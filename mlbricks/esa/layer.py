@@ -66,6 +66,7 @@ class ESA(nn.Module):
         self.auto_move_input = bool(auto_move_input)
         self.strict_checks = bool(strict_checks)
         self.compiled = False
+        self.compile_mode: str | None = None
 
         if compass is None:
             self.compass: int | str = "auto"
@@ -120,7 +121,17 @@ class ESA(nn.Module):
             return "pytorch"
 
     def compile(self, mode: str = "default"):
-        """Compile this ESA layer with torch.compile and return the module."""
+        """Compile this ESA layer with torch.compile and return the module.
+
+        The selected compile mode is also recorded on the underlying Thunder
+        module so ``backend="auto"`` can use the qualified compiled route.
+        """
+        self.compile_mode = str(mode)
+        target = getattr(self.layer, "_orig_mod", self.layer)
+        try:
+            setattr(target, "_mlbricks_compile_mode", self.compile_mode)
+        except Exception:
+            pass
         try:
             self.layer = torch.compile(self.layer, mode=mode, fullgraph=False)
             self.compiled = True

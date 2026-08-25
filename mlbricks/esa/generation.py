@@ -412,6 +412,38 @@ def esa_prefill(
 # configured backend, matching ESA v2.1 behavior.
 lightning_prefill = esa_prefill
 
+
+def _decode_runtime_backend(module: torch.nn.Module, x: torch.Tensor) -> str:
+    """Resolve explicit/Auto policy for one-token decode.
+
+    Historically decode_step opportunistically used the native kernel even
+    when the module was configured with backend="pytorch".  Keep explicit
+    policies strict and let only backend="auto" use the performance planner.
+    """
+    from ..runtime import normalize_backend
+
+    backend = _unwrap_backend(module)
+    raw = getattr(module, "backend", getattr(backend, "runtime_backend", "auto"))
+    policy = normalize_backend(raw, warn_legacy=False)
+    if policy != "auto":
+        return policy
+
+    try:
+        from .auto_backend import select_esa_auto_backend
+        from .native import available as _native_available
+        from .native import cuda_available as _native_cuda_available
+        return select_esa_auto_backend(
+            x,
+            workload="decode",
+            training=bool(getattr(backend, "training", False) or torch.is_grad_enabled()),
+            compile_mode=getattr(backend, "_mlbricks_compile_mode", None),
+            native_available=bool(_native_available()),
+            native_cuda_available=bool(_native_cuda_available()),
+        )
+    except Exception:
+        return "auto"
+
+
 def lightning_decode_step(
     module: torch.nn.Module,
     x: torch.Tensor,
@@ -446,6 +478,7 @@ def lightning_decode_step(
     B = x3.size(0)
     _, head, head_dim = _dimensions(module)
     backend = _unwrap_backend(module)
+    runtime_policy = _decode_runtime_backend(module, x3)
     flat_state = state.ndim == 2
     state_h = state.reshape(B, head, head_dim) if flat_state else state
 
@@ -460,7 +493,8 @@ def lightning_decode_step(
             from .native import fused_enabled_for as _fused_enabled_for
             from .native import lightning_fused_step as _native_fused_step
             if (
-                _fused_enabled_for(qgv)
+                runtime_policy != "pytorch"
+                and _fused_enabled_for(qgv)
                 and state_h.is_cuda
                 and state_h.dtype == qgv.dtype
                 and (not backend.training or backend.dropout.p == 0.0)
@@ -492,7 +526,12 @@ def lightning_decode_step(
     try:
         from .native import enabled_for as _native_enabled_for
         from .native import lightning_step as _native_lightning_step
-        if _native_enabled_for(A):
+        native_ok = bool(_native_enabled_for(A))
+        if runtime_policy == "native" and not native_ok:
+            raise RuntimeError(
+                "ESA backend='native' requested but native decode is unavailable"
+            )
+        if runtime_policy != "pytorch" and native_ok:
             new_state_h = _native_lightning_step(
                 A[:, 0],
                 B_write[:, 0],
@@ -504,7 +543,7 @@ def lightning_decode_step(
                 + B_write[:, 0].to(state_h.dtype)
             )
     except (ImportError, AttributeError, RuntimeError):
-        if os.getenv("MLBRICKS_NATIVE_STRICT", "0") == "1":
+        if runtime_policy == "native" or os.getenv("MLBRICKS_NATIVE_STRICT", "0") == "1":
             raise
         new_state_h = (
             A[:, 0].to(state_h.dtype) * state_h

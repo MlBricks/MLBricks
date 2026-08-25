@@ -317,6 +317,28 @@ class ThunderESA(nn.Module):
                 f"expected embedding dim {self.embd}, got input dim {C}"
             )
 
+        # Performance-aware Auto routing. Explicit native/pytorch requests are
+        # never changed. Training keeps the existing auto/native-autograd scan
+        # behavior; inference can choose the qualified PyTorch compiled path.
+        effective_backend = self.runtime_backend
+        if self.runtime_backend == "auto":
+            try:
+                from ..auto_backend import select_esa_auto_backend
+                from ..native import available as _native_available
+                from ..native import cuda_available as _native_cuda_available
+                effective_backend = select_esa_auto_backend(
+                    x,
+                    workload="inference",
+                    training=bool(self.training or torch.is_grad_enabled()),
+                    compile_mode=getattr(self, "_mlbricks_compile_mode", None),
+                    native_available=bool(_native_available()),
+                    native_cuda_available=bool(_native_cuda_available()),
+                )
+            except Exception:
+                # Auto must remain safe: an unavailable planner never blocks
+                # the historical native-first/fallback execution path.
+                effective_backend = "auto"
+
         # Experimental v4 projection orchestration path. It keeps the exact
         # public API and exact trained weights, but moves QGV -> hierarchical
         # ESA -> out_proj orchestration behind one C++ extension call. This is
@@ -326,7 +348,7 @@ class ThunderESA(nn.Module):
             from ..native import projection_fused_enabled_for as _proj_enabled_for
             from ..native import thunder_forward_hierarchical as _native_full_forward
             if (
-                self.runtime_backend != "pytorch"
+                effective_backend != "pytorch"
                 and self.compass != "auto"
                 and _proj_enabled_for(x)
                 and (not self.training or self.dropout.p == 0.0)
@@ -362,7 +384,7 @@ class ThunderESA(nn.Module):
                     qgv, C, training=self.training
                 )
             if (
-                self.runtime_backend != "pytorch"
+                effective_backend != "pytorch"
                 and resolved_compass is not None
                 and _should_use_fused_readout(qgv, C, int(resolved_compass))
             ):
@@ -404,13 +426,13 @@ class ThunderESA(nn.Module):
         B_scan = B_write.to(scan_dtype).contiguous()
 
         if self.compass == "auto":
-            E = _thunder_scan_auto(A_scan, B_scan, backend=self.runtime_backend)
+            E = _thunder_scan_auto(A_scan, B_scan, backend=effective_backend)
         else:
             E = thunder_scan(
                 A_scan,
                 B_scan,
                 compass=int(self.compass),
-                backend=self.runtime_backend,
+                backend=effective_backend,
             )
 
         E = E.reshape(B, T, C)
