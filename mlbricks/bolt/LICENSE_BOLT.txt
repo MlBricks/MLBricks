@@ -1,0 +1,36 @@
+BOLT COMPONENT SOFTWARE LICENSE NOTICE
+
+Copyright © 2026 Zameer Hussain and Akhtar Hussain.
+All rights reserved except as expressly licensed below.
+
+Bolt is licensed under the PolyForm Noncommercial License 1.0.0.
+
+Full public license terms:
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+Use of Bolt is subject to the complete PolyForm Noncommercial License 1.0.0.
+
+REQUIRED NOTICES
+
+Copyright © 2026 Zameer Hussain and Akhtar Hussain.
+Bolt is licensed under the PolyForm Noncommercial License 1.0.0.
+Commercial use requires a separate written commercial license.
+Commercial licensing inquiries: licensing@mlbricks.io
+
+COMMERCIAL USE
+
+No commercial-use rights are granted under the public noncommercial license.
+Commercial use requires a separate written commercial license.
+
+MLBRICKS PRIVATE LIMITED may be separately authorized by the copyright owners
+to commercialize, license, and sublicense MLBricks technology under a written
+agreement.
+
+Unless expressly assigned through a separate written agreement, ownership of
+the copyrighted Bolt software remains with Zameer Hussain and Akhtar Hussain.
+
+Access to source code, publication of a research paper or preprint, or receipt
+of the noncommercial license does not itself grant commercial-use rights.
+
+Any commercial rights must be obtained through a separate commercial license
+from the copyright owners or an entity expressly authorized by them.

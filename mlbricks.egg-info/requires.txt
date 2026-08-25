@@ -1,0 +1,8 @@
+torch>=2.1
+
+[dev]
+pytest>=7
+pandas>=2
+build
+twine
+ruff>=0.5

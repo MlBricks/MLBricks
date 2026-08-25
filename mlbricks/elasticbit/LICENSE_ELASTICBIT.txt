@@ -1,0 +1,33 @@
+ELASTICBIT COMPONENT SOFTWARE LICENSE NOTICE
+
+Copyright © 2026 Zameer Hussain and Akhtar Hussain.
+All rights reserved except as expressly licensed below.
+
+ElasticBit as distributed in MLBricks v1.0.0 is licensed under the
+PolyForm Noncommercial License 1.0.0.
+
+Full public license terms:
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+Use is subject to the complete PolyForm Noncommercial License 1.0.0.
+
+REQUIRED NOTICES
+
+Required Notice: Copyright © 2026 Zameer Hussain and Akhtar Hussain.
+Required Notice: ElasticBit is licensed under the PolyForm Noncommercial License 1.0.0.
+Required Notice: Commercial use requires a separate written commercial license.
+Required Notice: Commercial licensing inquiries: licensing@mlbricks.io
+
+PERMITTED USE
+
+The public license permits noncommercial use, including personal, educational,
+academic, research, experimentation, benchmarking, and hobby use to the extent
+allowed by the PolyForm Noncommercial License 1.0.0.
+
+COMMERCIAL USE
+
+No commercial-use rights are granted under the public noncommercial license.
+Commercial use requires a separate written commercial license from the
+copyright owner(s) or an entity expressly authorized by them.
+
+Commercial licensing inquiries: licensing@mlbricks.io
