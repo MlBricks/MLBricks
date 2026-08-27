@@ -7,6 +7,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# Triton is optional.  The H100/SM90 BOLT decoder uses it for the same fused
+# Q/U/G -> Q,K,C preparation kernel proven in the H100 benchmark notebook.
+# Import failures are intentionally silent so CPU/Windows and non-Triton
+# installs keep the existing BOLT decoder unchanged.
+try:  # pragma: no cover - availability is platform dependent
+    import triton
+    import triton.language as tl
+    from triton.language.extra import libdevice
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+    libdevice = None
+
 from .._reference import attention_forward_reference, gauss_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
@@ -20,6 +33,95 @@ from .._backend import (
     load_cuda_extension,
 )
 
+
+
+if triton is not None:  # pragma: no cover - exercised on CUDA/SM90
+    @triton.jit
+    def _bolt_qcg_sdpa_cache_kernel(
+        x_ptr,
+        w_ptr,
+        q_ptr,
+        k_cache_ptr,
+        c_cache_ptr,
+        stride_kb,
+        stride_kt,
+        stride_kh,
+        stride_kr,
+        stride_cb,
+        stride_ct,
+        stride_ch,
+        stride_cr,
+        position,
+        EPSILON: tl.constexpr,
+        D: tl.constexpr,
+        H: tl.constexpr,
+        R: tl.constexpr,
+        HR_: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        """Fused H100 BOLT decode preparation from the proven benchmark.
+
+        One program handles one (batch, head) pair.  It computes the packed
+        Q/U/G projection, forms C = U * (1 + tanh(G)), normalizes the derived
+        BOLT key K = rho*C, writes K/C directly into the persistent SDPA cache,
+        and returns Q for the q_len=1 SDPA call.
+        """
+        pid = tl.program_id(0)
+        b = pid // H
+        h = pid - b * H
+
+        r = tl.arange(0, R)
+        acc_q = tl.zeros((R,), dtype=tl.float32)
+        acc_u = tl.zeros((R,), dtype=tl.float32)
+        acc_g = tl.zeros((R,), dtype=tl.float32)
+
+        q_row = h * R + r
+        u_row = HR_ + h * R + r
+        g_row = 2 * HR_ + h * R + r
+
+        for k0 in range(0, D, BLOCK_K):
+            kk = k0 + tl.arange(0, BLOCK_K)
+            kmask = kk < D
+            x = tl.load(x_ptr + b * D + kk, mask=kmask, other=0.0).to(tl.float32)
+            wq = tl.load(
+                w_ptr + q_row[:, None] * D + kk[None, :],
+                mask=kmask[None, :], other=0.0,
+            ).to(tl.float32)
+            wu = tl.load(
+                w_ptr + u_row[:, None] * D + kk[None, :],
+                mask=kmask[None, :], other=0.0,
+            ).to(tl.float32)
+            wg = tl.load(
+                w_ptr + g_row[:, None] * D + kk[None, :],
+                mask=kmask[None, :], other=0.0,
+            ).to(tl.float32)
+            acc_q += tl.sum(wq * x[None, :], axis=1)
+            acc_u += tl.sum(wu * x[None, :], axis=1)
+            acc_g += tl.sum(wg * x[None, :], axis=1)
+
+        c = acc_u * (1.0 + libdevice.tanh(acc_g))
+        rho = tl.rsqrt(tl.sum(c * c, axis=0) / R + EPSILON)
+        kval = c * rho
+
+        q_off = (b * H + h) * R + r
+        tl.store(q_ptr + q_off, acc_q)
+
+        k_off = (
+            b * stride_kb
+            + position * stride_kt
+            + h * stride_kh
+            + r * stride_kr
+        )
+        c_off = (
+            b * stride_cb
+            + position * stride_ct
+            + h * stride_ch
+            + r * stride_cr
+        )
+        tl.store(k_cache_ptr + k_off, kval)
+        tl.store(c_cache_ptr + c_off, c)
+else:
+    _bolt_qcg_sdpa_cache_kernel = None
 
 def _validate_backend(backend: str) -> str:
     return normalize_backend(backend, warn_legacy=True)
@@ -203,6 +305,7 @@ class Attention(nn.Module):
         )
         y = self.out_proj(y.transpose(1, 2).contiguous().view(B, T, self.d_model))
         return y, (k.contiguous(), v.contiguous())
+
 
     @torch.no_grad()
     def project_decode_state(self, x: torch.Tensor, *, start_pos: int):
@@ -818,23 +921,317 @@ class Bolt(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.latent_dim)
         return self.out_proj(y), (c, rho)
 
+    @property
+    def sdpa_decode_cache_bytes_per_head_token(self) -> int:
+        """FP16 bytes/head/token for persistent derived K + C decode cache."""
+        return 4 * self.latent_dim
+
+    def _sdpa_decode_weight_fp16(self):
+        """Return a version-tracked FP16 packed Q/C/G weight for SM90 decode."""
+        weight, bias = self._packed_qcg()
+        if bias is not None:
+            return None
+        stamp = (
+            self._packed_qcg_versions,
+            str(weight.device),
+            int(weight.data_ptr()),
+        )
+        cached = getattr(self, "_sdpa_decode_weight_cache", None)
+        cached_stamp = getattr(self, "_sdpa_decode_weight_stamp", None)
+        if cached is None or cached_stamp != stamp:
+            cached = weight.detach().to(dtype=torch.float16).contiguous()
+            self._sdpa_decode_weight_cache = cached
+            self._sdpa_decode_weight_stamp = stamp
+        return cached
+
+    def _sm90_sdpa_decode_eligible(
+        self,
+        x: torch.Tensor,
+        k_cache: torch.Tensor,
+        c_cache: torch.Tensor,
+    ) -> bool:
+        if _bolt_qcg_sdpa_cache_kernel is None or self.position is not None:
+            return False
+        if not (x.is_cuda and k_cache.is_cuda and c_cache.is_cuda):
+            return False
+        if x.dim() != 2 or x.size(-1) != self.d_model:
+            return False
+        if k_cache.dim() != 4 or c_cache.shape != k_cache.shape:
+            return False
+        if k_cache.size(0) != x.size(0):
+            return False
+        if k_cache.size(2) != self.num_heads or k_cache.size(3) != self.latent_dim:
+            return False
+        if k_cache.dtype != torch.float16 or c_cache.dtype != torch.float16:
+            return False
+        if not (x.is_contiguous() and k_cache.is_contiguous() and c_cache.is_contiguous()):
+            return False
+        if self.latent_dim not in (8, 16, 32, 64):
+            return False
+        try:
+            major, _minor = torch.cuda.get_device_capability(x.device)
+        except Exception:
+            return False
+        return major == 9 and self._sdpa_decode_weight_fp16() is not None
+
+    @torch.no_grad()
+    def prefill_with_sdpa_decode_cache(
+        self, x: torch.Tensor, *, start_pos: int = 0
+    ):
+        """Prefill BOLT and materialize the persistent SDPA decode cache.
+
+        Cache layout is ``[B,T,H,R]`` to match the proven H100 fused cache
+        writer.  The key is exact BOLT ``K = rho * C`` (after optional RoPE)
+        and the value is raw ``C``.  Training/full-sequence code is untouched.
+        """
+        if x.dim() != 3 or x.size(-1) != self.d_model:
+            raise ValueError(f"x must have shape [B,T,{self.d_model}]")
+        B, T, _ = x.shape
+        q0, u0, g0 = self._qcg_inference(x)
+        q = q0.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+        u = u0.view(B * T, self.num_heads, self.latent_dim).contiguous()
+        g = g0.view(B * T, self.num_heads, self.latent_dim).contiguous()
+        c, _rho = self._native_gate_rho(u, g)
+        c = c.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+        rho_score = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+
+        key_c = c
+        if self.position is not None:
+            q = self.position(q, start_pos=int(start_pos))
+            key_c = self.position(c, start_pos=int(start_pos))
+        k = (key_c.float() * rho_score.unsqueeze(-1)).to(c.dtype)
+
+        y = _sdpa(
+            q, k, c,
+            scale=1.0 / math.sqrt(float(self.head_dim)),
+            causal=self.causal, dropout_p=0.0, training=False,
+        )
+        y = y.transpose(1, 2).contiguous().view(
+            B, T, self.num_heads * self.latent_dim
+        )
+
+        # H100 decode kernel writes [B,T,H,R] directly.
+        k_cache = k.transpose(1, 2).contiguous()
+        c_cache = c.transpose(1, 2).contiguous()
+        return self.out_proj(y), (k_cache, c_cache)
+
+    @torch.no_grad()
+    def project_sdpa_decode_state(self, x: torch.Tensor, *, start_pos: int):
+        """Generic BOLT Q/K/C projection for the SDPA decode cache."""
+        q, c4, rho3 = self.project_decode_state(x, start_pos=int(start_pos))
+        c = c4[:, :, 0, :] if c4.dim() == 4 else c4
+        rho = rho3[:, :, 0] if rho3.dim() == 3 else rho3
+        key_c = c
+        if self.position is not None:
+            key_c = self.position(
+                c[:, :, None, :], start_pos=int(start_pos)
+            )[:, :, 0, :]
+        k = (key_c.float() * rho.float().unsqueeze(-1)).to(c.dtype).contiguous()
+        return q, k, c.contiguous()
+
+    @torch.no_grad()
+    def decode_sdpa_projected(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        c_cache: torch.Tensor,
+        *,
+        used_length: int | None = None,
+    ) -> torch.Tensor:
+        """True q_len=1 BOLT decode through PyTorch SDPA/Flash split-KV.
+
+        ``k_cache`` and ``c_cache`` use the H100 benchmark layout [B,T,H,R].
+        q_len is one and the cache contains only past/current tokens, so
+        ``is_causal=False`` is correct and avoids constructing a causal mask.
+        """
+        if q.dim() != 3:
+            raise ValueError("q must have shape [B,H,R]")
+        if k_cache.dim() != 4 or c_cache.shape != k_cache.shape:
+            raise ValueError("k_cache/c_cache must have identical [B,T,H,R] shapes")
+        B, capacity, H, R = k_cache.shape
+        if q.shape != (B, H, R):
+            raise ValueError("q shape does not match SDPA cache")
+        if H != self.num_heads or R != self.latent_dim:
+            raise ValueError("SDPA cache shape does not match this BOLT module")
+        used = capacity if used_length is None else int(used_length)
+        if used < 1 or used > capacity:
+            raise ValueError("used_length must be in [1, cache_capacity]")
+        if q.device != k_cache.device or q.device != c_cache.device:
+            raise ValueError("q and SDPA caches must be on the same device")
+
+        y = F.scaled_dot_product_attention(
+            q[:, :, None, :],
+            k_cache[:, :used, :, :].permute(0, 2, 1, 3),
+            c_cache[:, :used, :, :].permute(0, 2, 1, 3),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=1.0 / math.sqrt(float(self.head_dim)),
+        )[:, :, 0, :]
+        return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
+
+    @torch.no_grad()
+    def decode_append_sdpa_projected(
+        self,
+        q: torch.Tensor,
+        k_now: torch.Tensor,
+        c_now: torch.Tensor,
+        k_cache: torch.Tensor,
+        c_cache: torch.Tensor,
+        *,
+        position: int,
+    ) -> torch.Tensor:
+        """Append one BOLT K/C pair and execute q_len=1 SDPA decode."""
+        pos = int(position)
+        if k_cache.dim() != 4 or c_cache.shape != k_cache.shape:
+            raise ValueError("k_cache/c_cache must have identical [B,T,H,R] shapes")
+        if pos < 0 or pos >= int(k_cache.size(1)):
+            raise ValueError("position must be in [0, cache_capacity)")
+        if q.shape != k_now.shape or q.shape != c_now.shape:
+            raise ValueError("projected q/K/C shapes are incompatible")
+        k_cache[:, pos, :, :].copy_(k_now)
+        c_cache[:, pos, :, :].copy_(c_now)
+        return self.decode_sdpa_projected(
+            q, k_cache, c_cache, used_length=pos + 1
+        )
+
+    @torch.no_grad()
+    def decode_sdpa(
+        self,
+        x: torch.Tensor,
+        k_cache: torch.Tensor,
+        c_cache: torch.Tensor,
+        *,
+        position: int,
+    ) -> torch.Tensor:
+        """Optimized BOLT decoder from the proven H100 benchmark.
+
+        On H100/SM90, FP16, bias-free BOLT with no RoPE, this uses one fused
+        Triton kernel for packed Q/U/G projection + K/C cache write and then
+        real PyTorch q_len=1 SDPA, allowing Flash split-KV scheduling.  Every
+        other configuration falls back to the same BOLT math using the generic
+        projected SDPA path.
+        """
+        if x.dim() == 3:
+            if x.size(1) != 1:
+                raise ValueError("decode_sdpa expects one token")
+            x = x[:, 0, :]
+        if x.dim() != 2 or x.size(-1) != self.d_model:
+            raise ValueError(f"x must have shape [B,{self.d_model}]")
+        if k_cache.dim() != 4 or c_cache.shape != k_cache.shape:
+            raise ValueError("k_cache/c_cache must have identical [B,T,H,R] shapes")
+        B, capacity, H, R = k_cache.shape
+        if B != x.size(0) or H != self.num_heads or R != self.latent_dim:
+            raise ValueError("SDPA cache shape does not match this BOLT module")
+        pos = int(position)
+        if pos < 0 or pos >= capacity:
+            raise ValueError("position must be in [0, cache_capacity)")
+
+        if self._sm90_sdpa_decode_eligible(x, k_cache, c_cache):
+            w_low = self._sdpa_decode_weight_fp16()
+            q = torch.empty(
+                B, self.num_heads, self.latent_dim,
+                device=x.device, dtype=torch.float16,
+            )
+            _bolt_qcg_sdpa_cache_kernel[(B * self.num_heads,)](
+                x.contiguous(),
+                w_low,
+                q,
+                k_cache,
+                c_cache,
+                k_cache.stride(0),
+                k_cache.stride(1),
+                k_cache.stride(2),
+                k_cache.stride(3),
+                c_cache.stride(0),
+                c_cache.stride(1),
+                c_cache.stride(2),
+                c_cache.stride(3),
+                pos,
+                EPSILON=self.eps,
+                D=self.d_model,
+                H=self.num_heads,
+                R=self.latent_dim,
+                HR_=self.num_heads * self.latent_dim,
+                BLOCK_K=32,
+                num_warps=4,
+                num_stages=2,
+            )
+            return self.decode_sdpa_projected(
+                q, k_cache, c_cache, used_length=pos + 1
+            )
+
+        q, k_now, c_now = self.project_sdpa_decode_state(
+            x, start_pos=pos
+        )
+        return self.decode_append_sdpa_projected(
+            q, k_now, c_now, k_cache, c_cache, position=pos
+        )
+
     @torch.no_grad()
     def project_decode_state(self, x: torch.Tensor, *, start_pos: int):
-        """One packed GEMM for current-token Q/C/G plus cache preprocessing."""
+        """Project one decode token with the lowest available launch overhead.
+
+        FP16 CUDA uses the extension's fused Q/C/G unpack + gate + rho kernel.
+        Besides keeping the exact public BOLT equation, this avoids the three
+        strided ``contiguous()`` copies previously needed after the packed GEMM
+        and folds gate/rho preprocessing into that single unpack launch.
+        """
         if x.dim() == 3:
             if x.size(1) != 1:
                 raise ValueError("project_decode_state expects one token")
             x = x[:, 0, :]
+        if x.dim() != 2 or x.size(-1) != self.d_model:
+            raise ValueError(f"x must have shape [B,{self.d_model}]")
+
         B = x.size(0)
-        q0, u0, g0 = self._qcg_inference(x)
-        q = q0.view(B, self.num_heads, self.latent_dim).contiguous()
-        u = u0.view(B, self.num_heads, self.latent_dim).contiguous()
-        g = g0.view(B, self.num_heads, self.latent_dim).contiguous()
-        c, rho = self._native_gate_rho(u, g)
-        c = c[:, :, None, :].contiguous()
-        rho = rho[:, :, None].contiguous()
+        weight, bias = self._packed_qcg()
+        qcg = F.linear(x, weight, bias)
+
+        unpack_eligible = (
+            qcg.is_cuda
+            and qcg.dtype == torch.float16
+            and self.latent_dim <= 64
+            and qcg.is_contiguous()
+        )
+        ext = load_cuda_extension() if _planner_native_decode(
+            "bolt_decode", qcg, self.backend, unpack_eligible,
+            extra=(self.num_heads, self.latent_dim, "unpack_gate_rho"),
+        ) else None
+        has_fused_unpack = bool(
+            ext is not None and hasattr(ext, "gauss_unpack_gate_rho_out")
+        )
+
+        if has_fused_unpack:
+            # These are compact current-token buffers.  The CUDA unpack kernel
+            # writes all three directly from packed [Q|U|G] output, avoiding
+            # intermediate q/u/g materializations and their copy launches.
+            q = torch.empty(
+                (B, self.num_heads, self.latent_dim),
+                device=qcg.device, dtype=qcg.dtype,
+            )
+            c3 = torch.empty_like(q)
+            rho2 = torch.empty(
+                (B, self.num_heads), device=qcg.device, dtype=qcg.dtype
+            )
+            ext.gauss_unpack_gate_rho_out(qcg, q, c3, rho2, self.eps)
+            c = c3[:, :, None, :]
+            rho = rho2[:, :, None]
+        else:
+            # Compatibility path for CPU/PyTorch and older prebuilt native
+            # extensions that do not yet export the fused unpack primitive.
+            hr = self.num_heads * self.latent_dim
+            q0, u0, g0 = qcg.split(hr, dim=-1)
+            q = q0.view(B, self.num_heads, self.latent_dim).contiguous()
+            u = u0.view(B, self.num_heads, self.latent_dim).contiguous()
+            g = g0.view(B, self.num_heads, self.latent_dim).contiguous()
+            c3, rho2 = self._native_gate_rho(u, g)
+            c = c3[:, :, None, :].contiguous()
+            rho = rho2[:, :, None].contiguous()
+
         if self.position is not None:
-            q = self.position(q[:, :, None, :], start_pos=int(start_pos))[:, :, 0, :].contiguous()
+            q = self.position(
+                q[:, :, None, :], start_pos=int(start_pos)
+            )[:, :, 0, :].contiguous()
         return q, c, rho
 
     @torch.no_grad()
