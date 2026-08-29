@@ -324,11 +324,12 @@ class ThunderESA(nn.Module):
             if frozen in {"native", "pytorch"}:
                 return self._forward_impl(x, effective_backend_override=frozen)
 
-            from ..native import available as _native_available
-            from ..native import cuda_available as _native_cuda_available
-            native_ok = bool(_native_available())
-            if x.is_cuda:
-                native_ok = native_ok and bool(_native_cuda_available())
+            # Ask the native runtime whether this *tensor* is eligible, not
+            # merely whether a compiled extension exists somewhere on the host.
+            # In particular, a CUDA build on a GPU machine must not make a CPU
+            # ESA element qualify/freeze to native by accident.
+            from ..native import enabled_for as _native_enabled_for
+            native_ok = bool(_native_enabled_for(x))
 
             if not native_ok:
                 route = EXECUTION_PLANNER.select_operator_once(

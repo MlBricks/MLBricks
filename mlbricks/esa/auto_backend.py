@@ -131,10 +131,17 @@ def select_esa_auto_backend(
         return "pytorch"
     if not native_available:
         return "pytorch"
-    if tensor.is_cuda and not native_cuda_available:
-        return "pytorch"
+
+    # A compiled CUDA extension being importable does not make the native ESA
+    # runtime valid for CPU tensors.  Normal CPU execution stays on PyTorch;
+    # the native CPU path is an explicit test/benchmark opt-in that mirrors
+    # ``mlbricks.esa.native.enabled_for``.  This prevents a CUDA-capable host
+    # from freezing a CPU ESA/decode element to an unusable native route.
     if not tensor.is_cuda:
-        return "native"
+        return "native" if os.getenv("MLBRICKS_NATIVE_CPU", "0") == "1" else "pytorch"
+
+    if not native_cuda_available:
+        return "pytorch"
 
     compiling = _compiler_is_active()
     mode = _normalize_compile_mode(compile_mode, compiling=compiling)
