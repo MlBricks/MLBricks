@@ -159,7 +159,7 @@ class VisionESABlock(nn.Module):
         if use_scan:
             state_input = apply_scan_native_or_pytorch(
                 state_input, *grid, scan=self.scan, layer_index=self.layer_index,
-                backend=self.backend,
+                backend=self.backend, owner=self,
             )
         elif order is not None:
             if inverse_order is None:
@@ -170,7 +170,7 @@ class VisionESABlock(nn.Module):
         if use_scan:
             mixed = restore_scan_native_or_pytorch(
                 mixed, *grid, scan=self.scan, layer_index=self.layer_index,
-                backend=self.backend,
+                backend=self.backend, owner=self,
             )
         elif order is not None:
             mixed = mixed.index_select(1, inverse_order)
@@ -228,7 +228,7 @@ class VisionESAClassifier(nn.Module):
             return hidden + self.learned_position[:, : hidden.shape[1], :].to(hidden.dtype)
         if self.config.position == "2d_sincos":
             return add_sinusoidal_2d_native_or_pytorch(
-                hidden, *grid, backend=self.config.backend
+                hidden, *grid, backend=self.config.backend, owner=self
             )
         raise RuntimeError(f"Unhandled position policy: {self.config.position}")
 

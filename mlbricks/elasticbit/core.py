@@ -20,6 +20,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..runtime import normalize_backend
+from .native_api import RuntimeMatrix, NativeFP16Matrix, bitsAnaliser, available as native_runtime_available
 from ..planner import EXECUTION_PLANNER
 
 
@@ -236,10 +237,12 @@ class _ElasticWeightMixin:
 
     def _apply(self, fn):
         self.clear_cache()
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return super()._apply(fn)
 
     def _load_from_state_dict(self, *args, **kwargs):
         self.clear_cache()
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return super()._load_from_state_dict(*args, **kwargs)
 
     @property
@@ -254,6 +257,7 @@ class _ElasticWeightMixin:
         data["runtime"] = "auto"
         self.config = ElasticBitConfig.from_manifest(data)
         self.clear_cache()
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
@@ -261,7 +265,10 @@ class _ElasticWeightMixin:
             return "pytorch"
         if self.backend == "native":
             return "native-required"
-        return "planner(auto; pytorch-default/native-when-calibrated)"
+        routes = EXECUTION_PLANNER.owner_routes(self)
+        if routes:
+            return "+".join(sorted(set(routes.values())))
+        return "planner(auto; qualify-once)"
 
     def _materialized_weight(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (device.type, device.index, dtype)
@@ -349,51 +356,96 @@ class ElasticLinear(_ElasticWeightMixin, nn.Module):
         dtype = self.config.compute_dtype or x.dtype
         x_compute = x.to(dtype)
         policy = self.config.backend
+        extra = (
+            int(self.in_features), int(self.out_features),
+            int(self.config.bits), int(self.config.group_size),
+        )
 
-        # 1.5.5 fast-auto policy:
-        # - the T4 qualification showed cached PyTorch GEMM is dramatically
-        #   faster than the packed kernel at the tested 128->512 shape;
-        # - auto therefore defaults to PyTorch for ElasticLinear;
-        # - explicit/calibrated native remains available;
-        # - the owning module keeps a one-entry route cache, so steady-state
-        #   auto does not probe/import the native extension every forward.
-        if policy == "pytorch":
-            route = "pytorch"
-        elif policy == "native":
-            route = "native"
-        else:
-            route = EXECUTION_PLANNER.select_operator_cached(
-                self,
-                "elastic_linear",
-                x_compute,
-                requested_backend="auto",
-                # Packed ElasticLinear is CUDA-only. Passing CUDA eligibility
-                # here lets the planner choose the conservative PyTorch default
-                # without touching extension availability on the hot path.
-                native_available=bool(x_compute.is_cuda),
-                native_supports_training=False,
-                training=False,
-                extra=(
-                    int(self.in_features), int(self.out_features),
-                    int(self.config.bits), int(self.config.group_size),
-                ),
-                default_auto="pytorch",
-            )
-
-        if route == "native":
-            native_available = False
+        def native_impl_available():
             packed_linear = None
+            available = False
             if x_compute.is_cuda:
                 try:
                     from ..esa.native import elastic_linear_packed as packed_linear
                     from ..esa.native import custom_ops_registered as custom_ops_registered
                     from ..esa.native import cuda_available as native_cuda_available
-                    native_available = bool(
-                        custom_ops_registered() and native_cuda_available()
-                    )
+                    available = bool(custom_ops_registered() and native_cuda_available())
+                except (ImportError, AttributeError, RuntimeError):
+                    available = False
+            return available, packed_linear
+
+        frozen = EXECUTION_PLANNER.owner_routes(self).get(("elastic_linear", False))
+        packed_linear = None
+        native_available = False
+
+        if policy == "pytorch":
+            route = "pytorch"
+        elif policy == "native":
+            native_available, packed_linear = native_impl_available()
+            if not native_available or packed_linear is None:
+                raise RuntimeError(
+                    "ElasticBit backend='native' requires the packed MLBricks CUDA extension"
+                )
+            route = "native"
+        elif frozen in {"native", "pytorch"}:
+            # Element-local auto decision was already qualified. Do not probe or
+            # benchmark again on subsequent forwards.
+            route = frozen
+            if route == "native":
+                try:
+                    from ..esa.native import elastic_linear_packed as packed_linear
+                    native_available = True
                 except (ImportError, AttributeError, RuntimeError):
                     native_available = False
+        elif torch.is_grad_enabled():
+            # Packed native ElasticLinear is inference-only. Keep training on
+            # the transparent PyTorch graph and do not freeze an inference route.
+            route = "pytorch"
+        else:
+            native_available, packed_linear = native_impl_available()
+            if native_available and packed_linear is not None:
+                # Materialize/copy steady-state operands before qualification so
+                # the one-time benchmark compares execution, not lazy setup.
+                weight = self._materialized_weight(x.device, dtype)
+                bias = None if self.bias is None else self.bias.to(device=x.device, dtype=dtype)
+                native_bias = (
+                    x_compute.new_empty(0) if bias is None else bias
+                )
+                route = EXECUTION_PLANNER.qualify_operator_once(
+                    self,
+                    "elastic_linear",
+                    x_compute,
+                    {
+                        "native": lambda: packed_linear(
+                            x_compute, self.packed_weight, self.scales, native_bias,
+                            self.config.bits, self.config.group_size,
+                            self.out_features, self.in_features,
+                        ),
+                        "pytorch": lambda: F.linear(x_compute, weight, bias),
+                    },
+                    requested_backend="auto",
+                    native_available=True,
+                    native_supports_training=False,
+                    training=False,
+                    extra=extra,
+                    default_auto="pytorch",
+                )
+            else:
+                route = EXECUTION_PLANNER.select_operator_once(
+                    self,
+                    "elastic_linear",
+                    x_compute,
+                    requested_backend="auto",
+                    native_available=False,
+                    native_supports_training=False,
+                    training=False,
+                    extra=extra,
+                    default_auto="pytorch",
+                )
 
+        if route == "native":
+            if packed_linear is None:
+                native_available, packed_linear = native_impl_available()
             if native_available and packed_linear is not None:
                 bias = (
                     x_compute.new_empty(0)
@@ -412,16 +464,13 @@ class ElasticLinear(_ElasticWeightMixin, nn.Module):
                     "ElasticBit backend='native' requires the packed MLBricks CUDA extension"
                 )
 
-            # A calibrated native decision can become unusable after moving a
-            # module/checkpoint to a different environment. Demote it once and
-            # invalidate component-local caches through the planner revision.
-            EXECUTION_PLANNER.set_operator_route(
-                "elastic_linear", x_compute, "pytorch", training=False,
-                extra=(
-                    int(self.in_features), int(self.out_features),
-                    int(self.config.bits), int(self.config.group_size),
-                ),
-                reason="native-unavailable:pytorch",
+            # A frozen native route can only become invalid after an explicit
+            # environment/device change. Clear this element and safely demote.
+            EXECUTION_PLANNER.clear_owner_routes(self)
+            route = EXECUTION_PLANNER.select_operator_once(
+                self, "elastic_linear", x_compute, requested_backend="auto",
+                native_available=False, native_supports_training=False, training=False,
+                extra=extra, default_auto="pytorch",
             )
 
         weight = self._materialized_weight(x.device, dtype)
@@ -500,7 +549,18 @@ class ElasticEmbedding(_ElasticWeightMixin, nn.Module):
 
 
 class ElasticBit:
-    """High-level ElasticBit quantization interface."""
+    """ElasticBit 4-32 bit runtime plus MLBricks compatibility helpers.
+
+    The standalone ElasticBit 0.2 API is available as class attributes:
+    ``ElasticBit.RuntimeMatrix``, ``ElasticBit.NativeFP16Matrix`` and
+    ``ElasticBit.bitsAnaliser``. Existing MLBricks tensor/module quantization
+    helpers remain available for compatibility and PyTorch fallback execution.
+    """
+
+    RuntimeMatrix = RuntimeMatrix
+    NativeFP16Matrix = NativeFP16Matrix
+    bitsAnaliser = staticmethod(bitsAnaliser)
+    native_runtime_available = staticmethod(native_runtime_available)
 
     def __init__(
         self,
@@ -540,7 +600,10 @@ class ElasticBit:
             return "pytorch"
         if self.backend == "native":
             return "native-required"
-        return "planner(auto; pytorch-default/native-when-calibrated)"
+        routes = EXECUTION_PLANNER.owner_routes(self)
+        if routes:
+            return "+".join(sorted(set(routes.values())))
+        return "planner(auto; qualify-once)"
 
     @property
     def bits(self) -> int:

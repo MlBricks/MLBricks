@@ -1,21 +1,21 @@
-ElasticBit License
+SOUP License
 
 Copyright © 2026 Zameer Hussain and Akhtar Hussain.
 All rights reserved except as expressly licensed below.
 
 Noncommercial License
 
-ElasticBit is licensed under the PolyForm Noncommercial License 1.0.0.
+SOUP is licensed under the PolyForm Noncommercial License 1.0.0.
 
 Full public license terms:
 https://polyformproject.org/licenses/noncommercial/1.0.0
 
-Use of ElasticBit is subject to the complete PolyForm Noncommercial License 1.0.0.
+Use of SOUP is subject to the complete PolyForm Noncommercial License 1.0.0.
 
 Required Notices
 
 Required Notice: Copyright © 2026 Zameer Hussain and Akhtar Hussain.
-Required Notice: ElasticBit is licensed under the PolyForm Noncommercial License 1.0.0.
+Required Notice: SOUP is licensed under the PolyForm Noncommercial License 1.0.0.
 Required Notice: Commercial use requires a separate written commercial license.
 Required Notice: Commercial licensing inquiries: licensing@mlbricks.io
 

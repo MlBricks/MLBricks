@@ -7,6 +7,7 @@ from torch import nn
 
 from . import native as _native
 from ..runtime import normalize_backend
+from ..planner import EXECUTION_PLANNER
 
 
 def _rms(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -66,6 +67,7 @@ class ResController(nn.Module):
         del recursive
         self.backend = normalize_backend(backend, warn_legacy=True)
         self.use_native = self.backend != "pytorch"
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
@@ -73,7 +75,10 @@ class ResController(nn.Module):
             return "pytorch"
         if self.backend == "native":
             return "native-required"
-        return "planner(auto)" if _native.is_available() else "pytorch"
+        routes = EXECUTION_PLANNER.owner_routes(self)
+        if routes:
+            return "+".join(sorted(set(routes.values())))
+        return "planner(auto; qualify-once)" if _native.is_available() else "pytorch"
 
     def _python_forward(
         self,
@@ -133,25 +138,51 @@ class ResController(nn.Module):
                 f"got {residual.device} and {update.device}"
             )
 
-        native_allowed = _native.inference_native_allowed(self, residual, update)
-        if self.backend == "native" and not native_allowed:
-            raise RuntimeError(
-                "ResController backend='native' requested but native CUDA eager inference "
-                "is unavailable for this call"
-            )
-        if native_allowed:
-            return _native.residual_forward(
-                residual,
-                update,
-                update_ratio=self.update_ratio,
-                stream_ratio=self.stream_ratio,
-                update_softness=self.update_softness,
-                stream_softness=self.stream_softness,
-                eps=self.eps,
-                fused_cuda=self.fused_cuda,
-            )
+        frozen = None
+        if self.backend == "auto" and not torch.is_grad_enabled() and not _native.is_compiling():
+            frozen = EXECUTION_PLANNER.owner_routes(self).get(("rescontroller", False))
+            if frozen == "pytorch":
+                return self._python_forward(residual, update)
+            if frozen == "native":
+                return _native.residual_forward(
+                    residual, update,
+                    update_ratio=self.update_ratio, stream_ratio=self.stream_ratio,
+                    update_softness=self.update_softness, stream_softness=self.stream_softness,
+                    eps=self.eps, fused_cuda=self.fused_cuda,
+                )
 
-        return self._python_forward(residual, update)
+        eligible = _native.inference_native_eligible(self, residual, update)
+        if self.backend == "native":
+            if not eligible:
+                raise RuntimeError(
+                    "ResController backend='native' requested but native CUDA eager inference "
+                    "is unavailable for this call"
+                )
+            return _native.residual_forward(
+                residual, update,
+                update_ratio=self.update_ratio, stream_ratio=self.stream_ratio,
+                update_softness=self.update_softness, stream_softness=self.stream_softness,
+                eps=self.eps, fused_cuda=self.fused_cuda,
+            )
+        if self.backend == "pytorch" or not eligible:
+            return self._python_forward(residual, update)
+
+        # Auto is qualified per ResController instance. This keeps two
+        # residual elements in the same model free to choose different routes.
+        native_call = lambda: _native.residual_forward(
+            residual, update,
+            update_ratio=self.update_ratio, stream_ratio=self.stream_ratio,
+            update_softness=self.update_softness, stream_softness=self.stream_softness,
+            eps=self.eps, fused_cuda=self.fused_cuda,
+        )
+        route = EXECUTION_PLANNER.qualify_operator_once(
+            self, "rescontroller", residual,
+            {"native": native_call, "pytorch": lambda: self._python_forward(residual, update)},
+            requested_backend="auto", native_available=True,
+            native_supports_training=False, training=False,
+            extra=(int(residual.shape[-1]),), default_auto="native",
+        )
+        return native_call() if route == "native" else self._python_forward(residual, update)
 
     def extra_repr(self) -> str:
         return (

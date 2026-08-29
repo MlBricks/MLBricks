@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from .bolt import Attention, Bolt, BoltAttention
+from .soup import SOUP, soup
 from .gaussian import Gaussian, GaussianConfig
 # Canonical ready-made Bolt model names; Gaussian names remain compatibility aliases.
 BoltModel = Gaussian
@@ -96,6 +97,8 @@ __all__ = [
     "Attention",
     "Bolt",
     "BoltAttention",
+    "SOUP",
+    "soup",
     "BoltModel",
     "BoltConfig",
     "Gaussian",

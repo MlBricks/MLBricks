@@ -3,9 +3,10 @@
 Public components use the same three backend names:
 
 ``auto``
-    Prefer a supported MLBricks native C++/CUDA/C++ implementation and fall
-    back to the exact PyTorch implementation when the native path is not
-    available for the current device/dtype/mode.
+    Qualify each backend-aware element independently on its first eligible
+    inference call, choose native or PyTorch for that element, and freeze the
+    winner for steady-state execution. Composite models can therefore remain
+    heterogeneous instead of forcing one whole-model backend.
 ``native``
     Require the native implementation.  Components raise a RuntimeError when
     their native path is unavailable for the current call.
@@ -190,11 +191,22 @@ def apply_execution_route(module: Any, route: str) -> Any:
 
 
 def reset_execution_route(module: Any) -> Any:
-    """Return a prepared model to normal per-operation ``auto`` routing."""
+    """Return a prepared model to auto and allow every element to re-qualify."""
     apply_execution_route(module, "operator")
+    try:
+        from .planner import EXECUTION_PLANNER
+        modules = getattr(module, "modules", None)
+        if callable(modules):
+            for child in modules():
+                EXECUTION_PLANNER.clear_owner_routes(child)
+        else:
+            EXECUTION_PLANNER.clear_owner_routes(module)
+    except Exception:
+        pass
     setattr(module, "_mlbricks_requested_backend", "auto")
-    setattr(module, "_mlbricks_model_route_reason", "reset:operator")
+    setattr(module, "_mlbricks_model_route_reason", "reset:elementwise-auto")
     setattr(module, "_mlbricks_model_timings", None)
+    setattr(module, "_mlbricks_model_diagnostic_winner", None)
     return module
 
 
@@ -247,16 +259,23 @@ def prepare_module_execution(
     candidates: tuple[str, ...] = ("operator", "native", "pytorch"),
     force: bool = False,
 ) -> "ExecutionPlan":
-    """Benchmark and cache the fastest *composed* inference execution route.
+    """Prepare inference while preserving heterogeneous element-wise ``auto``.
 
-    This is deliberately explicit; MLBricks never hides synchronization or
-    benchmarking in a normal forward pass.  Run it once after ``model.eval()``
-    using a representative input.  Per-operation calibration remains active in
-    the ``operator`` candidate, while the other candidates test coherent
-    all-native and all-PyTorch compositions.
+    ``backend='auto'`` is intentionally *not* converted into one whole-model
+    native/PyTorch decision.  Every backend-aware brick resolves its own route
+    (ESA, VESA scan, Bolt, vision scan/norm, FFNBrick, ResController,
+    ElasticBit, ...), and that brick freezes the decision for steady-state
+    execution.
+
+    ``native`` and ``pytorch`` candidates may still be timed as diagnostics,
+    but their whole-model timing can never override the element-wise operator
+    route.  Explicit user requests for ``backend='native'`` or
+    ``backend='pytorch'`` remain strict and global.
     """
     if bool(getattr(module, "training", False)):
-        raise RuntimeError("prepare_execution requires model.eval(); training keeps operator-safe auto routing")
+        raise RuntimeError(
+            "prepare_execution requires model.eval(); training keeps operator-safe auto routing"
+        )
     kwargs = {} if sample_kwargs is None else dict(sample_kwargs)
     key_tensor = _first_tensor(sample_args)
     if key_tensor is None:
@@ -277,25 +296,30 @@ def prepare_module_execution(
         return build_execution_plan(module)
 
     from .planner import EXECUTION_PLANNER
-    if not force:
-        cached = EXECUTION_PLANNER.select_model_route(
-            module, key_tensor, training=False, default="operator"
+    model_key = EXECUTION_PLANNER.model_key(module, key_tensor, training=False)
+    if not force and model_key in EXECUTION_PLANNER.model_benchmarks:
+        cached_timings = dict(EXECUTION_PLANNER.model_benchmarks[model_key])
+        apply_execution_route(module, "operator")
+        setattr(module, "_mlbricks_requested_backend", "auto")
+        setattr(module, "_mlbricks_model_route", "operator")
+        setattr(module, "_mlbricks_model_route_reason", "elementwise:auto:cached-diagnostics")
+        setattr(module, "_mlbricks_model_timings", cached_timings)
+        setattr(module, "_mlbricks_model_errors", {})
+        setattr(
+            module, "_mlbricks_model_diagnostic_winner",
+            min(cached_timings, key=cached_timings.get) if cached_timings else None,
         )
-        key = EXECUTION_PLANNER.model_key(module, key_tensor, training=False)
-        if key in EXECUTION_PLANNER.model_benchmarks:
-            apply_execution_route(module, cached)
-            setattr(module, "_mlbricks_requested_backend", "auto")
-            setattr(module, "_mlbricks_model_route_reason", EXECUTION_PLANNER.model_reasons.get(key, "cached"))
-            setattr(module, "_mlbricks_model_timings", EXECUTION_PLANNER.model_benchmarks.get(key))
-            return build_execution_plan(module)
+        return build_execution_plan(module)
 
-    names = []
+    names: list[str] = []
     for name in candidates:
         value = str(name).strip().lower()
         if value in {"operator", "native", "pytorch"} and value not in names:
             names.append(value)
-    if not names:
-        raise ValueError("candidates must include operator, native, and/or pytorch")
+    if "operator" not in names:
+        # Auto always needs the heterogeneous candidate because it is the route
+        # that will actually be kept after preparation.
+        names.insert(0, "operator")
 
     timings: dict[str, float] = {}
     errors: dict[str, str] = {}
@@ -310,19 +334,34 @@ def prepare_module_execution(
             except Exception as exc:
                 errors[name] = f"{type(exc).__name__}: {exc}"
 
-    if not timings:
-        apply_execution_route(module, "operator")
-        raise RuntimeError(f"no execution candidate succeeded: {errors}")
+    # Keep whole-model timings as diagnostics/cache compatibility, but never
+    # allow their winner to become the active auto route.
+    diagnostic_winner = None
+    if timings:
+        diagnostic_winner = EXECUTION_PLANNER.record_model_benchmark(
+            module, key_tensor, timings, training=False
+        )
+        model_key = EXECUTION_PLANNER.model_key(module, key_tensor, training=False)
+        EXECUTION_PLANNER.model_cache[model_key] = "operator"
+        EXECUTION_PLANNER.model_reasons[model_key] = (
+            f"elementwise:auto;diagnostic-winner:{diagnostic_winner}"
+        )
 
-    winner = EXECUTION_PLANNER.record_model_benchmark(
-        module, key_tensor, timings, training=False
-    )
-    apply_execution_route(module, winner)
-    key = EXECUTION_PLANNER.model_key(module, key_tensor, training=False)
+    # Critical policy: auto always returns to heterogeneous per-element routing.
+    # The operator pass above has already allowed each element to resolve/freeze
+    # its route using its own workload. Whole-model native/PyTorch results are
+    # retained only as diagnostics and never become the active route.
+    apply_execution_route(module, "operator")
     setattr(module, "_mlbricks_requested_backend", "auto")
-    setattr(module, "_mlbricks_model_route_reason", EXECUTION_PLANNER.model_reasons.get(key, "benchmark"))
-    setattr(module, "_mlbricks_model_timings", dict(timings))
+    setattr(module, "_mlbricks_model_route", "operator")
+    setattr(module, "_mlbricks_model_route_reason", "elementwise:auto")
+    setattr(module, "_mlbricks_model_timings", dict(timings) if timings else None)
     setattr(module, "_mlbricks_model_errors", errors)
+    setattr(
+        module,
+        "_mlbricks_model_diagnostic_winner",
+        diagnostic_winner,
+    )
     return build_execution_plan(module)
 
 
@@ -405,8 +444,8 @@ def predict_module(
     * choose FP16 on CUDA and FP32 on CPU unless explicitly overridden;
     * move floating inputs and model weights to the selected runtime;
     * switch the module to eval mode;
-    * optionally perform a lightweight hierarchical calibration on the first
-      matching workload and reuse the planner cache afterwards;
+    * optionally prepare/freeze element-wise auto routes on the first matching
+      workload without forcing one backend across the whole model;
     * execute under ``torch.inference_mode``.
 
     Integer/token/timestep tensors keep their dtype while moving device.
@@ -433,9 +472,9 @@ def predict_module(
         requested = getattr(module, "backend", getattr(getattr(module, "config", None), "backend", "auto"))
     requested = normalize_backend(requested)
 
-    # Keep normal forward() free of hidden benchmarking. predict() is explicitly
-    # the convenience inference API, so a tiny first-call calibration is safe
-    # and is skipped when a cached model plan already exists.
+    # Keep normal forward() free of hidden whole-model route switching.
+    # predict() may prepare the element-wise route once; every brick then keeps
+    # its own frozen native/PyTorch decision.
     if calibrate and requested == "auto":
         key_tensor = _first_tensor(moved_args)
         if key_tensor is None:
@@ -491,6 +530,7 @@ class ExecutionPlan:
     model_route_reason: str | None = None
     model_benchmarked: bool = False
     model_benchmarked_routes: int = 0
+    diagnostic_model_winner: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -540,6 +580,7 @@ def build_execution_plan(module: Any) -> ExecutionPlan:
         model_route_reason=getattr(module, "_mlbricks_model_route_reason", None),
         model_benchmarked=getattr(module, "_mlbricks_model_timings", None) is not None,
         model_benchmarked_routes=model_benchmarked_routes,
+        diagnostic_model_winner=getattr(module, "_mlbricks_model_diagnostic_winner", None),
     )
 
 

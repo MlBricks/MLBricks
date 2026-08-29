@@ -163,7 +163,7 @@ class VisionBoltBlock(nn.Module):
         if use_scan:
             mixer_in = apply_scan_native_or_pytorch(
                 mixer_in, *grid, scan=self.scan, layer_index=self.layer_index,
-                backend=self.backend,
+                backend=self.backend, owner=self,
             )
         elif order is not None:
             inverse = torch.argsort(order)
@@ -172,7 +172,7 @@ class VisionBoltBlock(nn.Module):
         if use_scan:
             mixed = restore_scan_native_or_pytorch(
                 mixed, *grid, scan=self.scan, layer_index=self.layer_index,
-                backend=self.backend,
+                backend=self.backend, owner=self,
             )
         elif inverse is not None:
             mixed = mixed.index_select(1, inverse)
@@ -222,7 +222,7 @@ class VisionBoltClassifier(nn.Module):
             return x + self.learned_position.to(x.dtype)
         if self.config.position == "2d_sincos":
             return add_sinusoidal_2d_native_or_pytorch(
-                x, *self.grid, backend=self.config.backend
+                x, *self.grid, backend=self.config.backend, owner=self
             )
         raise RuntimeError(f"Unhandled position policy: {self.config.position}")
 
@@ -316,6 +316,19 @@ class VisionBolt(nn.Module):
                         setter(value, recursive=False)
                     except TypeError:
                         setter(value)
+                elif hasattr(module, "backend"):
+                    try:
+                        module.backend = value
+                        from .planner import EXECUTION_PLANNER
+                        EXECUTION_PLANNER.clear_owner_routes(module)
+                    except ImportError:
+                        try:
+                            from ..planner import EXECUTION_PLANNER
+                            EXECUTION_PLANNER.clear_owner_routes(module)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         return self
 
     def backend_report(self):

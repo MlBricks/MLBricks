@@ -9,7 +9,8 @@
 - **BoltModel / BoltConfig** — ready-made Bolt language-model interface.
 - **FFNBricks** — `StateAwareFFN`, `VirtualStateAwareFFN`, and `MicroVirtualFFN`.
 - **ResController** — adaptive residual control.
-- **ElasticBit** — quantization and compact weight representations.
+- **SOUP** — state-oriented sequence processing with layerwise ESA/Bolt mixer selection.
+- **ElasticBit** — adaptive 4–32-bit CUDA runtime plus PyTorch-compatible quantization helpers.
 - **VESA** — ESA-based vision models.
 - **VisualBolt** — Bolt-based vision models through `VisionBolt`.
 - **Bricks / Brick** — heterogeneous model construction from MLBricks components.
@@ -54,6 +55,7 @@ MLBRICKS_BUILD_VISION_NATIVE=0
 MLBRICKS_BUILD_VESA_NATIVE=0
 MLBRICKS_BUILD_FFNBRICK_NATIVE=0
 MLBRICKS_BUILD_RESIDUALBRICK_NATIVE=0
+MLBRICKS_BUILD_ELASTICBIT_NATIVE=0
 ```
 
 ## Quick start
@@ -72,7 +74,7 @@ residual = ResController(update_ratio=0.18)
 
 MLBricks components use `backend="auto"` by default. The public backend choices are:
 
-- `auto` — choose the best available supported path and fall back safely.
+- `auto` — qualify **each element independently** (for example ESA, Bolt, SAFFN, a vision scan, or ElasticLinear). PyTorch is used as the one-time correctness reference; native must match it before both routes are benchmarked. The fastest valid route is then frozen for that element. Composite models can mix routes.
 - `native` — require a supported MLBricks native implementation.
 - `pytorch` — force the PyTorch/reference path.
 
@@ -162,6 +164,28 @@ from mlbricks import ResController
 controller = ResController(update_ratio=0.18)
 ```
 
+## SOUP
+
+```python
+from mlbricks import SOUP
+
+model = SOUP(
+    dim=512,
+    width=[1116, 1116],
+    depth=2,
+    mixer=["esa", "bolt"],
+    ffn=["saffn", "saffn"],
+    backend="auto",
+)
+```
+
+SOUP keeps `backend="auto"` **element-wise**. It does not force one backend for
+the whole SOUP model: an ESA layer can freeze to native while a Bolt layer
+freezes to PyTorch, and backend-aware FFN/residual elements make their own
+one-time decisions. Each native candidate must first match its PyTorch
+reference output; only parity-qualified routes are benchmarked for speed.
+Per-layer mixer and FFN choices remain supported.
+
 ## ElasticBit
 
 ```python
@@ -175,7 +199,17 @@ from mlbricks import (
 )
 ```
 
-ElasticBit provides quantized tensor/module utilities while keeping a PyTorch-compatible fallback path.
+ElasticBit now also exposes the standalone 0.2 adaptive 4–32-bit CUDA API through the MLBricks namespace:
+
+```python
+from mlbricks import ElasticBit
+
+analysis = ElasticBit.bitsAnaliser(weights, calibration, threshold=0.01)
+matrix = ElasticBit.RuntimeMatrix(weights, analysis["selected_bits"], "compact")
+y = matrix.forward(x)
+```
+
+The existing `ElasticLinear`, tensor quantization, and module-conversion helpers remain available as a PyTorch-compatible fallback surface.
 
 ## VESA
 

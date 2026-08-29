@@ -26,6 +26,7 @@ def _validate_backend(backend: str) -> str:
 
 
 def _planner_native_decode(
+    owner: object,
     op: str,
     tensor: torch.Tensor,
     backend: str,
@@ -41,8 +42,8 @@ def _planner_native_decode(
         return bool(eligible)
     if not eligible:
         return False
-    return EXECUTION_PLANNER.select_operator(
-        op, tensor, requested_backend="auto", native_available=True,
+    return EXECUTION_PLANNER.select_operator_once(
+        owner, op, tensor, requested_backend="auto", native_available=True,
         native_supports_training=False, training=False, extra=extra,
     ) == "native"
 
@@ -113,6 +114,7 @@ class Attention(nn.Module):
     def set_backend(self, backend: str, *, recursive: bool = True):
         del recursive
         self.backend = _validate_backend(backend)
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
@@ -239,7 +241,7 @@ class Attention(nn.Module):
             and self.head_dim <= 64 and k_cache.is_contiguous() and v_cache.is_contiguous()
         )
         ext = load_cuda_extension() if _planner_native_decode(
-            "attention_decode", q, self.backend, native_eligible,
+            self, "attention_decode", q, self.backend, native_eligible,
             extra=(self.num_heads, used, self.head_dim, "projected"),
         ) else None
         if ext is not None and used != capacity and not hasattr(ext, "baseline_decode_out_used"):
@@ -319,7 +321,7 @@ class Attention(nn.Module):
             and k_cache.is_contiguous() and v_cache.is_contiguous()
         )
         ext = load_cuda_extension() if _planner_native_decode(
-            "attention_decode", q, self.backend, native_eligible,
+            self, "attention_decode", q, self.backend, native_eligible,
             extra=(self.num_heads, pos + 1, self.head_dim, "append"),
         ) else None
         has_fused = bool(ext is not None and hasattr(ext, "baseline_decode_append_out"))
@@ -419,7 +421,7 @@ class Attention(nn.Module):
 
         ext = None
         if _planner_native_decode(
-            "attention_decode", q, self.backend, native_eligible,
+            self, "attention_decode", q, self.backend, native_eligible,
             extra=(self.num_heads, used, self.head_dim, "decode"),
         ):
             ext = load_cuda_extension()
@@ -566,6 +568,7 @@ class Bolt(nn.Module):
     def set_backend(self, backend: str, *, recursive: bool = True):
         del recursive
         self.backend = _validate_backend(backend)
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
@@ -628,6 +631,34 @@ class Bolt(nn.Module):
         hr = self.num_heads * self.latent_dim
         return qcg.split(hr, dim=-1)
 
+    def _pytorch_full_eval_core(
+        self, q_flat: torch.Tensor, u_flat: torch.Tensor, g_flat: torch.Tensor
+    ) -> torch.Tensor:
+        """PyTorch full-sequence Bolt core used for one-time auto qualification."""
+        B, T, _ = q_flat.shape
+        c_flat = u_flat * (1.0 + torch.tanh(g_flat))
+        q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+        c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+        rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+        if self.use_sdpa:
+            k = (c.float() * rho.unsqueeze(-1)).to(c.dtype)
+            y = _sdpa(
+                q, k, c, scale=1.0 / math.sqrt(float(self.head_dim)),
+                causal=self.causal, dropout_p=0.0, training=False,
+            )
+        else:
+            scores = torch.matmul(q, c.transpose(-2, -1))
+            scores = scores * rho.unsqueeze(-2)
+            scores = scores * (1.0 / math.sqrt(float(self.head_dim)))
+            if self.causal:
+                mask = torch.ones(T, T, device=q_flat.device, dtype=torch.bool).tril()
+                scores = scores.masked_fill(~mask, float("-inf"))
+            p = torch.softmax(scores.float(), dim=-1).to(c.dtype)
+            y = torch.matmul(p, c)
+        return y.transpose(1, 2).contiguous().view(
+            B, T, self.num_heads * self.latent_dim
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 3:
             raise ValueError("x must have shape [B,T,D]")
@@ -648,26 +679,70 @@ class Bolt(nn.Module):
             fused_inference = bool(not self.training and not torch.is_grad_enabled())
             native_backend = self.backend
 
-            # Fast auto route: the T4 qualification found the PyTorch/SDPA
-            # full-sequence path faster at this shape. Resolve once on the
-            # owning Bolt module and skip the native wrapper entirely when the
-            # cached decision is PyTorch. Explicit/calibrated native remains
-            # strict and bypasses the second planner lookup below.
+            # Element-wise auto: benchmark this Bolt instance/workload once,
+            # freeze native or PyTorch, and never re-check transient load.
             if self.backend == "auto":
-                route = EXECUTION_PLANNER.select_operator_cached(
-                    self,
-                    "bolt_full",
-                    q_flat,
-                    requested_backend="auto",
-                    native_available=True,
-                    native_supports_training=True,
-                    training=bool(torch.is_grad_enabled()),
-                    extra=(
-                        int(self.num_heads), int(self.latent_dim),
-                        int(self.head_dim), bool(self.causal), fused_inference,
-                    ),
-                    default_auto="pytorch",
+                extra = (
+                    int(self.num_heads), int(self.latent_dim),
+                    int(self.head_dim), bool(self.causal), fused_inference,
                 )
+                is_training = bool(torch.is_grad_enabled())
+                frozen = EXECUTION_PLANNER.owner_routes(self).get(("bolt_full", is_training))
+                if frozen in {"native", "pytorch"}:
+                    route = frozen
+                    native_ok = frozen == "native"
+                    _vision_bolt_full = None
+                else:
+                    native_ok = False
+                    _vision_bolt_full = None
+                    try:
+                        from ..vision_native import (
+                            bolt_full as _vision_bolt_full,
+                            available as _vision_native_available,
+                            cuda_built as _vision_native_cuda_built,
+                        )
+                        native_ok = bool(_vision_native_available())
+                        if q_flat.is_cuda:
+                            native_ok = native_ok and bool(_vision_native_cuda_built())
+                    except Exception:
+                        native_ok = False
+
+                if frozen not in {"native", "pytorch"} and not torch.is_grad_enabled() and native_ok and _vision_bolt_full is not None:
+                    route = EXECUTION_PLANNER.qualify_operator_once(
+                        self,
+                        "bolt_full",
+                        q_flat,
+                        {
+                            "native": lambda: _vision_bolt_full(
+                                q_flat, u_flat, g_flat,
+                                heads=self.num_heads, latent_dim=self.latent_dim,
+                                head_dim=self.head_dim, eps=self.eps,
+                                causal=self.causal, backend="native",
+                                fused_inference=fused_inference, owner=self,
+                            ),
+                            "pytorch": lambda: self._pytorch_full_eval_core(
+                                q_flat, u_flat, g_flat
+                            ),
+                        },
+                        requested_backend="auto",
+                        native_available=True,
+                        native_supports_training=True,
+                        training=False,
+                        extra=extra,
+                        default_auto="pytorch",
+                    )
+                elif frozen not in {"native", "pytorch"}:
+                    route = EXECUTION_PLANNER.select_operator_once(
+                        self,
+                        "bolt_full",
+                        q_flat,
+                        requested_backend="auto",
+                        native_available=native_ok,
+                        native_supports_training=True,
+                        training=bool(torch.is_grad_enabled()),
+                        extra=extra,
+                        default_auto="pytorch",
+                    )
                 native_backend = "native" if route == "native" else "pytorch"
 
             if native_backend == "native":
@@ -683,7 +758,7 @@ class Bolt(nn.Module):
                         # Route already resolved above; avoid planner work in
                         # vision_native._use_native for steady-state auto.
                         backend="native",
-                        fused_inference=fused_inference,
+                        fused_inference=fused_inference, owner=self,
                     )
                 except RuntimeError:
                     if self.backend == "native":
@@ -751,7 +826,7 @@ class Bolt(nn.Module):
             and self.latent_dim <= 64
         )
         if _planner_native_decode(
-            "bolt_decode", u, self.backend, eligible,
+            self, "bolt_decode", u, self.backend, eligible,
             extra=(self.num_heads, self.latent_dim, "gate_rho"),
         ):
             ext = load_cuda_extension()
@@ -860,7 +935,7 @@ class Bolt(nn.Module):
             )
             rope_width -= rope_width % 2
         ext = load_cuda_extension() if _planner_native_decode(
-            "bolt_decode", q, self.backend, tensor_eligible,
+            self, "bolt_decode", q, self.backend, tensor_eligible,
             extra=(self.num_heads, used, self.latent_dim, self.head_dim, "projected"),
         ) else None
         plain_native = self.position is None and ext is not None
@@ -980,7 +1055,7 @@ class Bolt(nn.Module):
             and c_cache.is_contiguous() and rho_cache.is_contiguous()
         )
         ext = load_cuda_extension() if _planner_native_decode(
-            "bolt_decode", q, self.backend, append_eligible,
+            self, "bolt_decode", q, self.backend, append_eligible,
             extra=(self.num_heads, pos + 1, self.latent_dim, self.head_dim, "append"),
         ) else None
         rope_width = 0
@@ -1113,7 +1188,7 @@ class Bolt(nn.Module):
 
         ext = None
         if _planner_native_decode(
-            "bolt_decode", q, self.backend, native_eligible,
+            self, "bolt_decode", q, self.backend, native_eligible,
             extra=(self.num_heads, used, self.latent_dim, self.head_dim, "decode"),
         ):
             ext = load_cuda_extension()

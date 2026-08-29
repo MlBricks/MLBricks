@@ -144,11 +144,19 @@ def cuda_built() -> bool:
     return bool(_load_extension().has_cuda())
 
 
+class _VisionRouteOwner:
+    pass
+
+
+_VISION_ROUTE_OWNER = _VisionRouteOwner()
+
+
 def _use_native(
     x: Tensor,
     backend: str,
     *,
     op: str,
+    owner: object | None = None,
     native_supports_training: bool = True,
     extra: tuple[object, ...] = (),
     default_auto: str | None = None,
@@ -156,13 +164,20 @@ def _use_native(
     policy = normalize_backend(backend, warn_legacy=True)
     if policy == "pytorch":
         return False
+    if policy == "auto" and owner is not None:
+        frozen = EXECUTION_PLANNER.owner_routes(owner).get(
+            (str(op), bool(torch.is_grad_enabled()))
+        )
+        if frozen in {"native", "pytorch"}:
+            return frozen == "native"
     ok = available()
     cuda_ok = ok and (not x.is_cuda or cuda_built())
     if policy == "native" and not ok:
         raise RuntimeError("backend='native' requested but shared vision native extension is unavailable")
     if policy == "native" and x.is_cuda and ok and not cuda_built():
         raise RuntimeError("backend='native' requested on CUDA but vision extension has no CUDA kernels")
-    route = EXECUTION_PLANNER.select_operator(
+    route = EXECUTION_PLANNER.select_operator_once(
+        _VISION_ROUTE_OWNER if owner is None else owner,
         op,
         x,
         requested_backend=policy,
@@ -182,37 +197,37 @@ def scan_code(scan: str) -> int:
         raise ValueError("scan must be cross, horizontal, vertical, or raster") from exc
 
 
-def reorder(x: Tensor, height: int, width: int, *, scan: str, layer_index: int, backend: str, inverse: bool = False) -> Tensor | None:
-    if not _use_native(x, backend, op="vision_scan", extra=(str(scan), int(layer_index), bool(inverse))):
+def reorder(x: Tensor, height: int, width: int, *, scan: str, layer_index: int, backend: str, inverse: bool = False, owner: object | None = None) -> Tensor | None:
+    if not _use_native(x, backend, op="vision_scan", owner=owner, extra=(str(scan), int(layer_index), bool(inverse))):
         return None
     return torch.ops.mlbricks_vision_native.scan_reorder(
         x.contiguous(), int(height), int(width), scan_code(scan), int(layer_index), bool(inverse)
     )
 
 
-def add_sincos2d(x: Tensor, height: int, width: int, *, backend: str) -> Tensor | None:
-    if not _use_native(x, backend, op="vision_position_2d"):
+def add_sincos2d(x: Tensor, height: int, width: int, *, backend: str, owner: object | None = None) -> Tensor | None:
+    if not _use_native(x, backend, op="vision_position_2d", owner=owner):
         return None
     return torch.ops.mlbricks_vision_native.add_sincos2d(x.contiguous(), int(height), int(width))
 
 
-def sincos2d(reference: Tensor, height: int, width: int, *, backend: str) -> Tensor | None:
-    if not _use_native(reference, backend, op="vision_position_2d"):
+def sincos2d(reference: Tensor, height: int, width: int, *, backend: str, owner: object | None = None) -> Tensor | None:
+    if not _use_native(reference, backend, op="vision_position_2d", owner=owner):
         return None
     return torch.ops.mlbricks_vision_native.sincos2d(reference, int(height), int(width))
 
 
-def unpatchify(patches: Tensor, gh: int, gw: int, patch: int, channels: int, *, backend: str) -> Tensor | None:
-    if not _use_native(patches, backend, op="vision_unpatchify", extra=(int(gh), int(gw), int(patch), int(channels))):
+def unpatchify(patches: Tensor, gh: int, gw: int, patch: int, channels: int, *, backend: str, owner: object | None = None) -> Tensor | None:
+    if not _use_native(patches, backend, op="vision_unpatchify", owner=owner, extra=(int(gh), int(gw), int(patch), int(channels))):
         return None
     return torch.ops.mlbricks_vision_native.unpatchify(
         patches.contiguous(), int(gh), int(gw), int(patch), int(channels)
     )
 
 
-def bolt_full(q: Tensor, u: Tensor, g: Tensor, *, heads: int, latent_dim: int, head_dim: int, eps: float, causal: bool, backend: str, fused_inference: bool = False) -> Tensor | None:
+def bolt_full(q: Tensor, u: Tensor, g: Tensor, *, heads: int, latent_dim: int, head_dim: int, eps: float, causal: bool, backend: str, fused_inference: bool = False, owner: object | None = None) -> Tensor | None:
     if not _use_native(
-        q, backend, op="bolt_full", native_supports_training=True,
+        q, backend, op="bolt_full", owner=owner, native_supports_training=True,
         extra=(int(heads), int(latent_dim), int(head_dim), bool(causal), bool(fused_inference)),
     ):
         return None
@@ -226,8 +241,8 @@ def bolt_full(q: Tensor, u: Tensor, g: Tensor, *, heads: int, latent_dim: int, h
     )
 
 
-def perspective_norm(x: Tensor, weight: Tensor, bias: Tensor, *, groups: int, eps: float = 1e-5, backend: str = "auto") -> Tensor | None:
-    if not _use_native(x, backend, op="perspective_norm", extra=(int(groups),)):
+def perspective_norm(x: Tensor, weight: Tensor, bias: Tensor, *, groups: int, eps: float = 1e-5, backend: str = "auto", owner: object | None = None) -> Tensor | None:
+    if not _use_native(x, backend, op="perspective_norm", owner=owner, extra=(int(groups),)):
         return None
     return torch.ops.mlbricks_vision_native.perspective_norm(
         x, weight, bias, int(groups), float(eps)
