@@ -34,6 +34,8 @@ DIRECT_PREFIX_KERNEL_MAX: Final[int] = 1024
 # promote it for shapes/devices where it wins.
 AUTO_OPERATOR_DEFAULTS: Final[dict[str, str]] = {
     "esa_scan": "native",
+    "vesa_scan": "native",
+    "vesa_decode": "native",
     "bolt_decode": "native",
     "attention_decode": "native",
     "bolt_full": "pytorch",
@@ -48,7 +50,6 @@ AUTO_OPERATOR_DEFAULTS: Final[dict[str, str]] = {
     "rescontroller": "native",
     "elastic_linear": "pytorch",
 }
-
 
 def ceil_div(a: int, b: int) -> int:
     return (int(a) + int(b) - 1) // int(b)
@@ -415,11 +416,180 @@ class MLBricksExecutionPlanner:
 
     @staticmethod
     def clear_owner_routes(owner: object) -> None:
-        """Forget one component's frozen auto decisions after an explicit reset."""
+        """Forget one element's frozen auto decisions after an explicit reset."""
         try:
             setattr(owner, "_mlbricks_frozen_auto_routes", {})
         except Exception:
             pass
+        try:
+            setattr(owner, "_mlbricks_auto_route_cache", None)
+        except Exception:
+            pass
+        try:
+            setattr(owner, "_mlbricks_frozen_auto_details", {})
+        except Exception:
+            pass
+
+    @staticmethod
+    def owner_routes(owner: object) -> dict[tuple[object, ...], str]:
+        """Return a copy of one element's frozen auto routes for reporting."""
+        cache = getattr(owner, "_mlbricks_frozen_auto_routes", None)
+        if not isinstance(cache, dict):
+            return {}
+        return {k: v for k, v in cache.items() if v in {"native", "pytorch"}}
+
+    def _auto_default(
+        self,
+        op: str,
+        *,
+        fallback: str | None = None,
+    ) -> str:
+        value = str(fallback or AUTO_OPERATOR_DEFAULTS.get(str(op), "pytorch")).lower()
+        return value if value in {"native", "pytorch"} else "pytorch"
+
+    def qualify_operator_once(
+        self,
+        owner: object,
+        op: str,
+        tensor: torch.Tensor,
+        candidates: Mapping[str, Callable[[], object]],
+        *,
+        requested_backend: str = "auto",
+        native_available: bool,
+        native_supports_training: bool = False,
+        training: bool | None = None,
+        extra: tuple[object, ...] = (),
+        default_auto: str | None = None,
+        warmup: int = 2,
+        trials: int = 5,
+        switch_margin: float = 0.05,
+    ) -> str:
+        """Benchmark one element once, choose a route, then freeze it.
+
+        This is the library-wide equivalent of ESA's performance-aware auto
+        policy for components that can expose both candidate callables.  It is
+        deliberately *element-local*: two Bolt/FFN/vision elements in the same
+        model may choose different routes.  The decision is made only once for
+        that owning element and training/eval mode and is never reconsidered
+        because transient hardware load later changes.
+
+        A small hysteresis band keeps the conservative default when candidates
+        are within ``switch_margin`` of each other, preventing benchmark noise
+        from flipping a route on first qualification.
+        """
+        policy = normalize_backend(requested_backend, warn_legacy=True)
+        is_training = bool(torch.is_grad_enabled()) if training is None else bool(training)
+        if policy != "auto":
+            return self.select_operator(
+                op, tensor, requested_backend=policy, native_available=native_available,
+                native_supports_training=native_supports_training, training=is_training,
+                extra=extra, default_auto=default_auto,
+            )
+        if is_training and not native_supports_training:
+            return "pytorch"
+        if not native_available:
+            return self.select_operator_once(
+                owner, op, tensor, requested_backend="auto", native_available=False,
+                native_supports_training=native_supports_training, training=is_training,
+                extra=extra, default_auto=default_auto,
+            )
+
+        cache = getattr(owner, "_mlbricks_frozen_auto_routes", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            try:
+                setattr(owner, "_mlbricks_frozen_auto_routes", cache)
+            except Exception:
+                pass
+        frozen_key = (str(op), bool(is_training))
+        frozen = cache.get(frozen_key)
+        if frozen in {"native", "pytorch"}:
+            return frozen
+
+        usable = {
+            str(name): fn for name, fn in candidates.items()
+            if str(name) in {"native", "pytorch"} and callable(fn)
+        }
+        if not usable:
+            return self.select_operator_once(
+                owner, op, tensor, requested_backend="auto", native_available=native_available,
+                native_supports_training=native_supports_training, training=is_training,
+                extra=extra, default_auto=default_auto,
+            )
+
+        warmup = max(0, int(warmup))
+        trials = max(1, int(trials))
+        timings: dict[str, float] = {}
+        errors: dict[str, str] = {}
+        for name, fn in usable.items():
+            try:
+                for _ in range(warmup):
+                    fn()
+                if tensor.is_cuda:
+                    torch.cuda.synchronize(tensor.device)
+                    samples: list[float] = []
+                    for _ in range(trials):
+                        start = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        fn()
+                        end.record()
+                        end.synchronize()
+                        samples.append(float(start.elapsed_time(end)))
+                else:
+                    samples = []
+                    for _ in range(trials):
+                        t0 = time.perf_counter()
+                        fn()
+                        samples.append((time.perf_counter() - t0) * 1000.0)
+                samples.sort()
+                timings[name] = samples[len(samples) // 2]
+            except Exception as exc:
+                errors[name] = f"{type(exc).__name__}: {exc}"
+
+        if not timings:
+            route = self.select_operator_once(
+                owner, op, tensor, requested_backend="auto", native_available=native_available,
+                native_supports_training=native_supports_training, training=is_training,
+                extra=extra, default_auto=default_auto,
+            )
+            return route
+
+        fastest = min(timings, key=timings.get)
+        default = self._auto_default(op, fallback=default_auto)
+        route = fastest
+        if default in timings and fastest != default:
+            base_ms = float(timings[default])
+            best_ms = float(timings[fastest])
+            improvement = (base_ms - best_ms) / max(base_ms, 1.0e-12)
+            if improvement < max(0.0, float(switch_margin)):
+                route = default
+
+        key = self.operator_key(op, tensor, training=is_training, extra=extra)
+        self.operator_benchmarks[key] = dict(timings)
+        previous = self.operator_cache.get(key)
+        self.operator_cache[key] = route
+        reason = "benchmark-once:" + ",".join(
+            f"{name}={ms:.6f}ms" for name, ms in sorted(timings.items())
+        )
+        if errors:
+            reason += ";errors=" + ",".join(f"{k}:{v}" for k, v in sorted(errors.items()))
+        self.operator_reasons[key] = reason
+        if previous != route:
+            self._operator_revision += 1
+        cache[frozen_key] = route
+        try:
+            details = getattr(owner, "_mlbricks_frozen_auto_details", None)
+            if not isinstance(details, dict):
+                details = {}
+                setattr(owner, "_mlbricks_frozen_auto_details", details)
+            details[frozen_key] = {
+                "route": route, "timings_ms": dict(timings), "errors": dict(errors),
+                "reason": reason,
+            }
+        except Exception:
+            pass
+        return route
 
     def select_operator(
         self,
@@ -455,25 +625,29 @@ class MLBricksExecutionPlanner:
                 )
             return "native"
 
-        # Auto: training safety beats every cached/heuristic choice.
+        # Auto: training safety and native availability beat every cached or
+        # heuristic choice. Record these fallbacks too so diagnostics can show
+        # why an element resolved to PyTorch.
+        key = self.operator_key(op, tensor, training=is_training, extra=extra)
         if is_training and not native_supports_training:
+            self.operator_cache[key] = "pytorch"
+            self.operator_reasons[key] = "training-safe:pytorch"
             return "pytorch"
         if not native_available:
+            self.operator_cache[key] = "pytorch"
+            self.operator_reasons[key] = "native-unavailable:pytorch"
             return "pytorch"
 
-        key = self.operator_key(op, tensor, training=is_training, extra=extra)
         cached = self.operator_cache.get(key)
         if cached in {"native", "pytorch"}:
             return cached
 
-        default = str(
-            default_auto or AUTO_OPERATOR_DEFAULTS.get(str(op), "pytorch")
-        ).lower()
-        if default not in {"native", "pytorch"}:
-            default = "pytorch"
+        default = self._auto_default(op, fallback=default_auto)
         route = default if (default != "native" or native_available) else "pytorch"
         self.operator_cache[key] = route
-        self.operator_reasons[key] = f"heuristic:{route}"
+        self.operator_reasons[key] = (
+            f"heuristic:{route}" if route == default else f"native-unavailable:{route}"
+        )
         return route
 
     def set_operator_route(

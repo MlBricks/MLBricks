@@ -6,6 +6,7 @@ from torch import nn
 
 from . import native as _native
 from ..runtime import normalize_backend
+from ..planner import EXECUTION_PLANNER
 
 
 class StateAwareFFN(nn.Module):
@@ -74,6 +75,7 @@ class StateAwareFFN(nn.Module):
         del recursive
         self.backend = normalize_backend(backend, warn_legacy=True)
         self.use_native = self.backend != "pytorch"
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
@@ -81,10 +83,13 @@ class StateAwareFFN(nn.Module):
             return "pytorch"
         if self.backend == "native":
             return "native-required"
-        return "planner(auto)" if _native.is_available() else "pytorch"
+        routes = EXECUTION_PLANNER.owner_routes(self)
+        if routes:
+            return "+".join(sorted(set(routes.values())))
+        return "planner(auto; qualify-once)" if _native.is_available() else "pytorch"
 
     def _require_native_for(self, x: torch.Tensor) -> None:
-        if self.backend == "native" and not _native.inference_native_allowed(self, x):
+        if self.backend == "native" and not _native.inference_native_eligible(self, x):
             raise RuntimeError(
                 "StateAwareFFN backend='native' requested but native eager inference "
                 "is unavailable for this call"
@@ -160,10 +165,58 @@ class StateAwareFFN(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._validate_inputs(x, esa_update, previous_esa, previous_state)
         # Keep the exact original PyTorch equations visible to autograd and
-        # torch.compile.  The native path is an eager no-grad inference
-        # specialization rather than an opaque replacement for the graph.
+        # torch.compile. Native is an eager no-grad specialization. In auto
+        # mode this *individual FFN element* benchmarks native vs PyTorch once,
+        # freezes the winner, and reuses it for all subsequent calls.
         self._require_native_for(x)
-        if _native.inference_native_allowed(self, x):
+
+        if self.backend == "pytorch":
+            return self.forward_python(x, esa_update, previous_esa, previous_state)
+
+        frozen = None
+        if self.backend == "auto" and not torch.is_grad_enabled() and not _native.is_compiling():
+            frozen = EXECUTION_PLANNER.owner_routes(self).get(("ffnbrick_state", False))
+            if frozen == "pytorch":
+                return self.forward_python(x, esa_update, previous_esa, previous_state)
+            if frozen == "native":
+                return _native.state_aware_forward(
+                    self, x, esa_update, previous_esa, previous_state
+                )
+
+        eligible = _native.inference_native_eligible(self, x)
+        if self.backend == "native":
+            if not eligible:
+                raise RuntimeError(
+                    "StateAwareFFN backend='native' requested but native eager inference "
+                    "is unavailable for this call"
+                )
+            return _native.state_aware_forward(
+                self, x, esa_update, previous_esa, previous_state
+            )
+
+        if not eligible:
+            return self.forward_python(x, esa_update, previous_esa, previous_state)
+
+        route = EXECUTION_PLANNER.qualify_operator_once(
+            self,
+            "ffnbrick_state",
+            x,
+            {
+                "native": lambda: _native.state_aware_forward(
+                    self, x, esa_update, previous_esa, previous_state
+                ),
+                "pytorch": lambda: self.forward_python(
+                    x, esa_update, previous_esa, previous_state
+                ),
+            },
+            requested_backend="auto",
+            native_available=True,
+            native_supports_training=False,
+            training=False,
+            extra=(int(self.d_model), int(self.state_dim), 0),
+            default_auto="native",
+        )
+        if route == "native":
             return _native.state_aware_forward(
                 self, x, esa_update, previous_esa, previous_state
             )

@@ -74,7 +74,7 @@ residual = ResController(update_ratio=0.18)
 
 MLBricks components use `backend="auto"` by default. The public backend choices are:
 
-- `auto` — choose the qualified/planned native or PyTorch route once for a component/workload and keep that route stable during execution.
+- `auto` — qualify **each element independently** (for example ESA, Bolt, SAFFN, a vision scan, or ElasticLinear), choose native or PyTorch once, and keep that element's route stable during execution. Composite models can mix routes.
 - `native` — require a supported MLBricks native implementation.
 - `pytorch` — force the PyTorch/reference path.
 
@@ -179,9 +179,10 @@ model = SOUP(
 )
 ```
 
-SOUP forwards `backend="auto"` to its built-in mixers, so ESA/Bolt use their
-qualified MLBricks execution policy without changing routes dynamically during
-steady-state execution. Per-layer mixer and FFN choices remain supported.
+SOUP keeps `backend="auto"` **element-wise**. It does not force one backend for
+the whole SOUP model: an ESA layer can freeze to native while a Bolt layer
+freezes to PyTorch, and backend-aware FFN/residual elements make their own
+one-time decisions. Per-layer mixer and FFN choices remain supported.
 
 ## ElasticBit
 

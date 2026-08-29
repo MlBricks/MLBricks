@@ -72,12 +72,12 @@ class _SpatialConditionedBlock(nn.Module):
         normalized = modulate(self.norm1(x), shift1, scale1)
         normalized = apply_scan_native_or_pytorch(
             normalized, *grid, scan=self.config.scan, layer_index=self.layer_index,
-            backend=self.config.backend,
+            backend=self.config.backend, owner=self,
         )
         mixed = _run_mixer(self.mixer, self.family, normalized)
         mixed = restore_scan_native_or_pytorch(
             mixed, *grid, scan=self.config.scan, layer_index=self.layer_index,
-            backend=self.config.backend,
+            backend=self.config.backend, owner=self,
         )
         x = x + gate1.unsqueeze(1) * mixed
         ffn = self.mlp(modulate(self.norm2(x), shift2, scale2))
@@ -133,7 +133,7 @@ class ImageDiffusionEngine(nn.Module):
             return x + self.learned_position.to(x.dtype)
         if self.config.position == "2d_sincos":
             return add_sinusoidal_2d_native_or_pytorch(
-                x, *self.grid, backend=self.config.backend
+                x, *self.grid, backend=self.config.backend, owner=self
             )
         raise RuntimeError(f"Unhandled position policy: {self.config.position}")
 
@@ -147,7 +147,7 @@ class ImageDiffusionEngine(nn.Module):
         try:
             from .vision_native import unpatchify as native_unpatchify
             native = native_unpatchify(
-                patches, gh, gw, p, c, backend=self.config.backend
+                patches, gh, gw, p, c, backend=self.config.backend, owner=self
             )
         except RuntimeError:
             if str(self.config.backend).strip().lower() == "native":
@@ -245,7 +245,7 @@ class VisualAREngine(nn.Module):
             reference = torch.empty(1, 1, self.config.dim, device=device, dtype=dtype)
             try:
                 from .vision_native import sincos2d as native_sincos
-                pos = native_sincos(reference, *self.grid, backend=self.config.backend)
+                pos = native_sincos(reference, *self.grid, backend=self.config.backend, owner=self)
             except RuntimeError:
                 if str(self.config.backend).strip().lower() == "native":
                     raise
@@ -256,7 +256,7 @@ class VisualAREngine(nn.Module):
                 )
             pos3 = apply_scan_native_or_pytorch(
                 pos.unsqueeze(0), *self.grid, scan=self.config.scan,
-                layer_index=0, backend=self.config.backend,
+                layer_index=0, backend=self.config.backend, owner=self,
             )
             return pos3[:, :length, :]
         raise RuntimeError(f"Unhandled position policy: {self.config.position}")

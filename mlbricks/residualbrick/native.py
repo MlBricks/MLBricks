@@ -49,13 +49,13 @@ def is_compiling() -> bool:
         return False
 
 
-def inference_native_allowed(
+def inference_native_eligible(
     module: object,
     residual: torch.Tensor,
     update: torch.Tensor,
 ) -> bool:
-    """Use the shared planner for eager no-grad ResidualBrick inference."""
-    eligible = bool(
+    """Whether the native residual kernel can legally execute this element."""
+    return bool(
         getattr(module, "use_native", False)
         and _C is not None
         and not torch.is_grad_enabled()
@@ -64,6 +64,15 @@ def inference_native_allowed(
         and update.is_cuda
         and residual.dtype == update.dtype
     )
+
+
+def inference_native_allowed(
+    module: object,
+    residual: torch.Tensor,
+    update: torch.Tensor,
+) -> bool:
+    """Use the shared planner for eager no-grad ResidualBrick inference."""
+    eligible = inference_native_eligible(module, residual, update)
     policy = normalize_backend(getattr(module, "backend", "auto"))
     if policy == "pytorch":
         return False

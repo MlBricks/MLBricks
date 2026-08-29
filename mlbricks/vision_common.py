@@ -11,6 +11,9 @@ from typing import Iterable
 import torch
 from torch import Tensor
 
+from .planner import EXECUTION_PLANNER
+from .runtime import normalize_backend
+
 
 _ENGINE_ALIASES = {
     "serpentine": "serpentine",
@@ -208,22 +211,73 @@ def apply_scan_native_or_pytorch(
     scan: str,
     layer_index: int,
     backend: str = "auto",
+    owner: object | None = None,
 ) -> Tensor:
-    """Apply a directional scan using the compiled vision op when available."""
+    """Apply directional scan with one-time element-wise auto qualification."""
+    policy = normalize_backend(backend, warn_legacy=True)
+    canonical = canonical_scan(scan)
+    order = None
+
+    if policy == "auto" and owner is not None and not torch.is_grad_enabled():
+        frozen = EXECUTION_PLANNER.owner_routes(owner)
+        if ("vision_scan", False) not in frozen:
+            try:
+                from .vision_native import (
+                    reorder as native_reorder, available as native_available,
+                    cuda_built as native_cuda_built,
+                )
+                native_ok = bool(native_available())
+                if x.is_cuda:
+                    native_ok = native_ok and bool(native_cuda_built())
+            except Exception:
+                native_ok = False
+                native_reorder = None
+            if native_ok and native_reorder is not None:
+                order = scan_indices(
+                    height, width, scan=scan, layer_index=layer_index, device=x.device
+                )
+                route = EXECUTION_PLANNER.qualify_operator_once(
+                    owner,
+                    "vision_scan",
+                    x,
+                    {
+                        "native": lambda: native_reorder(
+                            x, height, width, scan=canonical, layer_index=layer_index,
+                            backend="native", inverse=False, owner=owner,
+                        ),
+                        "pytorch": lambda: x.index_select(1, order),
+                    },
+                    requested_backend="auto",
+                    native_available=True,
+                    native_supports_training=True,
+                    training=False,
+                    extra=(canonical, int(layer_index), False),
+                    default_auto="pytorch",
+                )
+                if route == "native":
+                    out = native_reorder(
+                        x, height, width, scan=canonical, layer_index=layer_index,
+                        backend="native", inverse=False, owner=owner,
+                    )
+                    if out is not None:
+                        return out
+                return x.index_select(1, order)
+
     try:
         from .vision_native import reorder as native_reorder
         out = native_reorder(
-            x, height, width, scan=canonical_scan(scan),
-            layer_index=layer_index, backend=backend, inverse=False,
+            x, height, width, scan=canonical,
+            layer_index=layer_index, backend=policy, inverse=False, owner=owner,
         )
         if out is not None:
             return out
     except RuntimeError:
-        if str(backend).strip().lower() == "native":
+        if policy == "native":
             raise
-    order = scan_indices(
-        height, width, scan=scan, layer_index=layer_index, device=x.device
-    )
+    if order is None:
+        order = scan_indices(
+            height, width, scan=scan, layer_index=layer_index, device=x.device
+        )
     return x.index_select(1, order)
 
 
@@ -235,18 +289,21 @@ def restore_scan_native_or_pytorch(
     scan: str,
     layer_index: int,
     backend: str = "auto",
+    owner: object | None = None,
 ) -> Tensor:
-    """Restore directional-scan tokens to canonical row-major order."""
+    """Restore scan order using the same frozen route as the owning element."""
+    policy = normalize_backend(backend, warn_legacy=True)
+    canonical = canonical_scan(scan)
     try:
         from .vision_native import reorder as native_reorder
         out = native_reorder(
-            x, height, width, scan=canonical_scan(scan),
-            layer_index=layer_index, backend=backend, inverse=True,
+            x, height, width, scan=canonical,
+            layer_index=layer_index, backend=policy, inverse=True, owner=owner,
         )
         if out is not None:
             return out
     except RuntimeError:
-        if str(backend).strip().lower() == "native":
+        if policy == "native":
             raise
     order = scan_indices(
         height, width, scan=scan, layer_index=layer_index, device=x.device
@@ -255,12 +312,12 @@ def restore_scan_native_or_pytorch(
 
 
 def add_sinusoidal_2d_native_or_pytorch(
-    x: Tensor, height: int, width: int, *, backend: str = "auto"
+    x: Tensor, height: int, width: int, *, backend: str = "auto", owner: object | None = None
 ) -> Tensor:
     """Add deterministic 2-D sin/cos positions using native CUDA/C++ if available."""
     try:
         from .vision_native import add_sincos2d as native_add
-        out = native_add(x, height, width, backend=backend)
+        out = native_add(x, height, width, backend=backend, owner=owner)
         if out is not None:
             return out
     except RuntimeError:

@@ -364,20 +364,40 @@ class SOUP(nn.Module):
     def load_state_dict(self,*args,**kwargs):
         self.clear_generation_plan(); return super().load_state_dict(*args,**kwargs)
     def set_backend(self,backend):
-        self.backend=backend
+        # SOUP is a composition: backend policy propagates to every
+        # backend-aware brick, but each brick keeps its own auto decision.
+        self.backend=backend; self.clear_generation_plan()
         for layer in self.layers:
-            target=layer.mixer
-            if callable(getattr(target,'set_backend',None)): target.set_backend(backend)
-            elif hasattr(target,'backend'): target.backend=backend
+            for target in (layer.mixer, layer.ffn):
+                if callable(getattr(target,'set_backend',None)):
+                    target.set_backend(backend)
+                elif hasattr(target,'backend'):
+                    target.backend=backend
+                    try:
+                        from mlbricks.planner import EXECUTION_PLANNER
+                        EXECUTION_PLANNER.clear_owner_routes(target)
+                    except Exception:
+                        pass
         return self
+    def element_backends(self):
+        rows=[]
+        for index,layer in enumerate(self.layers):
+            for kind,target in (("mixer",layer.mixer),("ffn",layer.ffn)):
+                requested=getattr(target,'backend',None)
+                resolver=getattr(target,'resolved_backend',None)
+                if requested is None and not callable(resolver):
+                    continue
+                resolved=str(requested or self.backend)
+                if callable(resolver):
+                    try: resolved=str(resolver())
+                    except Exception: resolved='dynamic'
+                rows.append({
+                    'layer':index,'kind':kind,'component':target.__class__.__name__,
+                    'requested':str(requested or self.backend),'resolved':resolved,
+                })
+        return rows
     def resolved_backend(self):
-        vals=[]
-        for layer in self.layers:
-            target=layer.mixer
-            if callable(getattr(target,'resolved_backend',None)):
-                try: vals.append(target.resolved_backend())
-                except Exception: pass
-            elif hasattr(target,'backend'): vals.append(str(target.backend))
+        vals=[row['resolved'] for row in self.element_backends()]
         return vals[0] if vals and all(v==vals[0] for v in vals) else (vals or self.backend)
     def clear_generation_plan(self): self._generation_plans=None; self._observer_fast=None; self._generation_fast=False; return self
     def train(self,mode=True):

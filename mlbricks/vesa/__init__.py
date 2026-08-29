@@ -138,6 +138,19 @@ class Vesa(VisionESAClassifier):
                         setter(value, recursive=False)
                     except TypeError:
                         setter(value)
+                elif hasattr(module, "backend"):
+                    try:
+                        module.backend = value
+                        from .planner import EXECUTION_PLANNER
+                        EXECUTION_PLANNER.clear_owner_routes(module)
+                    except ImportError:
+                        try:
+                            from ..planner import EXECUTION_PLANNER
+                            EXECUTION_PLANNER.clear_owner_routes(module)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         return self
 
     def backend_report(self):

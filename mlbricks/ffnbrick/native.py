@@ -76,6 +76,17 @@ def is_compiling() -> bool:
         return False
 
 
+def inference_native_eligible(module: object, x: torch.Tensor) -> bool:
+    """Whether native eager inference can legally execute this element."""
+    return bool(
+        getattr(module, "use_native", False)
+        and _C is not None
+        and not torch.is_grad_enabled()
+        and not is_compiling()
+        and x.device.type in {"cpu", "cuda"}
+    )
+
+
 def inference_native_allowed(module: object, x: torch.Tensor) -> bool:
     """Planner-controlled eager inference specialization.
 
@@ -83,13 +94,7 @@ def inference_native_allowed(module: object, x: torch.Tensor) -> bool:
     ``torch.compile`` retain the PyTorch graph. Explicit ``backend='native'``
     remains strict; ``auto`` lets the shared MLBricks planner choose.
     """
-    eligible = bool(
-        getattr(module, "use_native", False)
-        and _C is not None
-        and not torch.is_grad_enabled()
-        and not is_compiling()
-        and x.device.type in {"cpu", "cuda"}
-    )
+    eligible = inference_native_eligible(module, x)
     policy = normalize_backend(getattr(module, "backend", "auto"))
     if policy == "pytorch":
         return False
