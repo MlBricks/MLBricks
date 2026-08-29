@@ -33,6 +33,7 @@ DIRECT_PREFIX_KERNEL_MAX: Final[int] = 1024
 # Native is still available via backend='native', and benchmark calibration can
 # promote it for shapes/devices where it wins.
 AUTO_OPERATOR_DEFAULTS: Final[dict[str, str]] = {
+    "esa_element": "native",
     "esa_scan": "native",
     "vesa_scan": "native",
     "vesa_decode": "native",
@@ -447,6 +448,124 @@ class MLBricksExecutionPlanner:
         value = str(fallback or AUTO_OPERATOR_DEFAULTS.get(str(op), "pytorch")).lower()
         return value if value in {"native", "pytorch"} else "pytorch"
 
+    @staticmethod
+    def _parity_tolerances(
+        tensor: torch.Tensor,
+        *,
+        rtol: float | None,
+        atol: float | None,
+    ) -> tuple[float, float]:
+        """Return conservative one-time native-vs-PyTorch parity tolerances."""
+        if rtol is None:
+            rtol = 2.0e-2 if tensor.dtype in {torch.float16, torch.bfloat16} else 1.0e-4
+        if atol is None:
+            atol = 2.0e-2 if tensor.dtype in {torch.float16, torch.bfloat16} else 1.0e-5
+        return max(0.0, float(rtol)), max(0.0, float(atol))
+
+    @classmethod
+    def _compare_candidate_outputs(
+        cls,
+        reference: object,
+        candidate: object,
+        *,
+        rtol: float,
+        atol: float,
+        path: str = "output",
+    ) -> tuple[bool, dict[str, object]]:
+        """Recursively compare candidate output against the PyTorch reference.
+
+        Tensor leaves are checked with ``torch.allclose`` while tuple/list/dict
+        structure must match exactly.  The returned details are intentionally
+        compact so they can be stored on the owning element for diagnostics.
+        """
+        stats: dict[str, object] = {
+            "checked": True,
+            "allclose": True,
+            "rtol": float(rtol),
+            "atol": float(atol),
+            "tensor_leaves": 0,
+            "max_abs": 0.0,
+            "max_relative_l2": 0.0,
+            "mismatch": None,
+        }
+
+        def fail(where: str, reason: str) -> bool:
+            stats["allclose"] = False
+            if stats["mismatch"] is None:
+                stats["mismatch"] = f"{where}: {reason}"
+            return False
+
+        def visit(ref: object, cand: object, where: str) -> bool:
+            if torch.is_tensor(ref) or torch.is_tensor(cand):
+                if not (torch.is_tensor(ref) and torch.is_tensor(cand)):
+                    return fail(where, "tensor/non-tensor type mismatch")
+                if tuple(ref.shape) != tuple(cand.shape):
+                    return fail(where, f"shape {tuple(ref.shape)} != {tuple(cand.shape)}")
+
+                ref_cmp = ref.detach()
+                cand_cmp = cand.detach()
+                if ref_cmp.device != cand_cmp.device:
+                    cand_cmp = cand_cmp.to(ref_cmp.device)
+                # Compare floating/complex tensors in a stable accumulator dtype.
+                if ref_cmp.is_floating_point() or ref_cmp.is_complex():
+                    if ref_cmp.is_complex():
+                        ref_num = ref_cmp.to(torch.complex64)
+                        cand_num = cand_cmp.to(torch.complex64)
+                    else:
+                        ref_num = ref_cmp.float()
+                        cand_num = cand_cmp.float()
+                    diff = (cand_num - ref_num).abs()
+                    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+                    ref_norm = torch.linalg.vector_norm(ref_num.reshape(-1))
+                    diff_norm = torch.linalg.vector_norm((cand_num - ref_num).reshape(-1))
+                    rel_l2 = float((diff_norm / (ref_norm + 1.0e-12)).item()) if diff.numel() else 0.0
+                    stats["max_abs"] = max(float(stats["max_abs"]), max_abs)
+                    stats["max_relative_l2"] = max(float(stats["max_relative_l2"]), rel_l2)
+                    close = bool(torch.allclose(cand_num, ref_num, rtol=rtol, atol=atol, equal_nan=False))
+                else:
+                    close = bool(torch.equal(cand_cmp, ref_cmp))
+                stats["tensor_leaves"] = int(stats["tensor_leaves"]) + 1
+                if not close:
+                    return fail(where, "tensor values differ from PyTorch reference")
+                return True
+
+            if isinstance(ref, Mapping) or isinstance(cand, Mapping):
+                if not (isinstance(ref, Mapping) and isinstance(cand, Mapping)):
+                    return fail(where, "mapping/non-mapping type mismatch")
+                if set(ref.keys()) != set(cand.keys()):
+                    return fail(where, "mapping keys differ")
+                ok = True
+                for key in sorted(ref.keys(), key=lambda value: repr(value)):
+                    ok = visit(ref[key], cand[key], f"{where}[{key!r}]") and ok
+                return ok
+
+            if isinstance(ref, (tuple, list)) or isinstance(cand, (tuple, list)):
+                if type(ref) is not type(cand):
+                    return fail(where, f"sequence types differ: {type(ref).__name__} != {type(cand).__name__}")
+                if len(ref) != len(cand):
+                    return fail(where, f"sequence lengths differ: {len(ref)} != {len(cand)}")
+                ok = True
+                for index, (ref_item, cand_item) in enumerate(zip(ref, cand)):
+                    ok = visit(ref_item, cand_item, f"{where}[{index}]") and ok
+                return ok
+
+            if ref is None or cand is None:
+                if ref is cand:
+                    return True
+                return fail(where, "None/non-None mismatch")
+
+            try:
+                equal = bool(ref == cand)
+            except Exception:
+                equal = repr(ref) == repr(cand)
+            if not equal:
+                return fail(where, f"value mismatch: {ref!r} != {cand!r}")
+            return True
+
+        ok = visit(reference, candidate, path)
+        stats["allclose"] = bool(ok and stats["allclose"])
+        return bool(stats["allclose"]), stats
+
     def qualify_operator_once(
         self,
         owner: object,
@@ -463,19 +582,23 @@ class MLBricksExecutionPlanner:
         warmup: int = 2,
         trials: int = 5,
         switch_margin: float = 0.05,
+        verify_parity: bool = True,
+        parity_rtol: float | None = None,
+        parity_atol: float | None = None,
     ) -> str:
-        """Benchmark one element once, choose a route, then freeze it.
+        """Validate and benchmark one element once, then freeze its route.
 
-        This is the library-wide equivalent of ESA's performance-aware auto
-        policy for components that can expose both candidate callables.  It is
-        deliberately *element-local*: two Bolt/FFN/vision elements in the same
-        model may choose different routes.  The decision is made only once for
-        that owning element and training/eval mode and is never reconsidered
-        because transient hardware load later changes.
+        ``backend='auto'`` is correctness-first and element-local.  When both
+        candidates are available, the PyTorch path is executed once as the
+        reference and the native output must match it within dtype-appropriate
+        tolerances before native is allowed into the speed race.  If parity
+        fails (or native raises), PyTorch is frozen immediately for that element.
 
-        A small hysteresis band keeps the conservative default when candidates
-        are within ``switch_margin`` of each other, preventing benchmark noise
-        from flipping a route on first qualification.
+        Only parity-qualified candidates are timed.  A small hysteresis band
+        keeps the conservative default when candidates are within
+        ``switch_margin`` of each other.  After the winner is frozen, later
+        calls do not re-check load/hardware or switch routes unless the owner is
+        explicitly reset/reconfigured.
         """
         policy = normalize_backend(requested_backend, warn_legacy=True)
         is_training = bool(torch.is_grad_enabled()) if training is None else bool(training)
@@ -517,10 +640,86 @@ class MLBricksExecutionPlanner:
                 extra=extra, default_auto=default_auto,
             )
 
-        warmup = max(0, int(warmup))
-        trials = max(1, int(trials))
+        key = self.operator_key(op, tensor, training=is_training, extra=extra)
         timings: dict[str, float] = {}
         errors: dict[str, str] = {}
+        parity: dict[str, object] = {"checked": False, "allclose": None}
+
+        def freeze(route: str, reason: str) -> str:
+            self.operator_benchmarks[key] = dict(timings)
+            previous = self.operator_cache.get(key)
+            self.operator_cache[key] = route
+            self.operator_reasons[key] = reason
+            if previous != route:
+                self._operator_revision += 1
+            cache[frozen_key] = route
+            try:
+                details = getattr(owner, "_mlbricks_frozen_auto_details", None)
+                if not isinstance(details, dict):
+                    details = {}
+                    setattr(owner, "_mlbricks_frozen_auto_details", details)
+                details[frozen_key] = {
+                    "route": route,
+                    "timings_ms": dict(timings),
+                    "errors": dict(errors),
+                    "parity": dict(parity),
+                    "reason": reason,
+                }
+            except Exception:
+                pass
+            return route
+
+        # Correctness gate: PyTorch is the reference implementation. Native is
+        # eligible for timing only after its first output matches that reference.
+        if bool(verify_parity) and "pytorch" in usable and "native" in usable:
+            rtol, atol = self._parity_tolerances(
+                tensor, rtol=parity_rtol, atol=parity_atol,
+            )
+            try:
+                reference_output = usable["pytorch"]()
+                if tensor.is_cuda:
+                    torch.cuda.synchronize(tensor.device)
+            except Exception as exc:
+                errors["pytorch_reference"] = f"{type(exc).__name__}: {exc}"
+                # Native is never auto-selected without a successful PyTorch
+                # reference comparison. Preserve correctness-first semantics.
+                parity.update({
+                    "checked": False,
+                    "allclose": None,
+                    "rtol": float(rtol),
+                    "atol": float(atol),
+                    "reference_error": errors["pytorch_reference"],
+                })
+                return freeze("pytorch", "correctness-gate:reference-error;pytorch")
+
+            try:
+                native_output = usable["native"]()
+                if tensor.is_cuda:
+                    torch.cuda.synchronize(tensor.device)
+            except Exception as exc:
+                errors["native_validation"] = f"{type(exc).__name__}: {exc}"
+                parity.update({
+                    "checked": True,
+                    "allclose": False,
+                    "rtol": float(rtol),
+                    "atol": float(atol),
+                    "mismatch": "native candidate raised during correctness validation",
+                })
+                return freeze("pytorch", "correctness-gate:native-error;pytorch")
+
+            parity_ok, parity_details = self._compare_candidate_outputs(
+                reference_output,
+                native_output,
+                rtol=rtol,
+                atol=atol,
+            )
+            parity.clear()
+            parity.update(parity_details)
+            if not parity_ok:
+                return freeze("pytorch", "correctness-gate:parity-failed;pytorch")
+
+        warmup = max(0, int(warmup))
+        trials = max(1, int(trials))
         for name, fn in usable.items():
             try:
                 for _ in range(warmup):
@@ -555,6 +754,8 @@ class MLBricksExecutionPlanner:
             )
             return route
 
+        # If native passed parity but later failed during timing, never select it.
+        # If PyTorch alone failed during timing, native is the only qualified route.
         fastest = min(timings, key=timings.get)
         default = self._auto_default(op, fallback=default_auto)
         route = fastest
@@ -565,31 +766,13 @@ class MLBricksExecutionPlanner:
             if improvement < max(0.0, float(switch_margin)):
                 route = default
 
-        key = self.operator_key(op, tensor, training=is_training, extra=extra)
-        self.operator_benchmarks[key] = dict(timings)
-        previous = self.operator_cache.get(key)
-        self.operator_cache[key] = route
-        reason = "benchmark-once:" + ",".join(
+        reason = "correctness-pass;benchmark-once:" if parity.get("checked") else "benchmark-once:"
+        reason += ",".join(
             f"{name}={ms:.6f}ms" for name, ms in sorted(timings.items())
         )
         if errors:
             reason += ";errors=" + ",".join(f"{k}:{v}" for k, v in sorted(errors.items()))
-        self.operator_reasons[key] = reason
-        if previous != route:
-            self._operator_revision += 1
-        cache[frozen_key] = route
-        try:
-            details = getattr(owner, "_mlbricks_frozen_auto_details", None)
-            if not isinstance(details, dict):
-                details = {}
-                setattr(owner, "_mlbricks_frozen_auto_details", details)
-            details[frozen_key] = {
-                "route": route, "timings_ms": dict(timings), "errors": dict(errors),
-                "reason": reason,
-            }
-        except Exception:
-            pass
-        return route
+        return freeze(route, reason)
 
     def select_operator(
         self,

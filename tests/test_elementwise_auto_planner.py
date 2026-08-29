@@ -160,3 +160,141 @@ def test_soup_keeps_backend_policy_per_mixer_element():
     mixers = [row for row in rows if row["kind"] == "mixer"]
     assert len(mixers) == 2
     assert all(row["requested"] == "auto" for row in mixers)
+
+
+def test_correctness_gate_rejects_faster_native_when_output_mismatches():
+    planner = MLBricksExecutionPlanner()
+    x = torch.randn(2, 4, 8)
+
+    class Owner:
+        pass
+
+    owner = Owner()
+
+    def native_wrong():
+        # Deliberately faster but numerically wrong.
+        return x + 1.0
+
+    def pytorch_reference():
+        time.sleep(0.001)
+        return x
+
+    route = planner.qualify_operator_once(
+        owner,
+        "parity_guard",
+        x,
+        {"native": native_wrong, "pytorch": pytorch_reference},
+        native_available=True,
+        training=False,
+        warmup=0,
+        trials=1,
+        switch_margin=0.0,
+    )
+
+    assert route == "pytorch"
+    assert planner.owner_routes(owner) == {("parity_guard", False): "pytorch"}
+    details = owner._mlbricks_frozen_auto_details[("parity_guard", False)]
+    assert details["parity"]["checked"] is True
+    assert details["parity"]["allclose"] is False
+    assert details["reason"] == "correctness-gate:parity-failed;pytorch"
+    # Performance timing must not be used to rescue an incorrect native path.
+    assert details["timings_ms"] == {}
+
+
+def test_correctness_gate_allows_close_nested_native_output_then_benchmarks():
+    planner = MLBricksExecutionPlanner()
+    x = torch.randn(2, 4, 8, dtype=torch.float32)
+
+    class Owner:
+        pass
+
+    owner = Owner()
+
+    def native_fast():
+        return (x + 1.0e-6, {"state": x * 0.5 + 1.0e-6})
+
+    def pytorch_slow():
+        time.sleep(0.002)
+        return (x, {"state": x * 0.5})
+
+    route = planner.qualify_operator_once(
+        owner,
+        "nested_parity",
+        x,
+        {"native": native_fast, "pytorch": pytorch_slow},
+        native_available=True,
+        training=False,
+        warmup=0,
+        trials=3,
+        switch_margin=0.0,
+    )
+
+    assert route == "native"
+    details = owner._mlbricks_frozen_auto_details[("nested_parity", False)]
+    assert details["parity"]["checked"] is True
+    assert details["parity"]["allclose"] is True
+    assert details["parity"]["tensor_leaves"] == 2
+    assert set(details["timings_ms"]) == {"native", "pytorch"}
+    assert details["reason"].startswith("correctness-pass;benchmark-once:")
+
+
+def test_correctness_gate_freezes_pytorch_when_native_validation_raises():
+    planner = MLBricksExecutionPlanner()
+    x = torch.randn(2, 4, 8)
+
+    class Owner:
+        pass
+
+    owner = Owner()
+
+    def broken_native():
+        raise RuntimeError("kernel qualification failed")
+
+    route = planner.qualify_operator_once(
+        owner,
+        "native_validation_error",
+        x,
+        {"native": broken_native, "pytorch": lambda: x},
+        native_available=True,
+        training=False,
+        warmup=0,
+        trials=1,
+    )
+
+    assert route == "pytorch"
+    details = owner._mlbricks_frozen_auto_details[("native_validation_error", False)]
+    assert details["parity"]["checked"] is True
+    assert details["parity"]["allclose"] is False
+    assert "native_validation" in details["errors"]
+    assert details["reason"] == "correctness-gate:native-error;pytorch"
+
+
+def test_correctness_gate_never_auto_selects_unverified_native_if_reference_fails():
+    planner = MLBricksExecutionPlanner()
+    x = torch.randn(2, 4, 8)
+
+    class Owner:
+        pass
+
+    owner = Owner()
+
+    def broken_reference():
+        raise RuntimeError("reference failed")
+
+    route = planner.qualify_operator_once(
+        owner,
+        "reference_failure",
+        x,
+        {"native": lambda: x, "pytorch": broken_reference},
+        native_available=True,
+        training=False,
+        warmup=0,
+        trials=1,
+    )
+
+    assert route == "pytorch"
+    details = owner._mlbricks_frozen_auto_details[("reference_failure", False)]
+    assert details["parity"]["checked"] is False
+    assert details["parity"]["allclose"] is None
+    assert "pytorch_reference" in details["errors"]
+    assert details["reason"] == "correctness-gate:reference-error;pytorch"

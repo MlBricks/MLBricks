@@ -300,12 +300,88 @@ class ThunderESA(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run ESA, qualifying this element once when ``backend='auto'``.
+
+        Eager inference uses the shared correctness-first element planner: full
+        native and PyTorch ESA outputs are compared first, then only valid
+        routes are benchmarked and the winner is frozen on this ESA instance.
+        Training and active ``torch.compile`` tracing keep the established ESA
+        route logic so qualification never runs inside a captured graph.
+        """
+        if self.runtime_backend != "auto" or self.training or torch.is_grad_enabled():
+            return self._forward_impl(x)
+
+        try:
+            from ..auto_backend import _compiler_is_active
+            if _compiler_is_active():
+                return self._forward_impl(x)
+        except Exception:
+            pass
+
+        try:
+            from ...planner import EXECUTION_PLANNER
+            frozen = EXECUTION_PLANNER.owner_routes(self).get(("esa_element", False))
+            if frozen in {"native", "pytorch"}:
+                return self._forward_impl(x, effective_backend_override=frozen)
+
+            from ..native import available as _native_available
+            from ..native import cuda_available as _native_cuda_available
+            native_ok = bool(_native_available())
+            if x.is_cuda:
+                native_ok = native_ok and bool(_native_cuda_available())
+
+            if not native_ok:
+                route = EXECUTION_PLANNER.select_operator_once(
+                    self,
+                    "esa_element",
+                    x,
+                    requested_backend="auto",
+                    native_available=False,
+                    native_supports_training=False,
+                    training=False,
+                    extra=(int(self.embd), int(self.head), str(self.precision), str(self.compass)),
+                    default_auto="native",
+                )
+                return self._forward_impl(x, effective_backend_override=route)
+
+            route = EXECUTION_PLANNER.qualify_operator_once(
+                self,
+                "esa_element",
+                x,
+                {
+                    "native": lambda: self._forward_impl(x, effective_backend_override="native"),
+                    "pytorch": lambda: self._forward_impl(x, effective_backend_override="pytorch"),
+                },
+                requested_backend="auto",
+                native_available=True,
+                native_supports_training=False,
+                training=False,
+                extra=(int(self.embd), int(self.head), str(self.precision), str(self.compass)),
+                default_auto="native",
+            )
+            return self._forward_impl(x, effective_backend_override=route)
+        except RuntimeError:
+            # Correctness/native runtime errors must remain visible to strict
+            # native users, but auto keeps the canonical PyTorch fallback safe.
+            return self._forward_impl(x, effective_backend_override="pytorch")
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        *,
+        effective_backend_override: str | None = None,
+    ) -> torch.Tensor:
         if x.dim() != 3:
             raise ValueError(f"expected input shape [B,T,C], got {x.shape}")
 
         B, T, C = x.shape
 
-        if self.runtime_backend == "native":
+        requested_backend = (
+            self.runtime_backend
+            if effective_backend_override is None
+            else str(effective_backend_override)
+        )
+        if requested_backend == "native":
             from ..native import available as _native_available
             if not _native_available():
                 raise RuntimeError("ESA backend='native' requested but the MLBricks native extension is unavailable")
@@ -317,11 +393,10 @@ class ThunderESA(nn.Module):
                 f"expected embedding dim {self.embd}, got input dim {C}"
             )
 
-        # Performance-aware Auto routing. Explicit native/pytorch requests are
-        # never changed. Training keeps the existing auto/native-autograd scan
-        # behavior; inference can choose the qualified PyTorch compiled path.
-        effective_backend = self.runtime_backend
-        if self.runtime_backend == "auto":
+        # Explicit overrides come from the one-time element qualifier. Without
+        # an override, preserve ESA's existing training/compile qualification.
+        effective_backend = requested_backend
+        if effective_backend_override is None and self.runtime_backend == "auto":
             try:
                 from ..auto_backend import select_esa_auto_backend
                 from ..native import available as _native_available
