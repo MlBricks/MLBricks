@@ -9,7 +9,8 @@
 - **BoltModel / BoltConfig** — ready-made Bolt language-model interface.
 - **FFNBricks** — `StateAwareFFN`, `VirtualStateAwareFFN`, and `MicroVirtualFFN`.
 - **ResController** — adaptive residual control.
-- **ElasticBit** — quantization and compact weight representations.
+- **SOUP** — state-oriented sequence processing with layerwise ESA/Bolt mixer selection.
+- **ElasticBit** — adaptive 4–32-bit CUDA runtime plus PyTorch-compatible quantization helpers.
 - **VESA** — ESA-based vision models.
 - **VisualBolt** — Bolt-based vision models through `VisionBolt`.
 - **Bricks / Brick** — heterogeneous model construction from MLBricks components.
@@ -54,6 +55,7 @@ MLBRICKS_BUILD_VISION_NATIVE=0
 MLBRICKS_BUILD_VESA_NATIVE=0
 MLBRICKS_BUILD_FFNBRICK_NATIVE=0
 MLBRICKS_BUILD_RESIDUALBRICK_NATIVE=0
+MLBRICKS_BUILD_ELASTICBIT_NATIVE=0
 ```
 
 ## Quick start
@@ -72,7 +74,7 @@ residual = ResController(update_ratio=0.18)
 
 MLBricks components use `backend="auto"` by default. The public backend choices are:
 
-- `auto` — choose the best available supported path and fall back safely.
+- `auto` — choose the qualified/planned native or PyTorch route once for a component/workload and keep that route stable during execution.
 - `native` — require a supported MLBricks native implementation.
 - `pytorch` — force the PyTorch/reference path.
 
@@ -162,6 +164,25 @@ from mlbricks import ResController
 controller = ResController(update_ratio=0.18)
 ```
 
+## SOUP
+
+```python
+from mlbricks import SOUP
+
+model = SOUP(
+    dim=512,
+    width=[1116, 1116],
+    depth=2,
+    mixer=["esa", "bolt"],
+    ffn=["saffn", "saffn"],
+    backend="auto",
+)
+```
+
+SOUP forwards `backend="auto"` to its built-in mixers, so ESA/Bolt use their
+qualified MLBricks execution policy without changing routes dynamically during
+steady-state execution. Per-layer mixer and FFN choices remain supported.
+
 ## ElasticBit
 
 ```python
@@ -175,7 +196,17 @@ from mlbricks import (
 )
 ```
 
-ElasticBit provides quantized tensor/module utilities while keeping a PyTorch-compatible fallback path.
+ElasticBit now also exposes the standalone 0.2 adaptive 4–32-bit CUDA API through the MLBricks namespace:
+
+```python
+from mlbricks import ElasticBit
+
+analysis = ElasticBit.bitsAnaliser(weights, calibration, threshold=0.01)
+matrix = ElasticBit.RuntimeMatrix(weights, analysis["selected_bits"], "compact")
+y = matrix.forward(x)
+```
+
+The existing `ElasticLinear`, tensor quantization, and module-conversion helpers remain available as a PyTorch-compatible fallback surface.
 
 ## VESA
 

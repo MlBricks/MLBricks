@@ -71,7 +71,7 @@ def inference_native_allowed(
         return eligible
     if not eligible:
         return False
-    route = EXECUTION_PLANNER.select_operator_cached(module, 
+    route = EXECUTION_PLANNER.select_operator_once(module, 
         "rescontroller", residual, requested_backend="auto",
         native_available=True, native_supports_training=False, training=False,
         extra=(int(residual.shape[-1]),),

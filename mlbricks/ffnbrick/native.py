@@ -105,7 +105,7 @@ def inference_native_allowed(module: object, x: torch.Tensor) -> bool:
         op = "ffnbrick_virtual"
     else:
         op = "ffnbrick_state"
-    route = EXECUTION_PLANNER.select_operator_cached(module, 
+    route = EXECUTION_PLANNER.select_operator_once(module, 
         op, x, requested_backend="auto", native_available=True,
         native_supports_training=False, training=False,
         extra=(int(getattr(module, "d_model", x.shape[-1])),

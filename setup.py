@@ -143,6 +143,19 @@ if enabled("MLBRICKS_BUILD_RESIDUALBRICK_NATIVE"):
         )
     )
 
+# ElasticBit 0.2 is a CUDA-only 4-32 bit runtime. Keep it optional so
+# CPU/source installs still expose the PyTorch compatibility implementation.
+if enabled("MLBRICKS_BUILD_ELASTICBIT_NATIVE") and has_cuda_toolkit:
+    csrc = ROOT / "mlbricks" / "elasticbit" / "csrc"
+    extensions.append(
+        _extension(
+            "mlbricks.elasticbit._C",
+            [],
+            cuda_source=csrc / "elasticbit_runtime.cu",
+            use_fast_math=True,
+        )
+    )
+
 setup(
     ext_modules=extensions,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},

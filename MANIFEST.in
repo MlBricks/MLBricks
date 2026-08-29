@@ -11,6 +11,7 @@ recursive-include mlbricks/ffnbrick *.py *.cpp *.cu *.h *.cuh *.txt
 recursive-include mlbricks/residualbrick *.py *.cpp *.cu *.h *.cuh *.txt
 recursive-include mlbricks/esa *.py *.cpp *.cu *.h *.cuh *.txt *.md
 recursive-include mlbricks/elasticbit *.py *.cpp *.cu *.h *.cuh *.txt *.md
+recursive-include mlbricks/soup *.py *.cpp *.cu *.h *.cuh *.txt *.md
 recursive-include examples *.py
 
 

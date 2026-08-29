@@ -20,6 +20,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..runtime import normalize_backend
+from .native_api import RuntimeMatrix, NativeFP16Matrix, bitsAnaliser, available as native_runtime_available
 from ..planner import EXECUTION_PLANNER
 
 
@@ -254,6 +255,7 @@ class _ElasticWeightMixin:
         data["runtime"] = "auto"
         self.config = ElasticBitConfig.from_manifest(data)
         self.clear_cache()
+        EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
@@ -362,7 +364,7 @@ class ElasticLinear(_ElasticWeightMixin, nn.Module):
         elif policy == "native":
             route = "native"
         else:
-            route = EXECUTION_PLANNER.select_operator_cached(
+            route = EXECUTION_PLANNER.select_operator_once(
                 self,
                 "elastic_linear",
                 x_compute,
@@ -500,7 +502,18 @@ class ElasticEmbedding(_ElasticWeightMixin, nn.Module):
 
 
 class ElasticBit:
-    """High-level ElasticBit quantization interface."""
+    """ElasticBit 4-32 bit runtime plus MLBricks compatibility helpers.
+
+    The standalone ElasticBit 0.2 API is available as class attributes:
+    ``ElasticBit.RuntimeMatrix``, ``ElasticBit.NativeFP16Matrix`` and
+    ``ElasticBit.bitsAnaliser``. Existing MLBricks tensor/module quantization
+    helpers remain available for compatibility and PyTorch fallback execution.
+    """
+
+    RuntimeMatrix = RuntimeMatrix
+    NativeFP16Matrix = NativeFP16Matrix
+    bitsAnaliser = staticmethod(bitsAnaliser)
+    native_runtime_available = staticmethod(native_runtime_available)
 
     def __init__(
         self,

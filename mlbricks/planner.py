@@ -355,6 +355,72 @@ class MLBricksExecutionPlanner:
             pass
         return route
 
+    def select_operator_once(
+        self,
+        owner: object,
+        op: str,
+        tensor: torch.Tensor,
+        *,
+        requested_backend: str = "auto",
+        native_available: bool,
+        native_supports_training: bool = False,
+        training: bool | None = None,
+        extra: tuple[object, ...] = (),
+        default_auto: str | None = None,
+    ) -> str:
+        """Resolve ``backend='auto'`` once for an owning component.
+
+        Unlike the shape-local hot-path cache, this is a *stable execution
+        decision*: after the first auto resolution for an operation/workload,
+        the owner keeps that native/PyTorch route for its lifetime. It is not
+        reconsidered because utilization, temperature, transient load, planner
+        calibration revisions, or later calls change. Explicit ``native`` and
+        ``pytorch`` requests always bypass the frozen auto route.
+
+        The cache is separated by operation and training/eval workload because
+        those can require fundamentally different implementations. Components
+        should only call this helper after checking that their native path is
+        valid for the current input.
+        """
+        policy = normalize_backend(requested_backend, warn_legacy=True)
+        is_training = bool(torch.is_grad_enabled()) if training is None else bool(training)
+        if policy != "auto":
+            return self.select_operator(
+                op, tensor, requested_backend=policy,
+                native_available=native_available,
+                native_supports_training=native_supports_training,
+                training=is_training, extra=extra, default_auto=default_auto,
+            )
+
+        cache = getattr(owner, "_mlbricks_frozen_auto_routes", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            try:
+                setattr(owner, "_mlbricks_frozen_auto_routes", cache)
+            except Exception:
+                pass
+        key = (str(op), bool(is_training))
+        route = cache.get(key)
+        if route in {"native", "pytorch"}:
+            return route
+
+        route = self.select_operator(
+            op, tensor, requested_backend="auto",
+            native_available=native_available,
+            native_supports_training=native_supports_training,
+            training=is_training, extra=extra, default_auto=default_auto,
+        )
+        cache[key] = route
+        return route
+
+    @staticmethod
+    def clear_owner_routes(owner: object) -> None:
+        """Forget one component's frozen auto decisions after an explicit reset."""
+        try:
+            setattr(owner, "_mlbricks_frozen_auto_routes", {})
+        except Exception:
+            pass
+
     def select_operator(
         self,
         op: str,

@@ -144,6 +144,13 @@ def cuda_built() -> bool:
     return bool(_load_extension().has_cuda())
 
 
+class _VisionRouteOwner:
+    pass
+
+
+_VISION_ROUTE_OWNER = _VisionRouteOwner()
+
+
 def _use_native(
     x: Tensor,
     backend: str,
@@ -162,7 +169,8 @@ def _use_native(
         raise RuntimeError("backend='native' requested but shared vision native extension is unavailable")
     if policy == "native" and x.is_cuda and ok and not cuda_built():
         raise RuntimeError("backend='native' requested on CUDA but vision extension has no CUDA kernels")
-    route = EXECUTION_PLANNER.select_operator(
+    route = EXECUTION_PLANNER.select_operator_once(
+        _VISION_ROUTE_OWNER,
         op,
         x,
         requested_backend=policy,
