@@ -3,15 +3,22 @@ import torch
 import mlbricks as mlb
 
 
-def _mixed_model():
+def _mixed_model(device="cpu"):
     dim = 16
+    device = torch.device(device)
     return mlb.Bricks(
         vocab_size=32,
         dim=dim,
         context=8,
         layers=[
             mlb.Brick(
-                mixer=mlb.ESA(embd=dim, head=2, backend="pytorch", precision="fp32"),
+                mixer=mlb.ESA(
+                    embd=dim,
+                    head=2,
+                    backend="pytorch",
+                    precision="fp32",
+                    device=device,
+                ),
                 ffn=mlb.FFN(dim, 32),
                 dim=dim,
             ),
@@ -22,7 +29,7 @@ def _mixed_model():
             ),
         ],
         backend="pytorch",
-    )
+    ).to(device)
 
 
 def test_package_level_save_load_mixed_model(tmp_path):
