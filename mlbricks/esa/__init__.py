@@ -3,7 +3,6 @@
 from .config import ESAConfig
 from .layer import ESA
 from .model import ESAModel, ESAModelConfig
-from .trainer import Trainer, TrainerState
 from .generation import GenerationResult, GenerationStats
 from .compass import compass, CompassResult
 from .backends import ThunderESA
@@ -25,8 +24,6 @@ __all__ = [
     "ESAConfig",
     "ESAModel",
     "ESAModelConfig",
-    "Trainer",
-    "TrainerState",
     "GenerationResult",
     "GenerationStats",
     "compass",

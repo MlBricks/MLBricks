@@ -1,5 +1,14 @@
 # MLBricks Changelog
 
+## 1.0.0 unified lifecycle update
+
+- Added architecture-agnostic `mlbricks.save()`, `mlbricks.load()`, and `mlbricks.inspect()`.
+- Replaced the ESA-specific trainer with the generic `mlbricks.Trainer` and `mlbricks.train()` APIs.
+- Added `Trainer.fit()`, `Trainer.evaluate()`, generic checkpointing, and `Trainer.resume()`.
+- Added package-level `predict`, `generate`, `compile`, and `quantize` helpers.
+- Removed `ESAModel.save()`, `ESAModel.load()`, and `mlbricks.esa.Trainer` from the public API.
+- Added unified mixed-model lifecycle tests, including ESA + Bolt `Bricks` save/load and resume.
+
 ## 1.0.0
 
 - Clean v1.0.0 public release.

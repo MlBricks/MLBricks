@@ -5,9 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json
 import math
-from pathlib import Path
 import time
 from typing import Any
 
@@ -547,11 +545,14 @@ class ESAModel(nn.Module):
     """
     Complete causal language model built from ESA layers.
 
-    Public lifecycle:
+    Public model operations:
         model(...)
         model.generate(...)
-        model.save(...)
-        ESAModel.load(...)
+
+    Saving/loading/training are package-level MLBricks APIs:
+        mlbricks.save(model, path)
+        mlbricks.load(path)
+        mlbricks.Trainer(model)
     """
 
     def __init__(
@@ -1442,108 +1443,3 @@ class ESAModel(nn.Module):
                 "ESA-Lightning"
             ),
         }
-
-    def save(
-        self,
-        path: str | Path,
-        *,
-        metadata: dict[str, Any] | None = None,
-    ) -> Path:
-        """Save the configuration, weights, and optional metadata to a model directory."""
-        path = Path(path)
-        path.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        (
-            path
-            / "config.json"
-        ).write_text(
-            json.dumps(
-                asdict(
-                    self.config
-                ),
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        torch.save(
-            self.state_dict(),
-            path / "model.pt",
-        )
-
-        meta = {
-            "format_version": self.config.format_version,
-            "architecture": "ESAModel",
-            "generation_engine": "ESA-Lightning",
-            "backend": self.config.backend,
-        }
-        from ..elasticbit import elasticbit_manifest
-        quantization = elasticbit_manifest(self)
-        if quantization is not None:
-            meta["quantization"] = quantization
-
-        if metadata:
-            meta.update(
-                metadata
-            )
-
-        (
-            path
-            / "metadata.json"
-        ).write_text(
-            json.dumps(
-                meta,
-                indent=2,
-                default=str,
-            ),
-            encoding="utf-8",
-        )
-
-        return path
-
-    @classmethod
-    def load(
-        cls,
-        path: str | Path,
-        *,
-        device: str | torch.device = "cpu",
-        strict: bool = True,
-    ) -> "ESAModel":
-        """Load an ESA model directory and restore its configuration and weights."""
-        path = Path(path)
-
-        config = ESAModelConfig.from_dict(
-            json.loads(
-                (
-                    path
-                    / "config.json"
-                ).read_text(
-                    encoding="utf-8"
-                )
-            )
-        )
-
-        target_device = _resolve_model_device(device)
-        model = cls(config, device=target_device)
-
-        metadata_path = path / "metadata.json"
-        metadata: dict[str, Any] = {}
-        if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        quantization = metadata.get("quantization")
-        if quantization is not None:
-            from ..elasticbit import restore_elasticbit_modules
-            restore_elasticbit_modules(model, quantization)
-            model.to(device=target_device)
-
-        state = torch.load(
-            path / "model.pt",
-            map_location=target_device,
-            weights_only=True,
-        )
-        model.load_state_dict(state, strict=strict)
-        return model
-

@@ -41,9 +41,9 @@ from .esa import (
     ESAConfig,
     ESAModel,
     ESAModelConfig,
-    Trainer,
-    TrainerState,
 )
+from .lifecycle import save, load, inspect, predict, generate, compile, quantize
+from .trainer import Trainer, TrainerState, train
 from .optim import Adam, AdamW, FP16_ADAM_MIN_EPS, stabilize_optimizer
 from .esa import GenerationResult, GenerationStats
 from .esa import compass, CompassResult
@@ -144,6 +144,14 @@ __all__ = [
     "ESAModelConfig",
     "Trainer",
     "TrainerState",
+    "save",
+    "load",
+    "inspect",
+    "predict",
+    "generate",
+    "compile",
+    "quantize",
+    "train",
     "Adam",
     "AdamW",
     "FP16_ADAM_MIN_EPS",

@@ -9,7 +9,9 @@ from mlbricks import (
     ESAModel,
     ESAModelConfig,
     Trainer,
-)
+
+    save,
+    load,)
 from mlbricks.backends.lightning import lightning_scan
 
 
@@ -154,12 +156,14 @@ def test_model_save_load_roundtrip(
         / "model"
     )
 
-    model.save(
+    save(
+        model,
         path
     )
 
-    loaded = ESAModel.load(
-        path
+    loaded = load(
+        path,
+        device="cpu"
     )
 
     loaded.eval()

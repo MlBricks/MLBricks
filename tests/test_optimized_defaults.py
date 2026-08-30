@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from mlbricks.generation import parse_engine_spec
-from mlbricks.model import ESAModel, ESAModelConfig
+from mlbricks import ESAModel, ESAModelConfig
 from mlbricks import ESAConfig
 
 

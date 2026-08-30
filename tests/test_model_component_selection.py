@@ -9,7 +9,9 @@ from mlbricks import (
     VirtualStateAwareFFN,
     MicroVirtualFFN,
     ResController,
-)
+
+    save,
+    load,)
 
 
 def _esa_model(**overrides):
@@ -147,8 +149,8 @@ def test_ffnbrick_rescontroller_checkpoint_roundtrip(tmp_path):
     ids = torch.randint(0, 64, (2, 6))
     reference, _ = model(ids)
     path = tmp_path / "component-model"
-    model.save(path)
-    loaded = ESAModel.load(path, device="cpu")
+    save(model, path)
+    loaded = load(path, device="cpu")
     loaded.eval()
     result, _ = loaded(ids)
     assert loaded.config.ffn == "ffnbrick"

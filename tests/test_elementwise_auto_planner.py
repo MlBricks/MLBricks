@@ -1,14 +1,23 @@
 import time
+from types import SimpleNamespace
 
 import torch
+
+import mlbricks.planner as planner_module
 
 from mlbricks import EXECUTION_PLANNER, SOUP
 from mlbricks.planner import MLBricksExecutionPlanner
 
 
-def test_qualify_operator_once_benchmarks_then_freezes_fastest_route():
+def test_qualify_operator_once_benchmarks_then_freezes_fastest_route(monkeypatch):
     planner = MLBricksExecutionPlanner()
     x = torch.randn(2, 4, 8)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        planner_module,
+        "time",
+        SimpleNamespace(perf_counter=lambda: clock["now"]),
+    )
 
     class Owner:
         pass
@@ -16,11 +25,11 @@ def test_qualify_operator_once_benchmarks_then_freezes_fastest_route():
     owner = Owner()
 
     def fast():
-        time.sleep(0.0005)
+        clock["now"] += 0.0005
         return x
 
     def slow():
-        time.sleep(0.003)
+        clock["now"] += 0.003
         return x
 
     route = planner.qualify_operator_once(
@@ -57,9 +66,15 @@ def test_qualify_operator_once_benchmarks_then_freezes_fastest_route():
     assert route_again == "pytorch"
 
 
-def test_qualified_routes_are_independent_per_element_owner():
+def test_qualified_routes_are_independent_per_element_owner(monkeypatch):
     planner = MLBricksExecutionPlanner()
     x = torch.randn(2, 4, 8)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        planner_module,
+        "time",
+        SimpleNamespace(perf_counter=lambda: clock["now"]),
+    )
 
     class Owner:
         pass
@@ -68,11 +83,11 @@ def test_qualified_routes_are_independent_per_element_owner():
     second = Owner()
 
     def fast():
-        time.sleep(0.0005)
+        clock["now"] += 0.0005
         return x
 
     def slow():
-        time.sleep(0.003)
+        clock["now"] += 0.003
         return x
 
     first_route = planner.qualify_operator_once(

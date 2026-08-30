@@ -1,7 +1,9 @@
-# Backward-compatibility module alias.
-# Canonical implementation: mlbricks.esa.model
-# Compatibility note: fixed-shape ESA-Lightning decode step; compile mode default remains unchanged.
-import sys as _sys
-from .esa import model as _impl
+"""Unified MLBricks model lifecycle API.
 
-_sys.modules[__name__] = _impl
+Use ``mlbricks.save`` and ``mlbricks.load`` from the package root in normal
+code. This module exists only as the implementation namespace, not as an ESA
+alias.
+"""
+from .lifecycle import compile, generate, inspect, load, predict, quantize, save
+
+__all__ = ["save", "load", "inspect", "predict", "generate", "compile", "quantize"]

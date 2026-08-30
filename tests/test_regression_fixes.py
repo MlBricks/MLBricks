@@ -4,7 +4,7 @@ import json
 
 import torch
 
-from mlbricks import ESA, ElasticBit, ElasticEmbedding, ElasticLinear, ESAModel, ESAModelConfig, thunderBoost
+from mlbricks import ESA, ElasticBit, ElasticEmbedding, ElasticLinear, ESAModel, ESAModelConfig, thunderBoost, save, load
 from mlbricks.planner import sequence_bucket
 
 
@@ -63,12 +63,12 @@ def test_elasticbit_init_state_and_checkpoint_roundtrip(tmp_path):
     ids = torch.randint(0, 32, (1, 5))
     reference, _ = model(ids)
     path = tmp_path / "packed"
-    model.save(path)
+    save(model, path)
 
     metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["quantization"]["type"] == "elasticbit"
 
-    loaded = ESAModel.load(path, device="cpu").eval()
+    loaded = load(path, device="cpu").eval()
     assert isinstance(loaded.blocks[0].esa.layer.qgv, ElasticLinear)
     output, _ = loaded(ids)
     torch.testing.assert_close(output, reference, atol=0, rtol=0)
@@ -113,7 +113,9 @@ def test_batch_eos_is_persistent(monkeypatch):
     def fake_sample(*args, **kwargs):
         return samples.pop(0).to(model.device)
 
-    monkeypatch.setattr("mlbricks.model.sample_next_token", fake_sample)
+    import importlib
+    esa_model_module = importlib.import_module("mlbricks.esa.model")
+    monkeypatch.setattr(esa_model_module, "sample_next_token", fake_sample)
     result = model.generate_ids(
         ids,
         seek=5,
@@ -161,8 +163,8 @@ def test_elasticbit_tied_storage_survives_checkpoint_load(tmp_path):
     model = _tiny_model().eval()
     ElasticBit(bits=4, group_size=8).quantize_module(model, include_embeddings=True)
     path = tmp_path / "packed_tied"
-    model.save(path)
-    loaded = ESAModel.load(path, device="cpu").eval()
+    save(model, path)
+    loaded = load(path, device="cpu").eval()
     assert isinstance(loaded.wte, ElasticEmbedding)
     assert isinstance(loaded.lm_head, ElasticLinear)
     assert loaded.wte.packed_weight.data_ptr() == loaded.lm_head.packed_weight.data_ptr()

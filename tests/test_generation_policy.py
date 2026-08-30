@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 
-from mlbricks.model import ESAModel
+from mlbricks import ESAModel
 
 
 def test_generation_fast_defaults() -> None:

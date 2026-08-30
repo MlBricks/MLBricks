@@ -3,7 +3,11 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 import re
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 
 from mlbricks import ESA, ESAModel, ESAModelConfig
 
@@ -52,7 +56,7 @@ def test_readme_has_no_stale_compile_default_claims() -> None:
 
 
 def test_source_docs_match_compile_policy() -> None:
-    text = (ROOT / "mlbricks" / "model.py").read_text(encoding="utf-8")
+    text = (ROOT / "mlbricks" / "esa" / "model.py").read_text(encoding="utf-8")
     assert "fixed-shape ESA-Lightning decode step" in text
     assert "default" in text
 

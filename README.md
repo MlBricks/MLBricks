@@ -86,6 +86,69 @@ bolt.set_backend("pytorch")
 bolt.set_backend("auto")
 ```
 
+## Unified model lifecycle
+
+Saving, loading, training, resume, inference, compilation, and quantization are package-level MLBricks APIs. They are not owned by ESA or any other individual architecture.
+
+```python
+import mlbricks as mlb
+
+mlb.save(model, "my_model")
+model = mlb.load("my_model", device="auto")
+info = mlb.inspect("my_model")
+```
+
+The same calls work for ESA models, Bolt models, SOUP, VESA, `Bricks`, and mixed models built from multiple MLBricks components.
+
+Train with the generic trainer:
+
+```python
+trainer = mlb.Trainer(
+    model,
+    optimizer="adamw",
+    lr=3e-4,
+    checkpoint_dir="checkpoints",
+    save_every=1000,
+)
+
+trainer.fit(
+    train_loader,
+    steps=10_000,
+    val_loader=val_loader,
+    validate_every=500,
+)
+```
+
+Or use the one-call convenience API:
+
+```python
+trainer = mlb.train(
+    model,
+    train_loader,
+    steps=10_000,
+    optimizer="adamw",
+    lr=3e-4,
+)
+```
+
+Resume an interrupted run with model weights, optimizer state, training step, scaler state, scheduler state (when supplied), and RNG state:
+
+```python
+trainer = mlb.Trainer.resume("checkpoints/last", device="auto")
+trainer.fit(train_loader, steps=20_000)
+```
+
+Unified inference and optimization helpers are also available:
+
+```python
+y = mlb.predict(model, x)
+text_or_tokens = mlb.generate(model, prompt, max_new_tokens=128)
+model = mlb.compile(model)
+model = mlb.quantize(model, method="elasticbit", bits=4)
+```
+
+`ESAModel.save()`, `ESAModel.load()`, and `mlbricks.esa.Trainer` are no longer public APIs.
+
 ## ESA
 
 ```python
@@ -97,7 +160,7 @@ esa = ESA(
 )
 ```
 
-For the ready-made ESA model lifecycle APIs:
+For the ready-made ESA language-model architecture:
 
 ```python
 from mlbricks import ESAModel, ESAModelConfig

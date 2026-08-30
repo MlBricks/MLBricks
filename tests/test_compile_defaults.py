@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 
-from mlbricks.model import ESAModel, ESAModelConfig
+from mlbricks import ESAModel, ESAModelConfig
 
 
 def test_training_compile_mode_default() -> None:
