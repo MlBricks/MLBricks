@@ -17,3 +17,10 @@
 - Consolidated the validated Bolt implementation under `mlbricks.bolt`.
 - Preserved existing computation, state-dict structure, planner behavior, and native acceleration paths.
 - Added `API.md` for the v1.0.0 public API.
+
+### ESA native training
+
+- Enabled explicit `backend="native"` Thunder ESA training when the CUDA native extension and registered autograd operators are available.
+- Native training now routes differentiable Thunder scans through the existing chunked native backward path without requiring `MLBRICKS_NATIVE_TRAINING=1`.
+- Fused native readout/full-forward kernels remain inference-only and are explicitly blocked while gradients are enabled.
+

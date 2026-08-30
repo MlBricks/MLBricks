@@ -119,10 +119,11 @@ def select_esa_auto_backend(
 ) -> str:
     """Select the effective ESA route for ``backend='auto'``.
 
-    Returns ``'native'``, ``'pytorch'`` or ``'auto'``.  ``'auto'`` is used for
-    training because the existing ESA training path can use registered native
-    scan operators with autograd without turning the whole layer into the
-    inference-only explicit native path.
+    Returns ``'native'``, ``'pytorch'`` or ``'auto'``.  ``'auto'`` is kept for
+    training so the existing training route can use registered native scan
+    operators with autograd while retaining safe PyTorch fallback behavior.
+    Explicit ``native`` training is also supported when the CUDA autograd
+    operators are available.
     """
     if bool(training):
         return "auto"

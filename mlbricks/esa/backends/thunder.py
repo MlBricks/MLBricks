@@ -385,9 +385,17 @@ class ThunderESA(nn.Module):
         if requested_backend == "native":
             from ..native import available as _native_available
             if not _native_available():
-                raise RuntimeError("ESA backend='native' requested but the MLBricks native extension is unavailable")
-            if torch.is_grad_enabled():
-                raise RuntimeError("ESA backend='native' is currently an eager inference path; use auto/pytorch for training")
+                raise RuntimeError(
+                    "ESA backend='native' requested but the MLBricks native extension is unavailable"
+                )
+            if self.training or torch.is_grad_enabled():
+                from ..native import training_enabled_for as _native_training_enabled_for
+                if not _native_training_enabled_for(x):
+                    raise RuntimeError(
+                        "ESA backend='native' training requires CUDA plus the registered "
+                        "MLBricks Thunder autograd operators; use backend='pytorch' if "
+                        "the native training runtime is unavailable"
+                    )
 
         if C != self.embd:
             raise ValueError(
@@ -445,8 +453,9 @@ class ThunderESA(nn.Module):
 
         qgv = self.qgv(x)
 
-        # Native CUDA v2 inference fast path. The public ThunderESA API,
-        # parameters, checkpoint format, and training path are unchanged.
+        # Native CUDA v2 fused inference fast path. The recurrent native scan
+        # below is separately autograd-capable; this fused readout remains
+        # inference-only.
         # This path consumes the combined Q/G/V projection directly, fusing
         # gate/value transforms + recurrence and then RMS/readout into two
         # CUDA kernels before the existing output projection.

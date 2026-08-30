@@ -6,7 +6,8 @@
 
 This module is deliberately not part of the public MLBricks API. Existing ESA
 constructors, checkpoints, and methods stay unchanged. When the compiled
-extension is available, inference paths can use native C++/CUDA operators.
+extension is available, eligible CUDA inference and recurrent-training paths
+can use native C++/CUDA operators.
 """
 from __future__ import annotations
 
@@ -80,24 +81,52 @@ def import_error() -> Exception | None:
     return _IMPORT_ERROR
 
 
+def training_enabled_for(tensor: torch.Tensor) -> bool:
+    """Return whether the native Thunder scan is safe for autograd training.
+
+    Native ESA training is deliberately narrower than native inference.  The
+    recurrent CUDA scan has an explicit registered autograd formula backed by
+    ``thunder_scan_backward_chunked``.  Fused readout/full-forward kernels stay
+    inference-only and are guarded separately by :func:`fused_enabled_for`.
+    """
+    if os.getenv("MLBRICKS_DISABLE_NATIVE", "0") == "1":
+        return False
+    if _C is None or not bool(getattr(tensor, "is_cuda", False)):
+        return False
+    try:
+        if not bool(_C.has_cuda()):
+            return False
+    except Exception:
+        return False
+
+    # Explicit native training uses the dispatcher autograd registration. This
+    # also keeps torch.compile/AOTAutograd on stable torch.ops operators rather
+    # than exposing a raw pybind call with no autograd contract.
+    return bool(_CUSTOM_OPS_REGISTERED)
+
+
 def enabled_for(tensor: torch.Tensor) -> bool:
     if os.getenv("MLBRICKS_DISABLE_NATIVE", "0") == "1":
         return False
     if _C is None:
         return False
-    # Automatically accelerate CUDA inference only. Training/backward keeps the
-    # original PyTorch implementation because v1.0 native ops are forward-only.
-    # MLBRICKS_NATIVE_CPU=1 exists only for local correctness/benchmark tests.
+
+    # Native CUDA Thunder now supports recurrent training/backward.  CPU native
+    # remains a correctness/benchmark opt-in only.
     if torch.is_grad_enabled():
-        return False
+        return training_enabled_for(tensor)
     if tensor.is_cuda:
         return True
     return os.getenv("MLBRICKS_NATIVE_CPU", "0") == "1"
 
 
 def fused_enabled_for(tensor: torch.Tensor) -> bool:
-    """Return True when the fused Thunder inference path may be used."""
+    """Return True when the fused Thunder *inference-only* path may be used."""
     if os.getenv("MLBRICKS_DISABLE_FUSED", "0") == "1":
+        return False
+    # Do not let enabling native scan training expose fused kernels that do not
+    # have the recurrent training autograd contract.
+    if torch.is_grad_enabled():
         return False
     if not enabled_for(tensor):
         return False
@@ -771,8 +800,13 @@ def thunder_scan(
 
     normalized = _normalize_compass(compass)
     if _allow_planner and _planner_supported(A, B_write):
-        native_training = os.getenv("MLBRICKS_NATIVE_TRAINING", "0") == "1"
-        if normalized == "auto" or native_training or not torch.is_grad_enabled():
+        needs_backward = bool(
+            torch.is_grad_enabled() and (A.requires_grad or B_write.requires_grad)
+        )
+        # Training no longer needs the old MLBRICKS_NATIVE_TRAINING opt-in.
+        # Route differentiable CUDA scans through the planned autograd-capable
+        # implementation automatically; inference keeps the same planner path.
+        if normalized == "auto" or needs_backward or not torch.is_grad_enabled():
             return thunder_scan_planned(A, B_write, normalized)
 
     if normalized == "auto":
