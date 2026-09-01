@@ -9,13 +9,6 @@ description = "MLBricks modular neural-network library with uniform auto/native/
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE.md" }
-license-files = [
-  "LICENSE.md",
-  "LICENSING_NOTICE.md",
-  "COMMERCIAL_LICENSE.md",
-  "mlbricks/LICENSE_*.txt",
-  "mlbricks/**/LICENSE_*.txt",
-]
 authors = [
   { name = "Zameer Hussain" },
   { name = "Akhtar Hussain" }
