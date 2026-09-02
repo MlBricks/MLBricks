@@ -1058,11 +1058,23 @@ class Bolt(nn.Module):
             key_cache = c_used
             if self.position is not None:
                 key_cache = self.position(c_used, start_pos=0)
-            scores = torch.matmul(q[:, :, None, :], key_cache.transpose(-2, -1))
-            scores = scores * rho_used[:, :, None, :].float()
-            scores = scores * (1.0 / math.sqrt(float(self.head_dim)))
-            p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-            y = torch.matmul(p, c_used)[:, :, 0, :]
+            if self.use_sdpa:
+                # Same Bolt equation as full eval/prefill, but let PyTorch's
+                # scaled-dot-product attention fuse score scaling, softmax and
+                # value reduction for the one-token decode query.  Keeping rho
+                # in the key reproduces (Q C^T) * rho / sqrt(head_dim).
+                k = (key_cache.float() * rho_used.unsqueeze(-1).float()).to(c_used.dtype)
+                y = _sdpa(
+                    q[:, :, None, :], k, c_used,
+                    scale=1.0 / math.sqrt(float(self.head_dim)),
+                    causal=False, dropout_p=0.0, training=False,
+                )[:, :, 0, :]
+            else:
+                scores = torch.matmul(q[:, :, None, :], key_cache.transpose(-2, -1))
+                scores = scores * rho_used[:, :, None, :].float()
+                scores = scores * (1.0 / math.sqrt(float(self.head_dim)))
+                p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+                y = torch.matmul(p, c_used)[:, :, 0, :]
         return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
 
     @torch.no_grad()
