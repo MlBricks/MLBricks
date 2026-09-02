@@ -51,3 +51,46 @@ def test_bolt_prefill_decode_step_matches_full_causal_forward():
     c_cache, rho_cache = cache
     assert c_cache.shape == (2, 4, 8, 4)
     assert rho_cache.shape == (2, 4, 8)
+
+
+def test_compressed_bolt_decode_keeps_compact_path(monkeypatch):
+    import mlbricks.bolt.attention as bolt_attention
+
+    torch.manual_seed(41)
+    # head_dim=8, latent_dim=4 => compressed Bolt must not materialize K/use SDPA.
+    layer = Bolt(32, 4, latent_dim=4, backend="pytorch", use_sdpa=True).eval()
+    q = torch.randn(2, 4, 4)
+    c = torch.randn(2, 4, 7, 4)
+    rho = torch.rsqrt(c.float().square().mean(dim=-1) + layer.eps)
+
+    def forbidden_sdpa(*args, **kwargs):
+        raise AssertionError("compressed Bolt decode must keep compact C+rho execution")
+
+    monkeypatch.setattr(bolt_attention, "_sdpa", forbidden_sdpa)
+    y = layer.decode_projected(q, c, rho, used_length=7)
+    assert y.shape == (2, 32)
+    assert torch.isfinite(y).all()
+
+
+def test_parameter_matched_bolt_decode_keeps_sdpa_path(monkeypatch):
+    import mlbricks.bolt.attention as bolt_attention
+
+    torch.manual_seed(42)
+    # head_dim=8, latent_dim=8 => retain the SDPA decode optimization.
+    layer = Bolt(32, 4, latent_dim=8, backend="pytorch", use_sdpa=True).eval()
+    q = torch.randn(2, 4, 8)
+    c = torch.randn(2, 4, 7, 8)
+    rho = torch.rsqrt(c.float().square().mean(dim=-1) + layer.eps)
+
+    calls = {"n": 0}
+    real_sdpa = bolt_attention._sdpa
+
+    def counted_sdpa(*args, **kwargs):
+        calls["n"] += 1
+        return real_sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(bolt_attention, "_sdpa", counted_sdpa)
+    y = layer.decode_projected(q, c, rho, used_length=7)
+    assert y.shape == (2, 32)
+    assert torch.isfinite(y).all()
+    assert calls["n"] == 1

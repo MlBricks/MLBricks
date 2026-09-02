@@ -1058,11 +1058,17 @@ class Bolt(nn.Module):
             key_cache = c_used
             if self.position is not None:
                 key_cache = self.position(c_used, start_pos=0)
-            if self.use_sdpa:
-                # Same Bolt equation as full eval/prefill, but let PyTorch's
-                # scaled-dot-product attention fuse score scaling, softmax and
-                # value reduction for the one-token decode query.  Keeping rho
-                # in the key reproduces (Q C^T) * rho / sqrt(head_dim).
+            # Decode dispatch is representation-aware.  When Bolt is actually
+            # compressed (latent_dim < head_dim), keep the historical compact
+            # C+rho execution form.  Materializing K=rho*C for the whole cache
+            # every token defeats the bandwidth/temporary-memory advantage that
+            # compressed Bolt is designed to provide at long context.
+            #
+            # Parameter-matched / expanded Bolt keeps the SDPA route measured
+            # faster for those shapes.  Both branches implement the same Bolt
+            # equation and retain the same persistent C+rho cache.
+            use_sdpa_decode = self.use_sdpa and self.latent_dim >= self.head_dim
+            if use_sdpa_decode:
                 k = (key_cache.float() * rho_used.unsqueeze(-1).float()).to(c_used.dtype)
                 y = _sdpa(
                     q[:, :, None, :], k, c_used,
