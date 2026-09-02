@@ -28,3 +28,26 @@ def test_legacy_gauss_import_constructs_bolt():
     layer = Bolt(32, 4, latent_dim=8)
     assert isinstance(layer, Bolt)
     assert type(layer).__name__ == "Bolt"
+
+
+def test_bolt_prefill_decode_step_matches_full_causal_forward():
+    torch.manual_seed(7)
+    layer = Bolt(16, 4, latent_dim=4, backend="pytorch", dropout=0.0).eval()
+    prefix = torch.randn(2, 5, 16)
+    continuation = torch.randn(2, 3, 16)
+
+    with torch.no_grad():
+        prefill_y, cache = layer.prefill(prefix)
+        torch.testing.assert_close(prefill_y, layer(prefix), rtol=1e-5, atol=1e-6)
+
+        sequence = prefix
+        for i in range(continuation.size(1)):
+            token = continuation[:, i:i + 1]
+            sequence = torch.cat((sequence, token), dim=1)
+            expected = layer(sequence)[:, -1:]
+            actual, cache = layer.decode_step(token, cache)
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    c_cache, rho_cache = cache
+    assert c_cache.shape == (2, 4, 8, 4)
+    assert rho_cache.shape == (2, 4, 8)

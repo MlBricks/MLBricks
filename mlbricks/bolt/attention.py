@@ -894,6 +894,63 @@ class Bolt(nn.Module):
         return self.out_proj(y), (c, rho)
 
     @torch.no_grad()
+    def prefill(
+        self, x: torch.Tensor, *, start_pos: int = 0
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Process a prefix and return outputs plus recurrent Bolt cache.
+
+        The cache stores the compact shared-latent ``C`` tensor and its
+        per-token normalization ``rho``. This is the public recurrent mixer
+        interface used by compositional models such as SOUP.
+        """
+        return self.prefill_with_cache(x, start_pos=int(start_pos))
+
+    @torch.no_grad()
+    def decode_step(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Decode one token and append it to the compact Bolt cache.
+
+        ``x`` may be ``[B,D]`` or ``[B,1,D]``. The returned output always
+        has shape ``[B,1,D]`` to match ESA/SOUP's recurrent mixer contract.
+        """
+        if x.dim() == 2:
+            x = x[:, None, :]
+        if x.dim() != 3 or x.size(1) != 1 or x.size(-1) != self.d_model:
+            raise ValueError(f"decode_step expects x with shape [B,1,{self.d_model}]")
+        if not isinstance(cache, (tuple, list)) or len(cache) != 2:
+            raise TypeError("Bolt cache must be a (c_cache, rho_cache) pair")
+
+        c_cache, rho_cache = cache
+        if c_cache.dim() != 4:
+            raise ValueError("c_cache must have shape [B,H,T,latent_dim]")
+        if rho_cache.dim() != 3:
+            raise ValueError("rho_cache must have shape [B,H,T]")
+        if (
+            c_cache.size(0) != x.size(0)
+            or c_cache.size(1) != self.num_heads
+            or c_cache.size(3) != self.latent_dim
+            or rho_cache.shape != c_cache.shape[:3]
+        ):
+            raise ValueError("Bolt cache shape does not match this module or input batch")
+        if c_cache.device != x.device or rho_cache.device != x.device:
+            raise ValueError("x and Bolt cache must be on the same device")
+
+        position = int(c_cache.size(2))
+        q, c_now, rho_now = self.project_decode_state(x, start_pos=position)
+        c_next = torch.cat((c_cache, c_now), dim=2)
+        rho_next = torch.cat((rho_cache, rho_now), dim=2)
+        y = self.decode_projected(
+            q, c_next, rho_next, used_length=position + 1
+        )[:, None, :]
+        return y, (c_next, rho_next)
+
+    lightning_prefill = prefill
+    lightning_step = decode_step
+
+    @torch.no_grad()
     def project_decode_state(self, x: torch.Tensor, *, start_pos: int):
         """One packed GEMM for current-token Q/C/G plus cache preprocessing."""
         if x.dim() == 3:
@@ -1001,11 +1058,23 @@ class Bolt(nn.Module):
             key_cache = c_used
             if self.position is not None:
                 key_cache = self.position(c_used, start_pos=0)
-            scores = torch.matmul(q[:, :, None, :], key_cache.transpose(-2, -1))
-            scores = scores * rho_used[:, :, None, :].float()
-            scores = scores * (1.0 / math.sqrt(float(self.head_dim)))
-            p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-            y = torch.matmul(p, c_used)[:, :, 0, :]
+            if self.use_sdpa:
+                # Same Bolt equation as full eval/prefill, but let PyTorch's
+                # scaled-dot-product attention fuse score scaling, softmax and
+                # value reduction for the one-token decode query.  Keeping rho
+                # in the key reproduces (Q C^T) * rho / sqrt(head_dim).
+                k = (key_cache.float() * rho_used.unsqueeze(-1).float()).to(c_used.dtype)
+                y = _sdpa(
+                    q[:, :, None, :], k, c_used,
+                    scale=1.0 / math.sqrt(float(self.head_dim)),
+                    causal=False, dropout_p=0.0, training=False,
+                )[:, :, 0, :]
+            else:
+                scores = torch.matmul(q[:, :, None, :], key_cache.transpose(-2, -1))
+                scores = scores * rho_used[:, :, None, :].float()
+                scores = scores * (1.0 / math.sqrt(float(self.head_dim)))
+                p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+                y = torch.matmul(p, c_used)[:, :, 0, :]
         return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
 
     @torch.no_grad()
