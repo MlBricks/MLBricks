@@ -1,5 +1,13 @@
 # MLBricks Changelog
 
+## 1.0.0 BOLT training performance restoration
+
+- Restored the historical Gauss/BOLT 0.2 full-sequence training route: one autograd-safe packed Q/U/G projection followed by normalized-key PyTorch SDPA.
+- Preserved the original `q_proj`, `c_proj`, `g_proj`, and `out_proj` Parameters/state-dict keys; no checkpoint or architecture change.
+- `use_sdpa=False` remains the explicit-order reference/debug path.
+- Prefill and recurrent decode/cache behavior are unchanged; compact BOLT generation continues to store `C + rho`.
+- No Stream2/custom-backward path is used for this training optimization.
+
 ## 1.0.0 unified lifecycle update
 
 - Added architecture-agnostic `mlbricks.save()`, `mlbricks.load()`, and `mlbricks.inspect()`.

@@ -170,6 +170,8 @@ from mlbricks import ESAModel, ESAModelConfig
 
 `Bolt` and `BoltAttention` are the public attention names in MLBricks v1.0.0.
 
+Full-sequence training uses the historical Gauss/BOLT 0.2 execution identity when `use_sdpa=True`: Q/U/G are projected with one autograd-safe packed GEMM and BOLT runs through normalized-key PyTorch SDPA. The learned Parameters, equations, checkpoints, prefill API, and compact `C + rho` recurrent cache are unchanged.
+
 ```python
 from mlbricks import Bolt, BoltAttention
 

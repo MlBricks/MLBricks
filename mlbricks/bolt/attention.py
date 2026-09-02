@@ -631,6 +631,21 @@ class Bolt(nn.Module):
         hr = self.num_heads * self.latent_dim
         return qcg.split(hr, dim=-1)
 
+    def _qcg_training(self, x: torch.Tensor):
+        """Autograd-safe packed Q/C/G projection for full-sequence training.
+
+        The public Parameters and state-dict keys remain independent. Concatenating
+        them inside the autograd graph lets one GEMM produce Q/U/G while gradients
+        flow back to ``q_proj``, ``c_proj`` and ``g_proj`` exactly as usual.
+        """
+        weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
+        biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
+        weight = torch.cat(weights, dim=0)
+        bias = None if biases[0] is None else torch.cat(biases, dim=0)
+        qcg = F.linear(x, weight, bias)
+        hr = self.num_heads * self.latent_dim
+        return qcg.split(hr, dim=-1)
+
     def _pytorch_full_eval_core(
         self, q_flat: torch.Tensor, u_flat: torch.Tensor, g_flat: torch.Tensor
     ) -> torch.Tensor:
@@ -666,9 +681,15 @@ class Bolt(nn.Module):
         if D != self.d_model:
             raise ValueError(f"expected D={self.d_model}, got {D}")
 
-        q_flat = self.q_proj(x)
-        u_flat = self.c_proj(x)
-        g_flat = self.g_proj(x)
+        # Historical Gauss/BOLT 0.2 training optimization: keep the original
+        # Parameters/state-dict, but execute Q/U/G as one autograd-visible GEMM.
+        # Eval/prefill retains its existing inference-packed cache path.
+        if self.training and torch.is_grad_enabled():
+            q_flat, u_flat, g_flat = self._qcg_training(x)
+        else:
+            q_flat = self.q_proj(x)
+            u_flat = self.c_proj(x)
+            g_flat = self.g_proj(x)
 
         # Full-sequence native vision path. The custom C++ operator owns the
         # Bolt equation while its matmul/softmax operations dispatch through
@@ -776,21 +797,14 @@ class Bolt(nn.Module):
             q = self.position(q, start_pos=0)
             key_c = self.position(c, start_pos=0)
 
-        # Quality-safe policy:
-        # Keep the exact original Gauss equation/order whenever gradients are
-        # enabled in training. This removes SDPA-induced gradient drift while
-        # retaining SDPA for fast eval/prefill. No parameters or mathematics
-        # are changed.
-        if self.position is None and self.training and torch.is_grad_enabled():
-            y = gauss_forward_reference(
-                q, c,
-                head_dim=self.head_dim,
-                eps=self.eps,
-                causal=self.causal,
-                dropout_p=self.dropout,
-                training=True,
-            )
-        elif self.use_sdpa:
+        # Historical Gauss/BOLT 0.2 full-sequence optimization. The normalized
+        # key identity is algebraically the same BOLT equation:
+        #   (Q C^T) * rho / sqrt(head_dim)
+        # == Q (rho C)^T / sqrt(head_dim).
+        # PyTorch SDPA supplies the autograd backward; no custom backward or
+        # Stream2 path is involved. ``use_sdpa=False`` remains the strict
+        # explicit-order reference/debug route.
+        if self.use_sdpa:
             # Key-only normalization. With RoPE, only the key view rotates;
             # raw C remains the value so the shared latent cache stays compact.
             k = (key_c.float() * rho.unsqueeze(-1)).to(c.dtype)
