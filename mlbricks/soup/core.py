@@ -303,7 +303,7 @@ class SOUPFusion(nn.Module):
 
 
 class SOUPDecodeCache(NamedTuple):
-    mixer_states: tuple[torch.Tensor,...]
+    mixer_states: tuple[object,...]
     observer_sum: torch.Tensor
     observer_count: torch.Tensor
 
@@ -405,8 +405,13 @@ class SOUP(nn.Module):
         return super().train(mode)
     def prepare_generation(self,fast=True):
         if self.training: raise RuntimeError('call model.eval() before prepare_generation()')
-        self.clear_generation_plan(); self._generation_fast=bool(fast)
-        if fast:
+        self.clear_generation_plan()
+        # The packed fast path is currently specific to built-in ESA + SAFFN.
+        # Mixed recurrent stacks (for example ESA + Bolt) remain fully
+        # supported through the standard per-mixer prefill/decode contract.
+        can_fast=bool(fast) and all(_can_fastpath_layer(layer) for layer in self.layers)
+        self._generation_fast=can_fast
+        if can_fast:
             self._generation_plans=[_build_layer_fast_plan(layer) for layer in self.layers]; self._observer_fast=_FastObserverPlan(self.observer)
         return self
     def _forward_uniform(self,h,state,prev):

@@ -35,14 +35,20 @@ def _extension(
     lineinfo: bool = False,
     libraries: list[str] | None = None,
 ):
-    source_strings = [str(path) for path in sources]
+    # setuptools requires extension source paths to be relative to setup.py.
+    # Absolute paths can leak into egg-info/SOURCES.txt and make wheel builds
+    # fail even when the source files exist.
+    def _rel(path: Path) -> str:
+        return path.resolve().relative_to(ROOT).as_posix()
+
+    source_strings = [_rel(path) for path in sources]
     define_macros = []
     extra_compile_args: dict[str, list[str]] = {"cxx": ["-O3", "-std=c++17"]}
     extension_cls = CppExtension
 
     if has_cuda_toolkit and cuda_source is not None:
         extension_cls = CUDAExtension
-        source_strings.append(str(cuda_source))
+        source_strings.append(_rel(cuda_source))
         define_macros.append(("WITH_CUDA", None))
         nvcc = ["-O3"]
         if use_fast_math:
@@ -58,7 +64,7 @@ def _extension(
         extra_compile_args=extra_compile_args,
     )
     if include_dirs:
-        kwargs["include_dirs"] = [str(path) for path in include_dirs]
+        kwargs["include_dirs"] = [_rel(path) for path in include_dirs]
     if libraries and extension_cls is CUDAExtension:
         kwargs["libraries"] = libraries
 
