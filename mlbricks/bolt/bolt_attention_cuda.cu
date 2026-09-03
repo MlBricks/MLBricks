@@ -1228,6 +1228,181 @@ __global__ void gauss_tiled_append_partial(
 
 
 // ============================================================
+// GAUSS R=16 SUBWARP TILED PARTIAL
+//
+// Exact-math fast path for the common Bolt latent_dim=16 decode shape.
+// The generic tiled kernel dedicates one 32-lane warp to a 16-value C vector,
+// leaving half of every scoring warp idle.  This kernel packs two tokens into
+// each warp as two independent 16-lane subwarps and evaluates two of the
+// established 8-token microtiles concurrently (16 tokens/block iteration).
+//
+// Importantly, each 8-token microtile keeps the same score/softmax/value
+// accumulation order as gauss_tiled_*: token order remains 0..7, dot products
+// use the same nonzero reduction tree, and the two microtiles are folded into
+// the running online-softmax state sequentially.  The optimization therefore
+// targets occupancy/synchronization overhead rather than changing Bolt math.
+// ============================================================
+
+template <bool APPEND>
+__global__ void gauss_r16_subwarp_tiled_partial(
+    const half* __restrict__ q,
+    half* __restrict__ c,
+    half* __restrict__ rho,
+    const half* __restrict__ c_now,
+    const half* __restrict__ rho_now,
+    float* __restrict__ pm,
+    float* __restrict__ pl,
+    float* __restrict__ po,
+    int BH,
+    int T,
+    int Tstride,
+    int splits,
+    int position,
+    float scale
+) {
+    constexpr int R16 = 16;
+    constexpr int MICRO = 8;
+    constexpr int GROUPS = 2;
+
+    const int block = blockIdx.x;
+    const int bh = block / splits;
+    const int s = block - bh * splits;
+    if (bh >= BH) return;
+
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;          // 0..7
+    const int lane = tid & 31;          // 0..31
+    const int group = lane >> 4;        // two 16-lane subwarps
+    const int d = lane & 15;            // one R=16 dimension per lane
+
+    const int start = (int)(((long long)T * s) / splits);
+    const int end = (int)(((long long)T * (s + 1)) / splits);
+    const long qbase = (long)bh * R16;
+    const long hbase = (long)bh * Tstride * R16;
+    const long rbase = (long)bh * Tstride;
+
+    // Only the first subwarp of warp 0 performs the physical cache append.
+    // Every block that encounters position consumes c_now/rho_now directly,
+    // so no inter-block synchronization is required for the current token.
+    if (APPEND && s == 0 && warp == 0 && group == 0) {
+        c[hbase + (long)position * R16 + d] = c_now[qbase + d];
+        if (d == 0) rho[rbase + position] = rho_now[bh];
+    }
+
+    const float qv = __half2float(q[qbase + d]);
+
+    __shared__ float scores[GROUPS][MICRO];
+    __shared__ float weights[GROUPS][MICRO];
+    __shared__ float vals[GROUPS][MICRO][R16];
+    __shared__ float alpha_micro[GROUPS];
+    __shared__ float beta_micro[GROUPS];
+    __shared__ float ta_micro[GROUPS][R16];
+
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    float a = 0.0f;
+
+    // Two established 8-token microtiles are scored concurrently.
+    for (int tile = start; tile < end; tile += GROUPS * MICRO) {
+        const int t = tile + group * MICRO + warp;
+        const bool valid = t < end;
+        const bool current = APPEND && valid && (t == position);
+
+        float cv = 0.0f;
+        if (valid) {
+            const long base = hbase + (long)t * R16;
+            cv = __half2float(current ? c_now[qbase + d] : c[base + d]);
+        }
+
+        // width=16 reproduces the useful part of the generic warp reduction:
+        // its initial +0 from lanes 16..31 disappears, while offsets 8/4/2/1
+        // and therefore all non-zero additions remain in the same order.
+        float dot = qv * cv;
+        dot += __shfl_down_sync(FULL_MASK, dot, 8, 16);
+        dot += __shfl_down_sync(FULL_MASK, dot, 4, 16);
+        dot += __shfl_down_sync(FULL_MASK, dot, 2, 16);
+        dot += __shfl_down_sync(FULL_MASK, dot, 1, 16);
+
+        if (d == 0) {
+            float score = -FLT_MAX;
+            if (valid) {
+                const float rr = __half2float(
+                    current ? rho_now[bh] : rho[rbase + t]
+                );
+                score = dot * rr * scale;
+            }
+            scores[group][warp] = score;
+        }
+        vals[group][warp][d] = valid ? cv : 0.0f;
+
+        __syncthreads();
+
+        // Fold the two 8-token microtiles in their original sequential order.
+        // This retains the existing online-softmax grouping while halving the
+        // number of outer iterations/synchronization sets for R=16.
+        if (tid == 0) {
+            #pragma unroll
+            for (int g = 0; g < GROUPS; ++g) {
+                float tm = -FLT_MAX;
+                #pragma unroll
+                for (int w = 0; w < MICRO; ++w)
+                    tm = fmaxf(tm, scores[g][w]);
+
+                float tl = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < MICRO; ++w) {
+                    const float sw = scores[g][w];
+                    const float ew = sw == -FLT_MAX ? 0.0f : __expf(sw - tm);
+                    weights[g][w] = ew;
+                    tl += ew;
+                }
+
+                const float nm = fmaxf(m, tm);
+                const float alpha = m == -FLT_MAX ? 0.0f : __expf(m - nm);
+                const float beta = tm == -FLT_MAX ? 0.0f : __expf(tm - nm);
+                alpha_micro[g] = alpha;
+                beta_micro[g] = beta;
+                l = l * alpha + tl * beta;
+                m = nm;
+            }
+        }
+
+        __syncthreads();
+
+        // 32 threads compute both microtile value reductions in parallel:
+        // [g0,d0..15] + [g1,d0..15].  Each reduction keeps w=0..7 order.
+        if (tid < GROUPS * R16) {
+            const int g = tid >> 4;
+            const int dim = tid & 15;
+            float ta = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < MICRO; ++w)
+                ta += weights[g][w] * vals[g][w][dim];
+            ta_micro[g][dim] = ta;
+        }
+
+        __syncthreads();
+
+        if (tid < R16) {
+            #pragma unroll
+            for (int g = 0; g < GROUPS; ++g)
+                a = a * alpha_micro[g] + ta_micro[g][tid] * beta_micro[g];
+        }
+
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        pm[block] = m;
+        pl[block] = l;
+    }
+    if (tid < R16) {
+        const long obase = (long)block * R16;
+        po[obase + tid] = a;
+    }
+}
+
+// ============================================================
 // GAUSS + RoPE PARTIALS
 // q is already RoPE-positioned for the current query position.  C remains
 // raw in the compact cache/value path.  The key view is rotated on-the-fly
@@ -3056,6 +3231,16 @@ torch::Tensor gauss_decode_project_out_used_cuda(
             reinterpret_cast<const half*>(rho.data_ptr<at::Half>()),
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,splits,(float)scale);
+    } else if(mode==3){
+        TORCH_CHECK(H==4 && R==16 && D==128,
+                    "R16 subwarp no-O mode requires H=4, R=16, D=128");
+        gauss_r16_subwarp_tiled_partial<false><<<BH*splits,TILE_THREADS,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho.data_ptr<at::Half>()),
+            nullptr,nullptr,
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,splits,-1,(float)scale);
     } else TORCH_CHECK(false,"unknown mode");
     launch_merge_project(
         pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
@@ -3125,6 +3310,17 @@ torch::Tensor gauss_decode_append_project_out_cuda(
         TORCH_CHECK(H==4 && R==16 && D==128,
                     "standalone two-pass no-O mode requires H=4, R=16, D=128");
         gauss_twopass_r16_append_partial<<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c_now.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,splits,position,(float)scale);
+    } else if(mode==3){
+        TORCH_CHECK(H==4 && R==16 && D==128,
+                    "R16 subwarp no-O mode requires H=4, R=16, D=128");
+        gauss_r16_subwarp_tiled_partial<true><<<BH*splits,TILE_THREADS,0,stream>>>(
             reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
             reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
             reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),

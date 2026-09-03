@@ -155,6 +155,7 @@ void baseline_unpack_qkv_out_cuda(
     torch::Tensor v_now);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gauss_r16_scan_supported", []() { return true; });
     m.def("baseline_decode", &baseline_decode_cuda);
     m.def("gauss_decode", &gauss_decode_cuda);
     m.def("gauss_gate_rho", &gauss_gate_rho_cuda);

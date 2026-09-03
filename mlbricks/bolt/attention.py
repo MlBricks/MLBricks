@@ -16,6 +16,7 @@ from .._backend import (
     WORKSPACES,
     KernelConfig,
     autotune,
+    autotune_gauss_no_o,
     autotune_gauss_rope,
     heuristic_config,
     load_cuda_extension,
@@ -1201,6 +1202,13 @@ class Bolt(nn.Module):
             y = ws.out
         elif plain_native:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
+            if cfg is not None and self.autotune_kernels:
+                cfg = autotune_gauss_no_o(
+                    q=q, c=c_cache, rho=rho_cache,
+                    weight=self.out_proj.weight.contiguous(),
+                    head_dim=self.head_dim, ext=ext, force=force_retune,
+                    used_length=used,
+                )
             if cfg is None:
                 if self.autotune_kernels:
                     cfg = autotune(
@@ -1379,6 +1387,13 @@ class Bolt(nn.Module):
 
         if plain_fused:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
+            if cfg is not None and self.autotune_kernels:
+                cfg = autotune_gauss_no_o(
+                    q=q, c=c_cache, rho=rho_cache,
+                    weight=self.out_proj.weight.contiguous(),
+                    head_dim=self.head_dim, ext=ext, force=force_retune,
+                    used_length=used, c_now=c_now3, rho_now=rho_now2, position=pos,
+                )
             if cfg is None:
                 if self.autotune_kernels:
                     cfg = autotune(
@@ -1501,6 +1516,13 @@ class Bolt(nn.Module):
             y = torch.matmul(p, c_used)[:, :, 0, :]
         else:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_native else None
+            if cfg is not None and self.autotune_kernels:
+                cfg = autotune_gauss_no_o(
+                    q=q, c=c_cache, rho=rho_cache,
+                    weight=self.out_proj.weight.contiguous(),
+                    head_dim=self.head_dim, ext=ext, force=force_retune,
+                    used_length=used,
+                )
             if cfg is None:
                 if self.autotune_kernels:
                     cfg = autotune(
