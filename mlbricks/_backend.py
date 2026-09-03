@@ -112,7 +112,13 @@ class KernelConfig:
 
     @property
     def mode_name(self) -> str:
-        return "stream" if self.mode == 0 else "tiled8"
+        if self.mode == 0:
+            return "stream"
+        if self.mode == 1:
+            return "tiled8"
+        if self.mode == 2:
+            return "standalone_twopass"
+        return f"mode{self.mode}"
 
 
 class TuneStore:

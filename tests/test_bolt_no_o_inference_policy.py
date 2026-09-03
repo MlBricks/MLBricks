@@ -15,6 +15,9 @@ def test_bolt_training_keeps_native_stage1_sdpa_and_inference_has_no_o_route():
     assert "gauss_decode_append_project_out" in attention
     assert "gauss_decode_project_out_used" in attention
     assert "merge_project_partial" in cuda
+    assert "gauss_twopass_r16_partial" in cuda
+    assert "gauss_twopass_r16_append_partial" in cuda
+    assert "standalone two-pass no-O mode requires H=4, R=16, D=128" in cuda
     assert 'm.def("gauss_decode_append_project_out"' in bindings
 
 
@@ -49,7 +52,7 @@ def test_standalone_no_o_fast_config_is_narrow_and_exact():
     for used, splits in expected.items():
         cfg = bolt._standalone_no_o_config(batch=1, used=used)
         assert cfg is not None
-        assert cfg.mode == 0
+        assert cfg.mode == 2
         assert cfg.splits == splits
 
     # Do not force the standalone schedule outside the measured batch/shape.

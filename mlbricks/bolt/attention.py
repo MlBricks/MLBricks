@@ -666,7 +666,7 @@ class Bolt(nn.Module):
             and self.out_proj.bias is None
         ):
             splits = max(1, min(32, (int(used) + 255) // 256))
-            return KernelConfig(mode=0, splits=splits)
+            return KernelConfig(mode=2, splits=splits)
         return None
 
     def _q_c(self, x: torch.Tensor):

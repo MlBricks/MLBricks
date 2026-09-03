@@ -307,6 +307,158 @@ __global__ void gauss_stream_partial(
 
 
 // ============================================================
+// STANDALONE TWO-PASS GAUSS PARTIAL (R=16)
+// Exact q_len=1 history algorithm from the fastest standalone
+// no-O BOLT experiment: pass 1 finds max(score), pass 2 performs
+// one exp per token and accumulates denominator + numerator.
+// ============================================================
+
+__global__ void gauss_twopass_r16_partial(
+    const half* __restrict__ q,
+    const half* __restrict__ c,
+    const half* __restrict__ rho,
+    float* __restrict__ pm,
+    float* __restrict__ pl,
+    float* __restrict__ po,
+    int BH,
+    int T,
+    int Tstride,
+    int splits,
+    float scale
+) {
+    const int block = blockIdx.x;
+    const int bh = block / splits;
+    const int s = block - bh * splits;
+    if (bh >= BH) return;
+
+    const int lane = threadIdx.x;
+    const int start = (int)(((long long)T * s) / splits);
+    const int end = (int)(((long long)T * (s + 1)) / splits);
+    const long qbase = (long)bh * 16;
+    const long hbase = (long)bh * Tstride * 16;
+    const long rbase = (long)bh * Tstride;
+
+    const float qv = lane < 16 ? __half2float(q[qbase + lane]) : 0.0f;
+
+    float m = -INFINITY;
+    for (int t = start; t < end; ++t) {
+        const long base = hbase + (long)t * 16;
+        float v = lane < 16
+            ? qv * __half2float(c[base + lane])
+            : 0.0f;
+        v = warp_sum(v);
+        const float dot = __shfl_sync(FULL_MASK, v, 0);
+        const float score = scale * __half2float(rho[rbase + t]) * dot;
+        m = fmaxf(m, score);
+    }
+    m = __shfl_sync(FULL_MASK, m, 0);
+
+    float den = 0.0f;
+    float num = 0.0f;
+    for (int t = start; t < end; ++t) {
+        const long base = hbase + (long)t * 16;
+        const float cv = lane < 16 ? __half2float(c[base + lane]) : 0.0f;
+        float v = lane < 16 ? qv * cv : 0.0f;
+        v = warp_sum(v);
+        const float dot = __shfl_sync(FULL_MASK, v, 0);
+        const float score = scale * __half2float(rho[rbase + t]) * dot;
+        const float e = expf(score - m);
+        if (lane == 0) den += e;
+        if (lane < 16) num += e * cv;
+    }
+
+    if (lane == 0) {
+        pm[block] = m;
+        pl[block] = den;
+    }
+    if (lane < 16) po[(long)block * 16 + lane] = num;
+}
+
+// Append variant keeps the current C/rho values register/source-resident while
+// scoring, then writes them to the preallocated cache in the same launch.
+// This preserves the newer MLBricks fused append API while using the original
+// standalone two-pass history algorithm.
+__global__ void gauss_twopass_r16_append_partial(
+    const half* __restrict__ q,
+    half* __restrict__ c,
+    half* __restrict__ rho,
+    const half* __restrict__ c_now,
+    const half* __restrict__ rho_now,
+    float* __restrict__ pm,
+    float* __restrict__ pl,
+    float* __restrict__ po,
+    int BH,
+    int T,
+    int Tstride,
+    int splits,
+    int position,
+    float scale
+) {
+    const int block = blockIdx.x;
+    const int bh = block / splits;
+    const int s = block - bh * splits;
+    if (bh >= BH) return;
+
+    const int lane = threadIdx.x;
+    const int start = (int)(((long long)T * s) / splits);
+    const int end = (int)(((long long)T * (s + 1)) / splits);
+    const long qbase = (long)bh * 16;
+    const long hbase = (long)bh * Tstride * 16;
+    const long rbase = (long)bh * Tstride;
+    const long write_base = hbase + (long)position * 16;
+
+    // Only one split performs the cache write. Any split that scores the current
+    // token reads c_now/rho_now directly, so there is no inter-block dependency.
+    if (s == 0) {
+        if (lane < 16) c[write_base + lane] = c_now[qbase + lane];
+        if (lane == 0) rho[rbase + position] = rho_now[bh];
+    }
+
+    const float qv = lane < 16 ? __half2float(q[qbase + lane]) : 0.0f;
+
+    float m = -INFINITY;
+    for (int t = start; t < end; ++t) {
+        const bool current = (t == position);
+        const long base = hbase + (long)t * 16;
+        const float cv = lane < 16
+            ? __half2float(current ? c_now[qbase + lane] : c[base + lane])
+            : 0.0f;
+        float v = lane < 16 ? qv * cv : 0.0f;
+        v = warp_sum(v);
+        const float dot = __shfl_sync(FULL_MASK, v, 0);
+        const float rr = __half2float(current ? rho_now[bh] : rho[rbase + t]);
+        const float score = scale * rr * dot;
+        m = fmaxf(m, score);
+    }
+    m = __shfl_sync(FULL_MASK, m, 0);
+
+    float den = 0.0f;
+    float num = 0.0f;
+    for (int t = start; t < end; ++t) {
+        const bool current = (t == position);
+        const long base = hbase + (long)t * 16;
+        const float cv = lane < 16
+            ? __half2float(current ? c_now[qbase + lane] : c[base + lane])
+            : 0.0f;
+        float v = lane < 16 ? qv * cv : 0.0f;
+        v = warp_sum(v);
+        const float dot = __shfl_sync(FULL_MASK, v, 0);
+        const float rr = __half2float(current ? rho_now[bh] : rho[rbase + t]);
+        const float score = scale * rr * dot;
+        const float e = expf(score - m);
+        if (lane == 0) den += e;
+        if (lane < 16) num += e * cv;
+    }
+
+    if (lane == 0) {
+        pm[block] = m;
+        pl[block] = den;
+    }
+    if (lane < 16) po[(long)block * 16 + lane] = num;
+}
+
+
+// ============================================================
 // TILED BASELINE PARTIAL
 // 8 warps score 8 tokens in parallel
 // ============================================================
@@ -2895,6 +3047,15 @@ torch::Tensor gauss_decode_project_out_used_cuda(
             reinterpret_cast<const half*>(rho.data_ptr<at::Half>()),
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,R,splits,(float)scale);
+    } else if(mode==2){
+        TORCH_CHECK(H==4 && R==16 && D==128,
+                    "standalone two-pass no-O mode requires H=4, R=16, D=128");
+        gauss_twopass_r16_partial<<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,splits,(float)scale);
     } else TORCH_CHECK(false,"unknown mode");
     launch_merge_project(
         pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
@@ -2960,6 +3121,17 @@ torch::Tensor gauss_decode_append_project_out_cuda(
             reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,R,splits,position,(float)scale);
+    } else if(mode==2){
+        TORCH_CHECK(H==4 && R==16 && D==128,
+                    "standalone two-pass no-O mode requires H=4, R=16, D=128");
+        gauss_twopass_r16_append_partial<<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c_now.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,splits,position,(float)scale);
     } else TORCH_CHECK(false,"unknown mode");
     launch_merge_project(
         pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
