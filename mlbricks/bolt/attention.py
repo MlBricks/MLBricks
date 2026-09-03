@@ -14,6 +14,7 @@ from ..position import RoPE
 
 from .._backend import (
     WORKSPACES,
+    KernelConfig,
     autotune,
     autotune_gauss_rope,
     heuristic_config,
@@ -649,6 +650,25 @@ class Bolt(nn.Module):
             / self.baseline_cache_bytes_per_head_token
         )
 
+    def _standalone_no_o_config(self, *, batch: int, used: int):
+        """Exact split schedule from the fastest standalone no-O T4 decode.
+
+        Keep this narrowly specialized until the integrated kernel is benchmarked
+        across more shapes. Other geometries/batches continue through the normal
+        autotuner/heuristic path.
+        """
+        if (
+            int(batch) == 1
+            and self.num_heads == 4
+            and self.latent_dim == 16
+            and self.d_model == 128
+            and self.position is None
+            and self.out_proj.bias is None
+        ):
+            splits = max(1, min(32, (int(used) + 255) // 256))
+            return KernelConfig(mode=0, splits=splits)
+        return None
+
     def _q_c(self, x: torch.Tensor):
         B, T, _ = x.shape
         q = self.q_proj(x)
@@ -1180,16 +1200,18 @@ class Bolt(nn.Module):
             )
             y = ws.out
         elif plain_native:
-            if self.autotune_kernels:
-                cfg = autotune(
-                    kind="gauss", q=q, a=c_cache, b=rho_cache, head_dim=self.head_dim,
-                    ext=ext, force=force_retune,
-                    used_length=used if used != capacity else None,
-                )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
-                )
+            cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
+            if cfg is None:
+                if self.autotune_kernels:
+                    cfg = autotune(
+                        kind="gauss", q=q, a=c_cache, b=rho_cache, head_dim=self.head_dim,
+                        ext=ext, force=force_retune,
+                        used_length=used if used != capacity else None,
+                    )
+                else:
+                    cfg = heuristic_config(
+                        kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
+                    )
             ws = WORKSPACES.get(
                 "gauss", B, self.num_heads, self.latent_dim, cfg.splits, q.device
             )
@@ -1356,16 +1378,18 @@ class Bolt(nn.Module):
             return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
 
         if plain_fused:
-            if self.autotune_kernels:
-                cfg = autotune(
-                    kind="gauss", q=q, a=c_cache, b=rho_cache,
-                    head_dim=self.head_dim, ext=ext, force=force_retune,
-                    used_length=used if used != capacity else None,
-                )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
-                )
+            cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
+            if cfg is None:
+                if self.autotune_kernels:
+                    cfg = autotune(
+                        kind="gauss", q=q, a=c_cache, b=rho_cache,
+                        head_dim=self.head_dim, ext=ext, force=force_retune,
+                        used_length=used if used != capacity else None,
+                    )
+                else:
+                    cfg = heuristic_config(
+                        kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
+                    )
             ws = WORKSPACES.get(
                 "gauss", B, self.num_heads, self.latent_dim, cfg.splits, q.device
             )
@@ -1476,25 +1500,27 @@ class Bolt(nn.Module):
             p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             y = torch.matmul(p, c_used)[:, :, 0, :]
         else:
-            if self.autotune_kernels:
-                cfg = autotune(
-                    kind="gauss",
-                    q=q,
-                    a=c_cache,
-                    b=rho_cache,
-                    head_dim=self.head_dim,
-                    ext=ext,
-                    force=force_retune,
-                    used_length=used if used != cache_capacity else None,
-                )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss",
-                    B=B,
-                    H=self.num_heads,
-                    T=used,
-                    W=self.latent_dim,
-                )
+            cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_native else None
+            if cfg is None:
+                if self.autotune_kernels:
+                    cfg = autotune(
+                        kind="gauss",
+                        q=q,
+                        a=c_cache,
+                        b=rho_cache,
+                        head_dim=self.head_dim,
+                        ext=ext,
+                        force=force_retune,
+                        used_length=used if used != cache_capacity else None,
+                    )
+                else:
+                    cfg = heuristic_config(
+                        kind="gauss",
+                        B=B,
+                        H=self.num_heads,
+                        T=used,
+                        W=self.latent_dim,
+                    )
             ws = WORKSPACES.get(
                 "gauss",
                 B,

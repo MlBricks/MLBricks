@@ -27,6 +27,15 @@ __device__ __forceinline__ float warp_sum(float x) {
     return x;
 }
 
+__device__ __forceinline__ float warp_max(float x) {
+    x = fmaxf(x, __shfl_down_sync(FULL_MASK, x, 16));
+    x = fmaxf(x, __shfl_down_sync(FULL_MASK, x, 8));
+    x = fmaxf(x, __shfl_down_sync(FULL_MASK, x, 4));
+    x = fmaxf(x, __shfl_down_sync(FULL_MASK, x, 2));
+    x = fmaxf(x, __shfl_down_sync(FULL_MASK, x, 1));
+    return x;
+}
+
 
 // ============================================================
 // FUSED GAUSS CACHE CREATION
@@ -1504,6 +1513,102 @@ static inline size_t merge_project_smem_bytes(int H, int R) {
 }
 
 
+// Fast standalone no-O reducer port.
+//
+// This is the exact execution shape that won the standalone T4 generation
+// experiment: H=4, R=16, D=128, <=32 context splits. One warp merges each
+// BOLT head, producing the 64-wide O only in shared memory. The same block
+// immediately applies PyTorch's native Linear layout weight[D,64] and writes Y.
+// Other shapes continue through merge_project_partial above.
+__global__ void merge_project_h4_r16_d128(
+    const float* __restrict__ pm,
+    const float* __restrict__ pl,
+    const float* __restrict__ po,
+    const half* __restrict__ weight,
+    half* __restrict__ y,
+    int B,
+    int splits
+) {
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    if (b >= B) return;
+
+    __shared__ half osh[64];
+
+    if (warp < 4) {
+        const int h = warp;
+        const int bh = b * 4 + h;
+        const long sbase = (long)bh * splits;
+
+        float gm = -FLT_MAX;
+        if (lane < splits)
+            gm = pm[sbase + lane];
+        gm = warp_max(gm);
+        gm = __shfl_sync(FULL_MASK, gm, 0);
+
+        float denom = 0.0f;
+        float numer = 0.0f;
+
+        for (int sp = 0; sp < splits; ++sp) {
+            const float a = __expf(pm[sbase + sp] - gm);
+            if (lane == 0)
+                denom += a * pl[sbase + sp];
+            if (lane < 16)
+                numer += a * po[((long)bh * splits + sp) * 16 + lane];
+        }
+
+        denom = __shfl_sync(FULL_MASK, denom, 0);
+        if (lane < 16)
+            osh[h * 16 + lane] = __float2half_rn(numer / denom);
+    }
+
+    __syncthreads();
+
+    // Native nn.Linear stores weight as [out_features, in_features] = [128,64].
+    if (tid < 128) {
+        float acc = 0.0f;
+        const long wbase = (long)tid * 64;
+        #pragma unroll
+        for (int k = 0; k < 64; ++k)
+            acc += __half2float(osh[k]) * __half2float(weight[wbase + k]);
+        y[(long)b * 128 + tid] = __float2half_rn(acc);
+    }
+}
+
+static inline bool use_fast_no_o_merge(int H, int R, int D, int splits) {
+    return H == 4 && R == 16 && D == 128 && splits >= 1 && splits <= 32;
+}
+
+static inline void launch_merge_project(
+    const float* pm,
+    const float* pl,
+    const float* po,
+    const half* weight,
+    half* y,
+    int B,
+    int H,
+    int R,
+    int D,
+    int splits,
+    cudaStream_t stream
+) {
+    if (use_fast_no_o_merge(H, R, D, splits)) {
+        merge_project_h4_r16_d128<<<B,128,0,stream>>>(
+            pm, pl, po, weight, y, B, splits
+        );
+        return;
+    }
+
+    const int project_blocks = (D + 127) / 128;
+    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
+        pm, pl, po, weight, y, B, H, R, D, splits, project_blocks
+    );
+}
+
+
+
 // ============================================================
 // HOST HELPERS
 // ============================================================
@@ -2791,11 +2896,11 @@ torch::Tensor gauss_decode_project_out_used_cuda(
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,R,splits,(float)scale);
     } else TORCH_CHECK(false,"unknown mode");
-    const int project_blocks = (D + 127) / 128;
-    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
-        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+    launch_merge_project(
+        pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
         reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+        B, H, R, D, splits, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
@@ -2856,11 +2961,11 @@ torch::Tensor gauss_decode_append_project_out_cuda(
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,R,splits,position,(float)scale);
     } else TORCH_CHECK(false,"unknown mode");
-    const int project_blocks = (D + 127) / 128;
-    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
-        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+    launch_merge_project(
+        pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
         reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+        B, H, R, D, splits, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }
@@ -3380,11 +3485,11 @@ torch::Tensor gauss_rope_decode_project_out_used_cuda(
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,R,splits,-1,(float)scale,rope_log_base,rope_dim);
     } else TORCH_CHECK(false,"unknown mode");
-    const int project_blocks = (D + 127) / 128;
-    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
-        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+    launch_merge_project(
+        pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
         reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+        B, H, R, D, splits, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return y;
 }
 
@@ -3433,10 +3538,11 @@ torch::Tensor gauss_rope_decode_append_project_out_cuda(
             pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
             BH,T,capacity,R,splits,position,(float)scale,rope_log_base,rope_dim);
     } else TORCH_CHECK(false,"unknown mode");
-    const int project_blocks = (D + 127) / 128;
-    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
-        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+    launch_merge_project(
+        pm.data_ptr<float>(), pl.data_ptr<float>(), po.data_ptr<float>(),
         reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+        B, H, R, D, splits, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK(); return y;
 }
+
