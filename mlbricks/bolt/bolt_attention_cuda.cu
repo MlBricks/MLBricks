@@ -1421,6 +1421,90 @@ __global__ void merge_partial(
 
 
 // ============================================================
+// MERGE SPLITS + OUTPUT PROJECTION (NO GLOBAL O)
+//
+// One block owns one batch element. Exact split-softmax summaries are merged
+// into a shared-memory O vector [H*R], then the ordinary Linear weight
+// [D,H*R] is applied before any O tensor is written to global memory.
+// This is inference-only; training keeps the saved-O + SDPA path because O is
+// required by backward.
+// ============================================================
+
+__global__ void merge_project_partial(
+    const float* __restrict__ pm,
+    const float* __restrict__ pl,
+    const float* __restrict__ po,
+    const half* __restrict__ weight,
+    half* __restrict__ y,
+    int B,
+    int H,
+    int R,
+    int D,
+    int splits,
+    int blocks_per_batch
+) {
+    const int tile = blockIdx.x % blocks_per_batch;
+    const int b = blockIdx.x / blocks_per_batch;
+    const int tid = threadIdx.x;
+    if (b >= B) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    float* gm = reinterpret_cast<float*>(smem_raw);
+    float* denom = gm + H;
+    half* osh = reinterpret_cast<half*>(denom + H);
+
+    // One thread computes the exact global max/denominator for each head.
+    for (int h = tid; h < H; h += blockDim.x) {
+        const int bh = b * H + h;
+        const long sbase = (long)bh * splits;
+        float m = -FLT_MAX;
+        for (int sp = 0; sp < splits; ++sp)
+            m = fmaxf(m, pm[sbase + sp]);
+        float d = 0.0f;
+        for (int sp = 0; sp < splits; ++sp)
+            d += pl[sbase + sp] * __expf(pm[sbase + sp] - m);
+        gm[h] = m;
+        denom[h] = d;
+    }
+    __syncthreads();
+
+    const int HR = H * R;
+    // Merge each O component once into shared memory. No global O store.
+    for (int k = tid; k < HR; k += blockDim.x) {
+        const int h = k / R;
+        const int r = k - h * R;
+        const int bh = b * H + h;
+        const long sbase = (long)bh * splits;
+        float n = 0.0f;
+        for (int sp = 0; sp < splits; ++sp) {
+            const float w = __expf(pm[sbase + sp] - gm[h]);
+            const long obase = ((long)bh * splits + sp) * R;
+            n += po[obase + r] * w;
+        }
+        osh[k] = __float2half_rn(n / denom[h]);
+    }
+    __syncthreads();
+
+    // F.linear(O, weight): weight is the native PyTorch [D, H*R] layout.
+    // Tile D across blocks so large model widths do not collapse to one block.
+    constexpr int OUT_TILE = 128;
+    const int d_begin = tile * OUT_TILE;
+    const int d_end = min(D, d_begin + OUT_TILE);
+    for (int d = d_begin + tid; d < d_end; d += blockDim.x) {
+        float acc = 0.0f;
+        const long wbase = (long)d * HR;
+        for (int k = 0; k < HR; ++k)
+            acc += __half2float(osh[k]) * __half2float(weight[wbase + k]);
+        y[(long)b * D + d] = __float2half_rn(acc);
+    }
+}
+
+static inline size_t merge_project_smem_bytes(int H, int R) {
+    return (size_t)(2 * H) * sizeof(float) + (size_t)(H * R) * sizeof(half);
+}
+
+
+// ============================================================
 // HOST HELPERS
 // ============================================================
 
@@ -1749,6 +1833,129 @@ torch::Tensor gauss_decode_cuda(
 // ZERO-ALLOCATION UNPACK / PREPROCESS KERNELS
 // ============================================================
 
+// ============================================================
+// FULL-SEQUENCE BOLT STAGE-1 TRAINING
+// packed qcg [B,T,3*H*R] -> q,c,rho (+ gate saved for backward)
+// One warp per token/head. U/G are never materialized as public tensors.
+// ============================================================
+
+__global__ void gauss_stage1_forward_kernel(
+    const half* __restrict__ qcg,
+    half* __restrict__ q_out,
+    half* __restrict__ c_out,
+    float* __restrict__ rho_out,
+    half* __restrict__ gate_out,
+    int B,
+    int T,
+    int H,
+    int R,
+    float eps
+) {
+    const int bth = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int BTH = B * T * H;
+    if (bth >= BTH) return;
+
+    const int h = bth % H;
+    const int bt = bth / H;
+    const int t = bt % T;
+    const int b = bt / T;
+    const int HR = H * R;
+    const int d0 = lane;
+    const int d1 = lane + 32;
+    const long row = ((long)b * T + t) * (3 * HR);
+    const long head_off = (long)h * R;
+    const long out_base = (((long)b * H + h) * T + t) * R;
+
+    float ss = 0.0f;
+
+    if (d0 < R) {
+        const float qf = __half2float(qcg[row + head_off + d0]);
+        const float uf = __half2float(qcg[row + HR + head_off + d0]);
+        const float gf = __half2float(qcg[row + 2 * HR + head_off + d0]);
+        const float a = 1.0f + tanhf(gf);
+        const half ch = __float2half_rn(uf * a);
+        q_out[out_base + d0] = __float2half_rn(qf);
+        c_out[out_base + d0] = ch;
+        gate_out[out_base + d0] = __float2half_rn(a);
+        const float cr = __half2float(ch);
+        ss += cr * cr;
+    }
+    if (d1 < R) {
+        const float qf = __half2float(qcg[row + head_off + d1]);
+        const float uf = __half2float(qcg[row + HR + head_off + d1]);
+        const float gf = __half2float(qcg[row + 2 * HR + head_off + d1]);
+        const float a = 1.0f + tanhf(gf);
+        const half ch = __float2half_rn(uf * a);
+        q_out[out_base + d1] = __float2half_rn(qf);
+        c_out[out_base + d1] = ch;
+        gate_out[out_base + d1] = __float2half_rn(a);
+        const float cr = __half2float(ch);
+        ss += cr * cr;
+    }
+
+    ss = warp_sum(ss);
+    if (lane == 0) {
+        rho_out[((long)b * H + h) * T + t] =
+            rsqrtf(ss / (float)R + eps);
+    }
+}
+
+__global__ void gauss_stage1_backward_kernel(
+    const half* __restrict__ dq,
+    const half* __restrict__ dc,
+    const float* __restrict__ drho,
+    const half* __restrict__ c,
+    const float* __restrict__ rho,
+    const half* __restrict__ gate,
+    half* __restrict__ dqcg,
+    int B,
+    int T,
+    int H,
+    int R
+) {
+    const int bth = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int BTH = B * T * H;
+    if (bth >= BTH) return;
+
+    const int h = bth % H;
+    const int bt = bth / H;
+    const int t = bt % T;
+    const int b = bt / T;
+    const int HR = H * R;
+    const long row = ((long)b * T + t) * (3 * HR);
+    const long head_off = (long)h * R;
+    const long in_base = (((long)b * H + h) * T + t) * R;
+    const long rho_idx = ((long)b * H + h) * T + t;
+    const float rv = rho[rho_idx];
+    const float rg = drho[rho_idx];
+
+    const int d0 = lane;
+    const int d1 = lane + 32;
+
+    if (d0 < R) {
+        const long idx = in_base + d0;
+        const float cv = __half2float(c[idx]);
+        const float a = __half2float(gate[idx]);
+        const float dct = __half2float(dc[idx])
+            - rg * (rv * rv * rv) * cv / (float)R;
+        dqcg[row + head_off + d0] = dq[idx];
+        dqcg[row + HR + head_off + d0] = __float2half_rn(dct * a);
+        dqcg[row + 2 * HR + head_off + d0] = __float2half_rn(dct * cv * (2.0f - a));
+    }
+    if (d1 < R) {
+        const long idx = in_base + d1;
+        const float cv = __half2float(c[idx]);
+        const float a = __half2float(gate[idx]);
+        const float dct = __half2float(dc[idx])
+            - rg * (rv * rv * rv) * cv / (float)R;
+        dqcg[row + head_off + d1] = dq[idx];
+        dqcg[row + HR + head_off + d1] = __float2half_rn(dct * a);
+        dqcg[row + 2 * HR + head_off + d1] = __float2half_rn(dct * cv * (2.0f - a));
+    }
+}
+
 // qcg: [B, 3*H*R], row-major FP16.
 // Writes contiguous q_out [B,H,R], c_out [B,H,R], rho_out [B,H].
 __global__ void gauss_unpack_gate_rho_out_kernel(
@@ -1912,6 +2119,84 @@ static inline void check_float(
     );
 }
 
+
+std::vector<torch::Tensor> gauss_stage1_forward_cuda(
+    torch::Tensor qcg,
+    int64_t heads,
+    int64_t latent,
+    double eps
+) {
+    check_half(qcg, "qcg");
+    TORCH_CHECK(qcg.dim() == 3, "qcg must be [B,T,3*H*R]");
+    const int B = qcg.size(0);
+    const int T = qcg.size(1);
+    const int H = (int)heads;
+    const int R = (int)latent;
+    TORCH_CHECK(R > 0 && R <= 64, "latent must be in [1,64]");
+    TORCH_CHECK(qcg.size(2) == 3 * H * R, "qcg shape mismatch");
+
+    auto q = torch::empty({B,H,T,R}, qcg.options());
+    auto c = torch::empty_like(q);
+    auto rho = torch::empty({B,H,T}, qcg.options().dtype(at::kFloat));
+    auto gate = torch::empty_like(q);
+
+    c10::cuda::CUDAGuard guard(qcg.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(qcg.get_device()).stream();
+    gauss_stage1_forward_kernel<<<B*T*H,32,0,stream>>>(
+        reinterpret_cast<const half*>(qcg.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(q.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(c.data_ptr<at::Half>()),
+        rho.data_ptr<float>(),
+        reinterpret_cast<half*>(gate.data_ptr<at::Half>()),
+        B,T,H,R,(float)eps
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {q,c,rho,gate};
+}
+
+torch::Tensor gauss_stage1_backward_cuda(
+    torch::Tensor dq,
+    torch::Tensor dc,
+    torch::Tensor drho,
+    torch::Tensor c,
+    torch::Tensor rho,
+    torch::Tensor gate,
+    int64_t heads,
+    int64_t latent
+) {
+    check_half(dq, "dq");
+    check_half(dc, "dc");
+    check_float(drho, "drho");
+    check_half(c, "c");
+    check_float(rho, "rho");
+    check_half(gate, "gate");
+    TORCH_CHECK(c.dim() == 4, "c must be [B,H,T,R]");
+    TORCH_CHECK(dq.sizes() == c.sizes() && dc.sizes() == c.sizes(), "dq/dc shape mismatch");
+    TORCH_CHECK(gate.sizes() == c.sizes(), "gate shape mismatch");
+    const int B = c.size(0);
+    const int H = (int)heads;
+    const int T = c.size(2);
+    const int R = (int)latent;
+    TORCH_CHECK(c.size(1) == H && c.size(3) == R, "c head/latent mismatch");
+    TORCH_CHECK(rho.dim() == 3 && rho.size(0) == B && rho.size(1) == H && rho.size(2) == T, "rho shape mismatch");
+    TORCH_CHECK(drho.sizes() == rho.sizes(), "drho shape mismatch");
+
+    auto dqcg = torch::empty({B,T,3*H*R}, c.options());
+    c10::cuda::CUDAGuard guard(c.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(c.get_device()).stream();
+    gauss_stage1_backward_kernel<<<B*T*H,32,0,stream>>>(
+        reinterpret_cast<const half*>(dq.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(dc.data_ptr<at::Half>()),
+        drho.data_ptr<float>(),
+        reinterpret_cast<const half*>(c.data_ptr<at::Half>()),
+        rho.data_ptr<float>(),
+        reinterpret_cast<const half*>(gate.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(dqcg.data_ptr<at::Half>()),
+        B,T,H,R
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dqcg;
+}
 
 void gauss_unpack_gate_rho_out_cuda(
     torch::Tensor qcg,
@@ -2446,6 +2731,140 @@ void gauss_decode_out_used_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+
+// ============================================================
+// PUBLIC: DIRECT C+rho DECODE + W_O (NO GLOBAL O)
+// ============================================================
+
+static torch::Tensor make_project_output(torch::Tensor q, torch::Tensor weight) {
+    TORCH_CHECK(weight.dim()==2, "output projection weight must be [D,H*R]");
+    return torch::empty({q.size(0), weight.size(0)}, q.options());
+}
+
+static void check_project_weight(torch::Tensor q, torch::Tensor weight, int H, int R) {
+    check_half(weight, "weight");
+    TORCH_CHECK(weight.dim()==2, "output projection weight must be [D,H*R]");
+    TORCH_CHECK(weight.size(1)==(long)H*R, "output projection input width mismatch");
+    TORCH_CHECK(weight.size(0)>0, "output projection output width must be positive");
+    TORCH_CHECK(weight.is_contiguous(), "output projection weight must be contiguous");
+    check_same_device(q,weight,"q","weight");
+}
+
+torch::Tensor gauss_decode_project_out_used_cuda(
+    torch::Tensor q, torch::Tensor c, torch::Tensor rho,
+    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
+    torch::Tensor weight, double scale, int64_t mode, int64_t splits_i64, int64_t used_i64
+) {
+    check_half(q,"q"); check_half(c,"c"); check_half(rho,"rho");
+    check_float(pm,"pm"); check_float(pl,"pl"); check_float(po,"po");
+    TORCH_CHECK(q.dim()==3, "q must be [B,H,R]");
+    TORCH_CHECK(c.dim()==4 && rho.dim()==3, "c/rho cache rank mismatch");
+    const int B=(int)q.size(0), H=(int)q.size(1), R=(int)q.size(2);
+    const int capacity=(int)c.size(2), T=(int)used_i64, BH=B*H;
+    const int splits=valid_splits(splits_i64);
+    TORCH_CHECK(B>0 && H>0 && R>0 && R<=64, "invalid Gauss dimensions");
+    TORCH_CHECK(T>=1 && T<=capacity, "used length must be in [1, cache capacity]");
+    TORCH_CHECK(c.size(0)==B && c.size(1)==H && c.size(3)==R, "c shape mismatch");
+    TORCH_CHECK(rho.size(0)==B && rho.size(1)==H && rho.size(2)==capacity, "rho shape mismatch");
+    TORCH_CHECK(pm.size(0)==BH && pm.size(1)==splits, "pm shape mismatch");
+    TORCH_CHECK(pl.sizes()==pm.sizes(), "pl shape mismatch");
+    TORCH_CHECK(po.size(0)==BH && po.size(1)==splits && po.size(2)==R, "po shape mismatch");
+    check_same_device(q,c,"q","c"); check_same_device(q,rho,"q","rho");
+    check_same_device(q,pm,"q","pm"); check_same_device(q,pl,"q","pl"); check_same_device(q,po,"q","po");
+    check_project_weight(q,weight,H,R);
+    auto y=make_project_output(q,weight);
+    const int D=(int)weight.size(0);
+    c10::cuda::CUDAGuard guard(q.device());
+    cudaStream_t stream=c10::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    if(mode==0){
+        gauss_stream_partial<<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,(float)scale);
+    } else if(mode==1){
+        gauss_tiled_partial<<<BH*splits,TILE_THREADS,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,(float)scale);
+    } else TORCH_CHECK(false,"unknown mode");
+    const int project_blocks = (D + 127) / 128;
+    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
+        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+        reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
+torch::Tensor gauss_decode_project_out_cuda(
+    torch::Tensor q, torch::Tensor c, torch::Tensor rho,
+    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
+    torch::Tensor weight, double scale, int64_t mode, int64_t splits_i64
+) {
+    return gauss_decode_project_out_used_cuda(
+        q,c,rho,pm,pl,po,weight,scale,mode,splits_i64,c.size(2));
+}
+
+torch::Tensor gauss_decode_append_project_out_cuda(
+    torch::Tensor q, torch::Tensor c_now, torch::Tensor rho_now,
+    torch::Tensor c_cache, torch::Tensor rho_cache,
+    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
+    torch::Tensor weight, double scale, int64_t mode, int64_t splits_i64, int64_t position_i64
+) {
+    check_half(q,"q"); check_half(c_now,"c_now"); check_half(rho_now,"rho_now");
+    check_half(c_cache,"c_cache"); check_half(rho_cache,"rho_cache");
+    check_float(pm,"pm"); check_float(pl,"pl"); check_float(po,"po");
+    TORCH_CHECK(q.dim()==3 && c_now.dim()==3 && rho_now.dim()==2, "current projected state rank mismatch");
+    TORCH_CHECK(c_cache.dim()==4 && rho_cache.dim()==3, "cache rank mismatch");
+    const int B=(int)q.size(0), H=(int)q.size(1), R=(int)q.size(2);
+    const int capacity=(int)c_cache.size(2), position=(int)position_i64, T=position+1, BH=B*H;
+    const int splits=valid_splits(splits_i64);
+    TORCH_CHECK(position>=0 && position<capacity, "position exceeds cache capacity");
+    TORCH_CHECK(c_now.sizes()==q.sizes(), "current C shape mismatch");
+    TORCH_CHECK(rho_now.size(0)==B && rho_now.size(1)==H, "current rho shape mismatch");
+    TORCH_CHECK(c_cache.size(0)==B && c_cache.size(1)==H && c_cache.size(3)==R, "C cache shape mismatch");
+    TORCH_CHECK(rho_cache.size(0)==B && rho_cache.size(1)==H && rho_cache.size(2)==capacity, "rho cache shape mismatch");
+    TORCH_CHECK(pm.size(0)==BH && pm.size(1)==splits, "pm shape mismatch");
+    TORCH_CHECK(pl.sizes()==pm.sizes(), "pl shape mismatch");
+    TORCH_CHECK(po.size(0)==BH && po.size(1)==splits && po.size(2)==R, "po shape mismatch");
+    check_same_device(q,c_now,"q","c_now"); check_same_device(q,rho_now,"q","rho_now");
+    check_same_device(q,c_cache,"q","c_cache"); check_same_device(q,rho_cache,"q","rho_cache");
+    check_project_weight(q,weight,H,R);
+    auto y=make_project_output(q,weight); const int D=(int)weight.size(0);
+    c10::cuda::CUDAGuard guard(q.device());
+    cudaStream_t stream=c10::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    if(mode==0){
+        gauss_stream_append_partial<<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c_now.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,position,(float)scale);
+    } else if(mode==1){
+        gauss_tiled_append_partial<<<BH*splits,TILE_THREADS,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c_now.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,position,(float)scale);
+    } else TORCH_CHECK(false,"unknown mode");
+    const int project_blocks = (D + 127) / 128;
+    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
+        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+        reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
 // ============================================================
 // PUBLIC: CACHE APPEND ONLY
 // Useful when the mathematical decode must stay in PyTorch (for example
@@ -2918,4 +3337,106 @@ void gauss_rope_decode_append_out_cuda(
         reinterpret_cast<half*>(out.data_ptr<at::Half>()),BH,R,splits
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ============================================================
+// RoPE variants of direct C+rho decode + W_O (NO GLOBAL O)
+// ============================================================
+
+torch::Tensor gauss_rope_decode_project_out_used_cuda(
+    torch::Tensor q, torch::Tensor c, torch::Tensor rho,
+    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
+    torch::Tensor weight, double scale, int64_t mode, int64_t splits_i64, int64_t used_i64,
+    double rope_base, int64_t rope_dim_i64
+) {
+    check_half(q,"q"); check_half(c,"c"); check_half(rho,"rho");
+    check_float(pm,"pm"); check_float(pl,"pl"); check_float(po,"po");
+    TORCH_CHECK(q.dim()==3 && c.dim()==4 && rho.dim()==3, "Gauss+RoPE rank mismatch");
+    const int B=(int)q.size(0), H=(int)q.size(1), R=(int)q.size(2);
+    const int capacity=(int)c.size(2), T=(int)used_i64, BH=B*H;
+    const int splits=valid_splits(splits_i64), rope_dim=(int)rope_dim_i64;
+    TORCH_CHECK(T>=1 && T<=capacity, "used length must be in [1, cache capacity]");
+    TORCH_CHECK(rope_base>0.0 && rope_dim>=2 && rope_dim<=R && (rope_dim%2)==0, "invalid RoPE config");
+    TORCH_CHECK(pm.size(0)==BH && pm.size(1)==splits, "pm shape mismatch");
+    TORCH_CHECK(pl.sizes()==pm.sizes(), "pl shape mismatch");
+    TORCH_CHECK(po.size(0)==BH && po.size(1)==splits && po.size(2)==R, "po shape mismatch");
+    check_project_weight(q,weight,H,R);
+    auto y=make_project_output(q,weight); const int D=(int)weight.size(0);
+    c10::cuda::CUDAGuard guard(q.device());
+    cudaStream_t stream=c10::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    const float rope_log_base=logf((float)rope_base);
+    if(mode==0){
+        gauss_rope_stream_partial<false><<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho.data_ptr<at::Half>()),nullptr,nullptr,
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,-1,(float)scale,rope_log_base,rope_dim);
+    } else if(mode==1){
+        gauss_rope_tiled_partial<false><<<BH*splits,TILE_THREADS,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho.data_ptr<at::Half>()),nullptr,nullptr,
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,-1,(float)scale,rope_log_base,rope_dim);
+    } else TORCH_CHECK(false,"unknown mode");
+    const int project_blocks = (D + 127) / 128;
+    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
+        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+        reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK(); return y;
+}
+
+torch::Tensor gauss_rope_decode_append_project_out_cuda(
+    torch::Tensor q, torch::Tensor c_now, torch::Tensor rho_now,
+    torch::Tensor c_cache, torch::Tensor rho_cache,
+    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
+    torch::Tensor weight, double scale, int64_t mode, int64_t splits_i64, int64_t position_i64,
+    double rope_base, int64_t rope_dim_i64
+) {
+    check_half(q,"q"); check_half(c_now,"c_now"); check_half(rho_now,"rho_now");
+    check_half(c_cache,"c_cache"); check_half(rho_cache,"rho_cache");
+    check_float(pm,"pm"); check_float(pl,"pl"); check_float(po,"po");
+    TORCH_CHECK(q.dim()==3 && c_now.dim()==3 && rho_now.dim()==2, "current projected state rank mismatch");
+    const int B=(int)q.size(0), H=(int)q.size(1), R=(int)q.size(2);
+    const int capacity=(int)c_cache.size(2), position=(int)position_i64, T=position+1, BH=B*H;
+    const int splits=valid_splits(splits_i64), rope_dim=(int)rope_dim_i64;
+    TORCH_CHECK(position>=0 && position<capacity, "position exceeds cache capacity");
+    TORCH_CHECK(rope_base>0.0 && rope_dim>=2 && rope_dim<=R && (rope_dim%2)==0, "invalid RoPE config");
+    TORCH_CHECK(c_now.sizes()==q.sizes(), "current C shape mismatch");
+    TORCH_CHECK(rho_now.size(0)==B && rho_now.size(1)==H, "current rho shape mismatch");
+    TORCH_CHECK(pm.size(0)==BH && pm.size(1)==splits, "pm shape mismatch");
+    TORCH_CHECK(pl.sizes()==pm.sizes(), "pl shape mismatch");
+    TORCH_CHECK(po.size(0)==BH && po.size(1)==splits && po.size(2)==R, "po shape mismatch");
+    check_project_weight(q,weight,H,R);
+    auto y=make_project_output(q,weight); const int D=(int)weight.size(0);
+    c10::cuda::CUDAGuard guard(q.device());
+    cudaStream_t stream=c10::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    const float rope_log_base=logf((float)rope_base);
+    if(mode==0){
+        gauss_rope_stream_partial<true><<<BH*splits,32,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c_now.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,position,(float)scale,rope_log_base,rope_dim);
+    } else if(mode==1){
+        gauss_rope_tiled_partial<true><<<BH*splits,TILE_THREADS,0,stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(c_cache.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(rho_cache.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(c_now.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(rho_now.data_ptr<at::Half>()),
+            pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+            BH,T,capacity,R,splits,position,(float)scale,rope_log_base,rope_dim);
+    } else TORCH_CHECK(false,"unknown mode");
+    const int project_blocks = (D + 127) / 128;
+    merge_project_partial<<<B*project_blocks,128,merge_project_smem_bytes(H,R),stream>>>(
+        pm.data_ptr<float>(),pl.data_ptr<float>(),po.data_ptr<float>(),
+        reinterpret_cast<const half*>(weight.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(y.data_ptr<at::Half>()),B,H,R,D,splits,project_blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK(); return y;
 }

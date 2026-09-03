@@ -1,5 +1,12 @@
 # MLBricks Changelog
 
+## 1.0.0 BOLT compound Stage-1 optimization
+
+- Added an exact native CUDA Stage-1 route that executes packed Q/C/G projection postprocessing as `X -> (Q, C, rho)` without exposing standalone U/G tensors.
+- Added the exact Stage-1 adjoint: `dU=dC*a`, `dG=dC*C*(2-a)` with `a=1+tanh(G)`, followed by packed projection GEMMs for `dX` and `dW`.
+- `backend="pytorch"` remains the strict reference path; `backend="native"` requires the native Stage-1 extension and `backend="auto"` selects the native route when eligible.
+- Public parameters, state-dict keys, BOLT equations, compact `C + rho` cache, and output semantics are unchanged.
+
 ## 1.0.0 BOLT training performance restoration
 
 - Restored the historical Gauss/BOLT 0.2 full-sequence training route: one autograd-safe packed Q/U/G projection followed by normalized-key PyTorch SDPA.

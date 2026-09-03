@@ -172,6 +172,8 @@ from mlbricks import ESAModel, ESAModelConfig
 
 Full-sequence training uses the historical Gauss/BOLT 0.2 execution identity when `use_sdpa=True`: Q/U/G are projected with one autograd-safe packed GEMM and BOLT runs through normalized-key PyTorch SDPA. The learned Parameters, equations, checkpoints, prefill API, and compact `C + rho` recurrent cache are unchanged.
 
+On FP16 CUDA with the Bolt native extension available, Stage-1 is further bundled as `X -> (Q, C, rho)`: the packed Q/C/G GEMM is followed by one native gate/RMS pass, and the exact custom adjoint feeds packed projection GEMMs in backward. `backend="pytorch"` remains the strict reference route.
+
 ```python
 from mlbricks import Bolt, BoltAttention
 
