@@ -22,6 +22,14 @@ std::vector<torch::Tensor> gauss_gate_rho_cuda(
     torch::Tensor g,
     double eps);
 
+std::vector<torch::Tensor> gauss_stage1_forward_cuda(
+    torch::Tensor qcg, int64_t heads, int64_t latent, double eps);
+
+torch::Tensor gauss_stage1_backward_cuda(
+    torch::Tensor dq, torch::Tensor dc, torch::Tensor drho,
+    torch::Tensor c, torch::Tensor rho, torch::Tensor gate,
+    int64_t heads, int64_t latent);
+
 void baseline_decode_out_cuda(
     torch::Tensor q,
     torch::Tensor k,
@@ -109,6 +117,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("baseline_decode", &baseline_decode_cuda);
     m.def("gauss_decode", &gauss_decode_cuda);
     m.def("gauss_gate_rho", &gauss_gate_rho_cuda);
+    m.def("gauss_stage1_forward", &gauss_stage1_forward_cuda);
+    m.def("gauss_stage1_backward", &gauss_stage1_backward_cuda);
 
     m.def("baseline_decode_out", &baseline_decode_out_cuda);
     m.def("gauss_decode_out", &gauss_decode_out_cuda);

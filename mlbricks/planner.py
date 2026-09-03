@@ -38,6 +38,7 @@ AUTO_OPERATOR_DEFAULTS: Final[dict[str, str]] = {
     "vesa_scan": "native",
     "vesa_decode": "native",
     "bolt_decode": "native",
+    "bolt_stage1": "native",
     "attention_decode": "native",
     "bolt_full": "pytorch",
     "vision_scan": "pytorch",

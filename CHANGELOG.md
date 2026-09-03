@@ -1,5 +1,12 @@
 # MLBricks Changelog
 
+## 1.0.0 BOLT compound Stage-1 optimization
+
+- Added a native CUDA compound Stage-1 for FP16 Bolt: packed Q/U/G projection plus fused gate, C-energy reduction and RMS normalization.
+- Added the exact Stage-1 adjoint so training does not retain standalone U/G tensors; the public q/c/g Parameters and checkpoints are unchanged.
+- Restored the normalized-key SDPA training identity when `use_sdpa=True`; `use_sdpa=False` remains the explicit-order reference path.
+- Prefill and recurrent decode can reuse the same compound Stage-1 while preserving the compact FP16 `C + rho` cache.
+
 ## 1.0.0 unified lifecycle update
 
 - Added architecture-agnostic `mlbricks.save()`, `mlbricks.load()`, and `mlbricks.inspect()`.

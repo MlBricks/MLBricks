@@ -170,6 +170,8 @@ from mlbricks import ESAModel, ESAModelConfig
 
 `Bolt` and `BoltAttention` are the public attention names in MLBricks v1.0.0.
 
+CUDA FP16 Bolt now uses a compound Stage-1 execution path when the native extension is available: one packed Q/U/G GEMM followed by one fused gate/RMS postprocess emits only `Q`, `C`, and FP32 `rho`. Training keeps the same parameters/equations and uses normalized-key PyTorch SDPA; `use_sdpa=False` remains the explicit reference route.
+
 ```python
 from mlbricks import Bolt, BoltAttention
 

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .._reference import attention_forward_reference, gauss_forward_reference
+from .._reference import attention_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
 from ..position import RoPE
@@ -79,6 +79,54 @@ def _sdpa(
         is_causal=bool(causal),
         scale=float(scale),
     )
+
+
+class _BoltStage1NativeFn(torch.autograd.Function):
+    """Exact autograd wrapper for the native compound Bolt Stage-1.
+
+    The public module still owns independent q/c/g Parameters.  A packed
+    projection weight is formed in the surrounding autograd graph, while this
+    function owns the packed GEMM plus the native gate/RMS postprocess.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, heads: int, latent: int, eps: float):
+        ext = load_cuda_extension()
+        if ext is None or not hasattr(ext, "gauss_stage1_forward"):
+            raise RuntimeError("native Bolt Stage-1 extension is unavailable")
+        qcg = F.linear(x, weight, bias).contiguous()
+        q, c, rho, gate = ext.gauss_stage1_forward(
+            qcg, int(heads), int(latent), float(eps)
+        )
+        ctx.save_for_backward(x, weight, c, rho, gate)
+        ctx.has_bias = bias is not None
+        ctx.heads = int(heads)
+        ctx.latent = int(latent)
+        return q, c, rho
+
+    @staticmethod
+    def backward(ctx, dq, dc, drho):
+        ext = load_cuda_extension()
+        if ext is None or not hasattr(ext, "gauss_stage1_backward"):
+            raise RuntimeError("native Bolt Stage-1 backward extension is unavailable")
+        x, weight, c, rho, gate = ctx.saved_tensors
+        if dq is None:
+            dq = torch.zeros_like(c)
+        if dc is None:
+            dc = torch.zeros_like(c)
+        if drho is None:
+            drho = torch.zeros_like(rho)
+        dqcg = ext.gauss_stage1_backward(
+            dq.contiguous(), dc.contiguous(), drho.contiguous(),
+            c, rho, gate, ctx.heads, ctx.latent,
+        )
+        B, T, D = x.shape
+        flat_d = dqcg.reshape(B * T, -1)
+        flat_x = x.reshape(B * T, D)
+        dx = flat_d.matmul(weight).reshape_as(x)
+        dw = flat_d.transpose(0, 1).matmul(flat_x)
+        db = flat_d.sum(dim=0) if ctx.has_bias else None
+        return dx, dw, db, None, None, None
 
 
 class Attention(nn.Module):
@@ -631,6 +679,66 @@ class Bolt(nn.Module):
         hr = self.num_heads * self.latent_dim
         return qcg.split(hr, dim=-1)
 
+    def _qcg_training(self, x: torch.Tensor):
+        """One autograd-visible GEMM for Q/U/G without changing Parameters."""
+        weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
+        biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
+        weight = torch.cat(weights, dim=0)
+        bias = None if biases[0] is None else torch.cat(biases, dim=0)
+        qcg = F.linear(x, weight, bias)
+        hr = self.num_heads * self.latent_dim
+        return qcg.split(hr, dim=-1)
+
+    def _native_stage1(self, x: torch.Tensor):
+        """Return native ``(Q,C,rho)`` or ``None`` when the route is ineligible.
+
+        Native Stage-1 is an exact execution transform of the original Bolt
+        equations.  It is currently specialized for contiguous CUDA FP16 and
+        latent widths up to 64.  CPU/other dtypes keep the PyTorch path.
+        """
+        eligible = bool(
+            x.is_cuda
+            and x.dtype == torch.float16
+            and x.is_contiguous()
+            and 1 <= self.latent_dim <= 64
+            and self.backend != "pytorch"
+        )
+        if not eligible:
+            return None
+        ext = load_cuda_extension()
+        native_ok = bool(
+            ext is not None
+            and hasattr(ext, "gauss_stage1_forward")
+            and hasattr(ext, "gauss_stage1_backward")
+        )
+        if not native_ok:
+            return None
+        route = EXECUTION_PLANNER.select_operator_once(
+            self, "bolt_stage1", x, requested_backend=self.backend,
+            native_available=True, native_supports_training=True,
+            training=bool(torch.is_grad_enabled()),
+            extra=(self.num_heads, self.latent_dim, self.d_model),
+            default_auto="native",
+        )
+        if route != "native":
+            return None
+
+        if torch.is_grad_enabled():
+            weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
+            biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
+            weight = torch.cat(weights, dim=0)
+            bias = None if biases[0] is None else torch.cat(biases, dim=0)
+            return _BoltStage1NativeFn.apply(
+                x, weight, bias, self.num_heads, self.latent_dim, self.eps
+            )
+
+        weight, bias = self._packed_qcg()
+        qcg = F.linear(x, weight, bias).contiguous()
+        q, c, rho, _gate = ext.gauss_stage1_forward(
+            qcg, self.num_heads, self.latent_dim, self.eps
+        )
+        return q, c, rho
+
     def _pytorch_full_eval_core(
         self, q_flat: torch.Tensor, u_flat: torch.Tensor, g_flat: torch.Tensor
     ) -> torch.Tensor:
@@ -666,9 +774,15 @@ class Bolt(nn.Module):
         if D != self.d_model:
             raise ValueError(f"expected D={self.d_model}, got {D}")
 
-        q_flat = self.q_proj(x)
-        u_flat = self.c_proj(x)
-        g_flat = self.g_proj(x)
+        # The optional VisionBolt full-sequence route still consumes raw Q/U/G.
+        # Ordinary Bolt uses the compound Stage-1 below so U/G do not escape as
+        # standalone forward tensors when the native path is available.
+        q_flat = u_flat = g_flat = None
+        if self.native_full_sequence:
+            if self.training and torch.is_grad_enabled():
+                q_flat, u_flat, g_flat = self._qcg_training(x)
+            else:
+                q_flat, u_flat, g_flat = self._qcg_inference(x)
 
         # Full-sequence native vision path. The custom C++ operator owns the
         # Bolt equation while its matmul/softmax operations dispatch through
@@ -767,30 +881,30 @@ class Bolt(nn.Module):
                 if native_y is not None:
                     return self.out_proj(native_y)
 
-        c_flat = u_flat * (1.0 + torch.tanh(g_flat))
-        q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
-        c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
-        rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+        stage1 = None if q_flat is not None else self._native_stage1(x)
+        if stage1 is not None:
+            q, c, rho = stage1
+        else:
+            if q_flat is None:
+                if self.training and torch.is_grad_enabled():
+                    q_flat, u_flat, g_flat = self._qcg_training(x)
+                else:
+                    q_flat, u_flat, g_flat = self._qcg_inference(x)
+            c_flat = u_flat * (1.0 + torch.tanh(g_flat))
+            q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+            c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+            rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
         key_c = c
         if self.position is not None:
             q = self.position(q, start_pos=0)
             key_c = self.position(c, start_pos=0)
 
-        # Quality-safe policy:
-        # Keep the exact original Gauss equation/order whenever gradients are
-        # enabled in training. This removes SDPA-induced gradient drift while
-        # retaining SDPA for fast eval/prefill. No parameters or mathematics
-        # are changed.
-        if self.position is None and self.training and torch.is_grad_enabled():
-            y = gauss_forward_reference(
-                q, c,
-                head_dim=self.head_dim,
-                eps=self.eps,
-                causal=self.causal,
-                dropout_p=self.dropout,
-                training=True,
-            )
-        elif self.use_sdpa:
+        # The normalized-key identity is exactly the same Bolt score law:
+        #   (Q C^T) * rho / sqrt(head_dim) == Q (rho C)^T / sqrt(head_dim).
+        # SDPA supplies the optimized score/softmax/value implementation and
+        # its autograd backward. ``use_sdpa=False`` remains the explicit-order
+        # reference/debug route.
+        if self.use_sdpa:
             # Key-only normalization. With RoPE, only the key view rotates;
             # raw C remains the value so the shared latent cache stays compact.
             k = (key_c.float() * rho.unsqueeze(-1)).to(c.dtype)
@@ -860,17 +974,23 @@ class Bolt(nn.Module):
         if x.dim() != 3 or x.size(-1) != self.d_model:
             raise ValueError(f"x must have shape [B,T,{self.d_model}]")
         B, T, _ = x.shape
-        q0, u0, g0 = self._qcg_inference(x)
-        q = q0.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
-        u = u0.view(B * T, self.num_heads, self.latent_dim).contiguous()
-        g = g0.view(B * T, self.num_heads, self.latent_dim).contiguous()
-        c, rho = self._native_gate_rho(u, g)
-        c = c.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
-        rho = rho.view(B, T, self.num_heads).transpose(1, 2).contiguous()
-        # Preserve the eval-forward normalization precision for the output.
-        # The compact cache may keep rho in FP16, but prefill scoring uses the
-        # FP32 rho value just like forward().
-        rho_score = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+        stage1 = self._native_stage1(x)
+        if stage1 is not None:
+            q, c, rho_score = stage1
+            q = q.contiguous()
+            c = c.contiguous()
+            # Recurrent cache remains compact FP16 C+rho exactly as before.
+            rho = rho_score.to(c.dtype).contiguous()
+        else:
+            q0, u0, g0 = self._qcg_inference(x)
+            q = q0.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+            u = u0.view(B * T, self.num_heads, self.latent_dim).contiguous()
+            g = g0.view(B * T, self.num_heads, self.latent_dim).contiguous()
+            c, rho = self._native_gate_rho(u, g)
+            c = c.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+            rho = rho.view(B, T, self.num_heads).transpose(1, 2).contiguous()
+            # Preserve eval-forward FP32 normalization precision for scoring.
+            rho_score = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
         key_c = c
         if self.position is not None:
             q = self.position(q, start_pos=int(start_pos))
@@ -958,13 +1078,20 @@ class Bolt(nn.Module):
                 raise ValueError("project_decode_state expects one token")
             x = x[:, 0, :]
         B = x.size(0)
-        q0, u0, g0 = self._qcg_inference(x)
-        q = q0.view(B, self.num_heads, self.latent_dim).contiguous()
-        u = u0.view(B, self.num_heads, self.latent_dim).contiguous()
-        g = g0.view(B, self.num_heads, self.latent_dim).contiguous()
-        c, rho = self._native_gate_rho(u, g)
-        c = c[:, :, None, :].contiguous()
-        rho = rho[:, :, None].contiguous()
+        stage1 = self._native_stage1(x[:, None, :])
+        if stage1 is not None:
+            q4, c4, rho3 = stage1
+            q = q4[:, :, 0, :].contiguous()
+            c = c4[:, :, :1, :].contiguous()
+            rho = rho3[:, :, :1].to(c.dtype).contiguous()
+        else:
+            q0, u0, g0 = self._qcg_inference(x)
+            q = q0.view(B, self.num_heads, self.latent_dim).contiguous()
+            u = u0.view(B, self.num_heads, self.latent_dim).contiguous()
+            g = g0.view(B, self.num_heads, self.latent_dim).contiguous()
+            c0, rho0 = self._native_gate_rho(u, g)
+            c = c0[:, :, None, :].contiguous()
+            rho = rho0[:, :, None].contiguous()
         if self.position is not None:
             q = self.position(q[:, :, None, :], start_pos=int(start_pos))[:, :, 0, :].contiguous()
         return q, c, rho

@@ -89,6 +89,117 @@ __global__ void gauss_gate_rho_kernel(
 
 
 // ============================================================
+// COMPOUND FULL-SEQUENCE BOLT STAGE-1
+// packed qcg: [B,T,3*H*R] FP16/FP32
+// q,c,gate:   [B,H,T,R]    same dtype
+// rho:        [B,H,T]      FP32
+// One warp owns one (B,H,T) row.  This fuses Q extraction,
+// C=U*(1+tanh(G)), C^2 reduction and rsqrt into one postprocess.
+// ============================================================
+
+template <typename scalar_t>
+__global__ void gauss_stage1_forward_kernel(
+    const scalar_t* __restrict__ qcg,
+    scalar_t* __restrict__ q,
+    scalar_t* __restrict__ c,
+    float* __restrict__ rho,
+    scalar_t* __restrict__ gate,
+    int B, int T, int H, int R, float eps
+) {
+    const int pid = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int h = pid % H;
+    const int nt = pid / H;
+    const int t = nt % T;
+    const int b = nt / T;
+    if (b >= B) return;
+
+    const int W = H * R;
+    const long in_base = (long)(b * T + t) * (3 * W);
+    const long out_base = ((long)b * H * T + (long)h * T + t) * R;
+    const long rho_idx = (long)b * H * T + (long)h * T + t;
+    float ss = 0.0f;
+
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int d = lane + pass * 32;
+        if (d < R) {
+            const int hd = h * R + d;
+            const float qv = static_cast<float>(qcg[in_base + hd]);
+            const float uv = static_cast<float>(qcg[in_base + W + hd]);
+            const float gv = static_cast<float>(qcg[in_base + 2 * W + hd]);
+
+            // Match eager FP16 semantics: round the gate factor before C.
+            const scalar_t ah = static_cast<scalar_t>(1.0f + tanhf(gv));
+            const float a = static_cast<float>(ah);
+            const scalar_t ch = static_cast<scalar_t>(uv * a);
+            const float cv = static_cast<float>(ch);
+
+            q[out_base + d] = static_cast<scalar_t>(qv);
+            c[out_base + d] = ch;
+            gate[out_base + d] = ah;
+            ss += cv * cv;
+        }
+    }
+
+    ss = warp_sum(ss);
+    if (lane == 0) {
+        rho[rho_idx] = rsqrtf(ss / (float)R + eps);
+    }
+}
+
+template <typename scalar_t>
+__global__ void gauss_stage1_backward_kernel(
+    const scalar_t* __restrict__ dq,
+    const scalar_t* __restrict__ dc,
+    const float* __restrict__ drho,
+    const scalar_t* __restrict__ c,
+    const float* __restrict__ rho,
+    const scalar_t* __restrict__ gate,
+    scalar_t* __restrict__ dqcg,
+    int B, int T, int H, int R
+) {
+    const int pid = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int h = pid % H;
+    const int nt = pid / H;
+    const int t = nt % T;
+    const int b = nt / T;
+    if (b >= B) return;
+
+    const int W = H * R;
+    const long out_base = ((long)b * H * T + (long)h * T + t) * R;
+    const long rho_idx = (long)b * H * T + (long)h * T + t;
+    const long pack_base = (long)(b * T + t) * (3 * W);
+    const float rv = rho[rho_idx];
+    const float rg = drho[rho_idx];
+
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        const int d = lane + pass * 32;
+        if (d < R) {
+            const long idx = out_base + d;
+            const int hd = h * R + d;
+            const float qg = static_cast<float>(dq[idx]);
+            const float cg = static_cast<float>(dc[idx]);
+            const float cv = static_cast<float>(c[idx]);
+            const float a = static_cast<float>(gate[idx]);
+
+            // rho=(mean(C^2)+eps)^(-1/2)
+            const float dct = cg - rg * (rv * rv * rv) * cv / (float)R;
+            // C=U*a, a=1+tanh(G): dU=dC*a, dG=dC*C*(2-a)
+            const float du = dct * a;
+            const float dg = dct * cv * (2.0f - a);
+
+            dqcg[pack_base + hd] = static_cast<scalar_t>(qg);
+            dqcg[pack_base + W + hd] = static_cast<scalar_t>(du);
+            dqcg[pack_base + 2 * W + hd] = static_cast<scalar_t>(dg);
+        }
+    }
+}
+
+
+// ============================================================
 // STREAMING BASELINE PARTIAL
 // one warp per sequence split
 // ============================================================
@@ -1535,6 +1646,79 @@ std::vector<torch::Tensor> gauss_gate_rho_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {c,rho};
+}
+
+
+// ============================================================
+// PUBLIC: COMPOUND STAGE-1
+// ============================================================
+
+std::vector<torch::Tensor> gauss_stage1_forward_cuda(
+    torch::Tensor qcg, int64_t heads, int64_t latent, double eps
+) {
+    TORCH_CHECK(qcg.is_cuda(), "qcg must be CUDA");
+    TORCH_CHECK(qcg.is_contiguous(), "qcg must be contiguous");
+    TORCH_CHECK(qcg.dim() == 3, "qcg must be [B,T,3*H*R]");
+    TORCH_CHECK(latent > 0 && latent <= 64, "latent must be in [1,64]");
+    TORCH_CHECK(qcg.size(2) == 3 * heads * latent, "qcg width mismatch");
+    TORCH_CHECK(
+        qcg.scalar_type() == torch::kFloat16 || qcg.scalar_type() == torch::kFloat32,
+        "qcg must be float16 or float32"
+    );
+
+    const int B = (int)qcg.size(0);
+    const int T = (int)qcg.size(1);
+    const int H = (int)heads;
+    const int R = (int)latent;
+    c10::cuda::CUDAGuard guard(qcg.device());
+
+    auto q = torch::empty({B,H,T,R}, qcg.options());
+    auto c = torch::empty_like(q);
+    auto gate = torch::empty_like(q);
+    auto rho = torch::empty({B,H,T}, qcg.options().dtype(torch::kFloat32));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(qcg.get_device()).stream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(qcg.scalar_type(), "gauss_stage1_forward", [&] {
+        gauss_stage1_forward_kernel<scalar_t><<<B*T*H,32,0,stream>>>(
+            qcg.data_ptr<scalar_t>(), q.data_ptr<scalar_t>(), c.data_ptr<scalar_t>(),
+            rho.data_ptr<float>(), gate.data_ptr<scalar_t>(), B,T,H,R,(float)eps
+        );
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {q,c,rho,gate};
+}
+
+torch::Tensor gauss_stage1_backward_cuda(
+    torch::Tensor dq, torch::Tensor dc, torch::Tensor drho,
+    torch::Tensor c, torch::Tensor rho, torch::Tensor gate,
+    int64_t heads, int64_t latent
+) {
+    TORCH_CHECK(dq.is_cuda() && dc.is_cuda() && drho.is_cuda(), "grad tensors must be CUDA");
+    TORCH_CHECK(dq.is_contiguous() && dc.is_contiguous() && drho.is_contiguous(), "grad tensors must be contiguous");
+    TORCH_CHECK(c.is_contiguous() && rho.is_contiguous() && gate.is_contiguous(), "saved tensors must be contiguous");
+    TORCH_CHECK(c.dim() == 4 && rho.dim() == 3, "invalid Stage-1 saved tensor ranks");
+    TORCH_CHECK(c.scalar_type() == dq.scalar_type() && c.scalar_type() == dc.scalar_type(), "Q/C gradient dtype mismatch");
+    TORCH_CHECK(rho.scalar_type() == torch::kFloat32 && drho.scalar_type() == torch::kFloat32, "rho/drho must be float32");
+
+    const int B = (int)c.size(0);
+    const int H = (int)heads;
+    const int T = (int)c.size(2);
+    const int R = (int)latent;
+    const int W = H * R;
+    TORCH_CHECK(c.size(1) == H && c.size(3) == R, "C shape mismatch");
+    c10::cuda::CUDAGuard guard(c.device());
+
+    auto dqcg = torch::empty({B,T,3*W}, c.options());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(c.get_device()).stream();
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(c.scalar_type(), "gauss_stage1_backward", [&] {
+        gauss_stage1_backward_kernel<scalar_t><<<B*T*H,32,0,stream>>>(
+            dq.data_ptr<scalar_t>(), dc.data_ptr<scalar_t>(), drho.data_ptr<float>(),
+            c.data_ptr<scalar_t>(), rho.data_ptr<float>(), gate.data_ptr<scalar_t>(),
+            dqcg.data_ptr<scalar_t>(), B,T,H,R
+        );
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return dqcg;
 }
 
 
