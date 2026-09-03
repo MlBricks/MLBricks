@@ -112,7 +112,15 @@ class KernelConfig:
 
     @property
     def mode_name(self) -> str:
-        return "stream" if self.mode == 0 else "tiled8"
+        if self.mode == 0:
+            return "stream"
+        if self.mode == 1:
+            return "tiled8"
+        if self.mode == 2:
+            return "standalone_twopass"
+        if self.mode == 3:
+            return "r16_subwarp"
+        return f"mode{self.mode}"
 
 
 class TuneStore:
@@ -308,6 +316,95 @@ def autotune(
 
     if best is None:
         best = heuristic_config(kind=kind, B=B, H=H, T=T, W=W)
+    cache[key] = {"mode": best.mode, "splits": best.splits, "latency_us": best_us}
+    TUNE_STORE.save(cache)
+    return best
+
+
+@torch.no_grad()
+def autotune_gauss_no_o(
+    *, q: torch.Tensor, c: torch.Tensor, rho: torch.Tensor,
+    weight: torch.Tensor, head_dim: int, ext, force: bool = False,
+    used_length: int | None = None,
+    c_now: torch.Tensor | None = None,
+    rho_now: torch.Tensor | None = None,
+    position: int | None = None,
+) -> KernelConfig:
+    """Autotune the actual no-O Bolt decode + output projection path.
+
+    For the production B=1/H=4/R=16/D=128 shape, preserve the existing exact
+    standalone two-pass mode (2) and add the R16 subwarp mode (3) as another
+    candidate.  The winner is cached per GPU/context bucket, so the new kernel
+    is used only where it is actually faster.
+    """
+    B, H, R = q.shape
+    T = c.shape[2] if used_length is None else int(used_length)
+    if T < 1 or T > c.shape[2]:
+        raise ValueError("used_length must be in [1, cache_capacity]")
+
+    is_append = c_now is not None or rho_now is not None or position is not None
+    if is_append:
+        if c_now is None or rho_now is None or position is None:
+            raise ValueError("c_now, rho_now and position must be provided together")
+        if int(position) + 1 != T:
+            raise ValueError("append position must equal used_length - 1")
+
+    D = int(weight.size(0))
+    supports_r16 = bool(
+        B == 1 and H == 4 and R == 16 and D == 128
+        and hasattr(ext, "gauss_r16_scan_supported")
+        and bool(ext.gauss_r16_scan_supported())
+    )
+    kind = "gauss_no_o_r16_v1_append" if is_append else "gauss_no_o_r16_v1"
+    key = shape_key(kind, B, H, T, R, str(q.dtype))
+    cache = TUNE_STORE.load()
+    if (not force) and key in cache:
+        x = cache[key]
+        mode = int(x["mode"])
+        if mode != 3 or supports_r16:
+            return KernelConfig(mode, int(x["splits"]))
+
+    # Keep all existing exact implementations available.  Mode 3 is added only
+    # for the validated R16 production geometry.
+    modes = (0, 1, 2, 3) if supports_r16 else (0, 1, 2)
+    scale = 1.0 / math.sqrt(float(head_dim))
+    best = None
+    best_us = float("inf")
+
+    for mode in modes:
+        # stream/two-pass use one warp; tiled8/R16-subwarp use 8 warps.
+        split_mode = 0 if mode in (0, 2) else 1
+        split_candidates = set(candidate_splits(B, H, T, split_mode))
+        if mode in (0, 2):
+            max_by_tokens = max(1, min(128, math.ceil(T / 64)))
+            for value in (1, 2, 4, 8, 16, 32, 64, 128):
+                if value <= max_by_tokens:
+                    split_candidates.add(value)
+            # Preserve the historical standalone split schedule as a candidate.
+            split_candidates.add(max(1, min(32, math.ceil(T / 256))))
+
+        for splits in sorted(split_candidates):
+            ws = WORKSPACES.get("gauss", B, H, R, splits, q.device)
+            if is_append:
+                fn_call = lambda mode=mode, splits=splits, ws=ws: ext.gauss_decode_append_project_out(
+                    q, c_now, rho_now, c, rho,
+                    ws.pm, ws.pl, ws.po, weight,
+                    scale, mode, splits, int(position),
+                )
+            else:
+                fn_call = lambda mode=mode, splits=splits, ws=ws: ext.gauss_decode_project_out_used(
+                    q, c, rho, ws.pm, ws.pl, ws.po, weight,
+                    scale, mode, splits, T,
+                )
+            us = _median_us(fn_call)
+            if us < best_us:
+                best_us = us
+                best = KernelConfig(mode, splits)
+
+    if best is None:
+        # This helper is called only for the standalone no-O geometry, so retain
+        # its proven exact two-pass schedule as the deterministic fallback.
+        best = KernelConfig(2, max(1, min(32, math.ceil(T / 256))))
     cache[key] = {"mode": best.mode, "splits": best.splits, "latency_us": best_us}
     TUNE_STORE.save(cache)
     return best

@@ -7,14 +7,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .._reference import attention_forward_reference
+from .._reference import attention_forward_reference, gauss_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
 from ..position import RoPE
 
 from .._backend import (
     WORKSPACES,
+    KernelConfig,
     autotune,
+    autotune_gauss_no_o,
     autotune_gauss_rope,
     heuristic_config,
     load_cuda_extension,
@@ -81,34 +83,34 @@ def _sdpa(
     )
 
 
-class _BoltStage1NativeFn(torch.autograd.Function):
-    """Exact autograd wrapper for the native compound Bolt Stage-1.
+class _BoltNativeStage1Fn(torch.autograd.Function):
+    """Exact packed BOLT Stage-1 with a native CUDA postprocess.
 
-    The public module still owns independent q/c/g Parameters.  A packed
-    projection weight is formed in the surrounding autograd graph, while this
-    function owns the packed GEMM plus the native gate/RMS postprocess.
+    The public q/c/g Parameters remain independent.  The caller passes their
+    autograd-visible concatenation, so the packed gradient returned here flows
+    through ``torch.cat`` back to the original Parameters/state-dict keys.
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, heads: int, latent: int, eps: float):
+    def forward(ctx, x, weight, bias, num_heads: int, latent_dim: int, eps: float):
         ext = load_cuda_extension()
         if ext is None or not hasattr(ext, "gauss_stage1_forward"):
-            raise RuntimeError("native Bolt Stage-1 extension is unavailable")
-        qcg = F.linear(x, weight, bias).contiguous()
+            raise RuntimeError("native BOLT Stage-1 extension is unavailable")
+        packed = F.linear(x, weight, bias).contiguous()
         q, c, rho, gate = ext.gauss_stage1_forward(
-            qcg, int(heads), int(latent), float(eps)
+            packed, int(num_heads), int(latent_dim), float(eps)
         )
         ctx.save_for_backward(x, weight, c, rho, gate)
         ctx.has_bias = bias is not None
-        ctx.heads = int(heads)
-        ctx.latent = int(latent)
+        ctx.num_heads = int(num_heads)
+        ctx.latent_dim = int(latent_dim)
         return q, c, rho
 
     @staticmethod
     def backward(ctx, dq, dc, drho):
         ext = load_cuda_extension()
         if ext is None or not hasattr(ext, "gauss_stage1_backward"):
-            raise RuntimeError("native Bolt Stage-1 backward extension is unavailable")
+            raise RuntimeError("native BOLT Stage-1 backward extension is unavailable")
         x, weight, c, rho, gate = ctx.saved_tensors
         if dq is None:
             dq = torch.zeros_like(c)
@@ -118,11 +120,12 @@ class _BoltStage1NativeFn(torch.autograd.Function):
             drho = torch.zeros_like(rho)
         dqcg = ext.gauss_stage1_backward(
             dq.contiguous(), dc.contiguous(), drho.contiguous(),
-            c, rho, gate, ctx.heads, ctx.latent,
+            c, rho, gate, ctx.num_heads, ctx.latent_dim,
         )
         B, T, D = x.shape
         flat_d = dqcg.reshape(B * T, -1)
         flat_x = x.reshape(B * T, D)
+        # Two large GEMMs replace three separate projection backwards.
         dx = flat_d.matmul(weight).reshape_as(x)
         dw = flat_d.transpose(0, 1).matmul(flat_x)
         db = flat_d.sum(dim=0) if ctx.has_bias else None
@@ -648,6 +651,25 @@ class Bolt(nn.Module):
             / self.baseline_cache_bytes_per_head_token
         )
 
+    def _standalone_no_o_config(self, *, batch: int, used: int):
+        """Exact split schedule from the fastest standalone no-O T4 decode.
+
+        Keep this narrowly specialized until the integrated kernel is benchmarked
+        across more shapes. Other geometries/batches continue through the normal
+        autotuner/heuristic path.
+        """
+        if (
+            int(batch) == 1
+            and self.num_heads == 4
+            and self.latent_dim == 16
+            and self.d_model == 128
+            and self.position is None
+            and self.out_proj.bias is None
+        ):
+            splits = max(1, min(32, (int(used) + 255) // 256))
+            return KernelConfig(mode=2, splits=splits)
+        return None
+
     def _q_c(self, x: torch.Tensor):
         B, T, _ = x.shape
         q = self.q_proj(x)
@@ -679,64 +701,92 @@ class Bolt(nn.Module):
         hr = self.num_heads * self.latent_dim
         return qcg.split(hr, dim=-1)
 
-    def _qcg_training(self, x: torch.Tensor):
-        """One autograd-visible GEMM for Q/U/G without changing Parameters."""
+    def _qcg_training_parameters(self):
+        """Autograd-visible packed Q/C/G Parameters without changing state keys."""
         weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
         biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
         weight = torch.cat(weights, dim=0)
         bias = None if biases[0] is None else torch.cat(biases, dim=0)
+        return weight, bias
+
+    def _qcg_training(self, x: torch.Tensor):
+        """Autograd-safe packed Q/C/G projection for full-sequence training."""
+        weight, bias = self._qcg_training_parameters()
         qcg = F.linear(x, weight, bias)
         hr = self.num_heads * self.latent_dim
         return qcg.split(hr, dim=-1)
 
-    def _native_stage1(self, x: torch.Tensor):
-        """Return native ``(Q,C,rho)`` or ``None`` when the route is ineligible.
-
-        Native Stage-1 is an exact execution transform of the original Bolt
-        equations.  It is currently specialized for contiguous CUDA FP16 and
-        latent widths up to 64.  CPU/other dtypes keep the PyTorch path.
-        """
+    def _stage1_native_extension(self, x: torch.Tensor, *, training: bool):
         eligible = bool(
-            x.is_cuda
-            and x.dtype == torch.float16
-            and x.is_contiguous()
-            and 1 <= self.latent_dim <= 64
-            and self.backend != "pytorch"
+            x.is_cuda and x.dtype == torch.float16
+            and self.latent_dim <= 64
         )
-        if not eligible:
-            return None
-        ext = load_cuda_extension()
-        native_ok = bool(
+        ext = load_cuda_extension() if eligible else None
+        available = bool(
             ext is not None
             and hasattr(ext, "gauss_stage1_forward")
-            and hasattr(ext, "gauss_stage1_backward")
+            and (not training or hasattr(ext, "gauss_stage1_backward"))
         )
-        if not native_ok:
-            return None
         route = EXECUTION_PLANNER.select_operator_once(
-            self, "bolt_stage1", x, requested_backend=self.backend,
-            native_available=True, native_supports_training=True,
-            training=bool(torch.is_grad_enabled()),
+            self, "bolt_stage1", x,
+            requested_backend=self.backend,
+            native_available=available,
+            native_supports_training=True,
+            training=bool(training),
             extra=(self.num_heads, self.latent_dim, self.d_model),
             default_auto="native",
         )
-        if route != "native":
+        if route == "native" and not available:
+            if self.backend == "native":
+                raise RuntimeError(
+                    "backend='native' requested but native BOLT Stage-1 is unavailable"
+                )
             return None
+        return ext if route == "native" else None
 
-        if torch.is_grad_enabled():
-            weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
-            biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
-            weight = torch.cat(weights, dim=0)
-            bias = None if biases[0] is None else torch.cat(biases, dim=0)
-            return _BoltStage1NativeFn.apply(
+    def _stage1_training(self, x: torch.Tensor):
+        ext = self._stage1_native_extension(x, training=True)
+        if ext is not None:
+            weight, bias = self._qcg_training_parameters()
+            return _BoltNativeStage1Fn.apply(
                 x, weight, bias, self.num_heads, self.latent_dim, self.eps
             )
+        B, T, _ = x.shape
+        q_flat, u_flat, g_flat = self._qcg_training(x)
+        c_flat = u_flat * (1.0 + torch.tanh(g_flat))
+        q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+        c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+        rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+        return q, c, rho
 
-        weight, bias = self._packed_qcg()
-        qcg = F.linear(x, weight, bias).contiguous()
-        q, c, rho, _gate = ext.gauss_stage1_forward(
-            qcg, self.num_heads, self.latent_dim, self.eps
-        )
+    @torch.no_grad()
+    def _stage1_inference(self, x: torch.Tensor):
+        B, T, _ = x.shape
+        ext = self._stage1_native_extension(x, training=False)
+        if ext is not None and hasattr(ext, "gauss_unpack_gate_rho_out"):
+            weight, bias = self._packed_qcg()
+            packed = F.linear(x, weight, bias).reshape(B * T, -1).contiguous()
+            q_flat = torch.empty(
+                B * T, self.num_heads, self.latent_dim,
+                device=x.device, dtype=x.dtype,
+            )
+            c_flat = torch.empty_like(q_flat)
+            rho_flat = torch.empty(
+                B * T, self.num_heads, device=x.device, dtype=x.dtype,
+            )
+            ext.gauss_unpack_gate_rho_out(
+                packed, q_flat, c_flat, rho_flat, self.eps
+            )
+            q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+            c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+            rho = rho_flat.view(B, T, self.num_heads).transpose(1, 2).contiguous()
+            return q, c, rho
+
+        q_flat, u_flat, g_flat = self._qcg_inference(x)
+        c_flat = u_flat * (1.0 + torch.tanh(g_flat))
+        q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+        c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
+        rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps).to(c.dtype)
         return q, c, rho
 
     def _pytorch_full_eval_core(
@@ -774,22 +824,17 @@ class Bolt(nn.Module):
         if D != self.d_model:
             raise ValueError(f"expected D={self.d_model}, got {D}")
 
-        # The optional VisionBolt full-sequence route still consumes raw Q/U/G.
-        # Ordinary Bolt uses the compound Stage-1 below so U/G do not escape as
-        # standalone forward tensors when the native path is available.
+        # ``native_full_sequence`` retains its existing whole-operator route.
+        # Ordinary BOLT uses the compound Stage-1 route below so U/G never need
+        # to become standalone tensors when native CUDA is available.
+        q = c = rho = None
         q_flat = u_flat = g_flat = None
-        if self.native_full_sequence:
+        if self.native_full_sequence and self.position is None and self.dropout == 0.0 and self.backend != "pytorch":
             if self.training and torch.is_grad_enabled():
                 q_flat, u_flat, g_flat = self._qcg_training(x)
             else:
                 q_flat, u_flat, g_flat = self._qcg_inference(x)
 
-        # Full-sequence native vision path. The custom C++ operator owns the
-        # Bolt equation while its matmul/softmax operations dispatch through
-        # ATen to CPU/CUDA and retain autograd. VisionBolt always uses
-        # position=None internally; explicit Bolt RoPE keeps the proven Python
-        # path below.
-        if self.native_full_sequence and self.position is None and self.dropout == 0.0 and self.backend != "pytorch":
             fused_inference = bool(not self.training and not torch.is_grad_enabled())
             native_backend = self.backend
 
@@ -869,8 +914,6 @@ class Bolt(nn.Module):
                         head_dim=self.head_dim,
                         eps=self.eps,
                         causal=self.causal,
-                        # Route already resolved above; avoid planner work in
-                        # vision_native._use_native for steady-state auto.
                         backend="native",
                         fused_inference=fused_inference, owner=self,
                     )
@@ -881,29 +924,36 @@ class Bolt(nn.Module):
                 if native_y is not None:
                     return self.out_proj(native_y)
 
-        stage1 = None if q_flat is not None else self._native_stage1(x)
-        if stage1 is not None:
-            q, c, rho = stage1
-        else:
-            if q_flat is None:
-                if self.training and torch.is_grad_enabled():
-                    q_flat, u_flat, g_flat = self._qcg_training(x)
-                else:
-                    q_flat, u_flat, g_flat = self._qcg_inference(x)
+            # Whole-operator route fell back; reuse the projection already made.
             c_flat = u_flat * (1.0 + torch.tanh(g_flat))
             q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
             c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
             rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+        elif self.training and torch.is_grad_enabled():
+            q, c, rho = self._stage1_training(x)
+        else:
+            # Keep eval-forward normalization precision identical to the
+            # existing PyTorch path. Prefill/decode use the compact native
+            # inference Stage-1 below because their cache already stores rho
+            # in the model dtype.
+            q_flat, u_flat, g_flat = self._qcg_inference(x)
+            c_flat = u_flat * (1.0 + torch.tanh(g_flat))
+            q = q_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+            c = c_flat.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2)
+            rho = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+
         key_c = c
         if self.position is not None:
             q = self.position(q, start_pos=0)
             key_c = self.position(c, start_pos=0)
 
-        # The normalized-key identity is exactly the same Bolt score law:
-        #   (Q C^T) * rho / sqrt(head_dim) == Q (rho C)^T / sqrt(head_dim).
-        # SDPA supplies the optimized score/softmax/value implementation and
-        # its autograd backward. ``use_sdpa=False`` remains the explicit-order
-        # reference/debug route.
+        # Historical Gauss/BOLT 0.2 full-sequence optimization. The normalized
+        # key identity is algebraically the same BOLT equation:
+        #   (Q C^T) * rho / sqrt(head_dim)
+        # == Q (rho C)^T / sqrt(head_dim).
+        # PyTorch SDPA supplies the autograd backward; no custom backward or
+        # Stream2 path is involved. ``use_sdpa=False`` remains the strict
+        # explicit-order reference/debug route.
         if self.use_sdpa:
             # Key-only normalization. With RoPE, only the key view rotates;
             # raw C remains the value so the shared latent cache stays compact.
@@ -974,23 +1024,11 @@ class Bolt(nn.Module):
         if x.dim() != 3 or x.size(-1) != self.d_model:
             raise ValueError(f"x must have shape [B,T,{self.d_model}]")
         B, T, _ = x.shape
-        stage1 = self._native_stage1(x)
-        if stage1 is not None:
-            q, c, rho_score = stage1
-            q = q.contiguous()
-            c = c.contiguous()
-            # Recurrent cache remains compact FP16 C+rho exactly as before.
-            rho = rho_score.to(c.dtype).contiguous()
-        else:
-            q0, u0, g0 = self._qcg_inference(x)
-            q = q0.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
-            u = u0.view(B * T, self.num_heads, self.latent_dim).contiguous()
-            g = g0.view(B * T, self.num_heads, self.latent_dim).contiguous()
-            c, rho = self._native_gate_rho(u, g)
-            c = c.view(B, T, self.num_heads, self.latent_dim).transpose(1, 2).contiguous()
-            rho = rho.view(B, T, self.num_heads).transpose(1, 2).contiguous()
-            # Preserve eval-forward FP32 normalization precision for scoring.
-            rho_score = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
+        q, c, rho = self._stage1_inference(x)
+        # Preserve the eval-forward normalization precision for the output.
+        # The compact cache may keep rho in FP16, but prefill scoring uses the
+        # FP32 rho value just like forward().
+        rho_score = torch.rsqrt(c.float().square().mean(dim=-1) + self.eps)
         key_c = c
         if self.position is not None:
             q = self.position(q, start_pos=int(start_pos))
@@ -1078,20 +1116,9 @@ class Bolt(nn.Module):
                 raise ValueError("project_decode_state expects one token")
             x = x[:, 0, :]
         B = x.size(0)
-        stage1 = self._native_stage1(x[:, None, :])
-        if stage1 is not None:
-            q4, c4, rho3 = stage1
-            q = q4[:, :, 0, :].contiguous()
-            c = c4[:, :, :1, :].contiguous()
-            rho = rho3[:, :, :1].to(c.dtype).contiguous()
-        else:
-            q0, u0, g0 = self._qcg_inference(x)
-            q = q0.view(B, self.num_heads, self.latent_dim).contiguous()
-            u = u0.view(B, self.num_heads, self.latent_dim).contiguous()
-            g = g0.view(B, self.num_heads, self.latent_dim).contiguous()
-            c0, rho0 = self._native_gate_rho(u, g)
-            c = c0[:, :, None, :].contiguous()
-            rho = rho0[:, :, None].contiguous()
+        q4, c, rho3 = self._stage1_inference(x[:, None, :])
+        q = q4[:, :, 0, :].contiguous()
+        rho = rho3[:, :, :,].contiguous()
         if self.position is not None:
             q = self.position(q[:, :, None, :], start_pos=int(start_pos))[:, :, 0, :].contiguous()
         return q, c, rho
@@ -1127,6 +1154,18 @@ class Bolt(nn.Module):
             rope_width >= 2 and ext is not None
             and hasattr(ext, "gauss_rope_decode_out_used")
         )
+        # Inference fast path: exact split C+rho decode is merged directly into
+        # W_O.  The head output O exists only on-chip and is never materialized
+        # as a global tensor. Bias=True keeps the historical path because the
+        # fused projection currently targets the default bias=False BOLT.
+        no_o_plain = bool(
+            plain_native and self.out_proj.bias is None
+            and hasattr(ext, "gauss_decode_project_out_used")
+        )
+        no_o_rope = bool(
+            rope_native and self.out_proj.bias is None
+            and hasattr(ext, "gauss_rope_decode_project_out_used")
+        )
         if plain_native and used != capacity and not hasattr(ext, "gauss_decode_out_used"):
             plain_native = False
         if self.backend == "native" and not (plain_native or rope_native):
@@ -1148,6 +1187,13 @@ class Bolt(nn.Module):
             ws = WORKSPACES.get(
                 "gauss_rope", B, self.num_heads, self.latent_dim, cfg.splits, q.device
             )
+            if no_o_rope:
+                return ext.gauss_rope_decode_project_out_used(
+                    q, c_cache, rho_cache, ws.pm, ws.pl, ws.po,
+                    self.out_proj.weight.contiguous(),
+                    1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, used,
+                    float(self.position.base), rope_width,
+                )
             ext.gauss_rope_decode_out_used(
                 q, c_cache, rho_cache, ws.pm, ws.pl, ws.po, ws.out,
                 1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, used,
@@ -1155,19 +1201,40 @@ class Bolt(nn.Module):
             )
             y = ws.out
         elif plain_native:
-            if self.autotune_kernels:
-                cfg = autotune(
-                    kind="gauss", q=q, a=c_cache, b=rho_cache, head_dim=self.head_dim,
-                    ext=ext, force=force_retune,
-                    used_length=used if used != capacity else None,
+            cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
+            if cfg is not None and self.autotune_kernels:
+                cfg = autotune_gauss_no_o(
+                    q=q, c=c_cache, rho=rho_cache,
+                    weight=self.out_proj.weight.contiguous(),
+                    head_dim=self.head_dim, ext=ext, force=force_retune,
+                    used_length=used,
                 )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
-                )
+            if cfg is None:
+                if self.autotune_kernels:
+                    cfg = autotune(
+                        kind="gauss", q=q, a=c_cache, b=rho_cache, head_dim=self.head_dim,
+                        ext=ext, force=force_retune,
+                        used_length=used if used != capacity else None,
+                    )
+                else:
+                    cfg = heuristic_config(
+                        kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
+                    )
             ws = WORKSPACES.get(
                 "gauss", B, self.num_heads, self.latent_dim, cfg.splits, q.device
             )
+            if no_o_plain:
+                if used != capacity:
+                    return ext.gauss_decode_project_out_used(
+                        q, c_cache, rho_cache, ws.pm, ws.pl, ws.po,
+                        self.out_proj.weight.contiguous(),
+                        1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, used,
+                    )
+                return ext.gauss_decode_project_out(
+                    q, c_cache, rho_cache, ws.pm, ws.pl, ws.po,
+                    self.out_proj.weight.contiguous(),
+                    1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits,
+                )
             if used != capacity:
                 ext.gauss_decode_out_used(
                     q, c_cache, rho_cache, ws.pm, ws.pl, ws.po, ws.out,
@@ -1185,11 +1252,17 @@ class Bolt(nn.Module):
             key_cache = c_used
             if self.position is not None:
                 key_cache = self.position(c_used, start_pos=0)
-            if self.use_sdpa:
-                # Same Bolt equation as full eval/prefill, but let PyTorch's
-                # scaled-dot-product attention fuse score scaling, softmax and
-                # value reduction for the one-token decode query.  Keeping rho
-                # in the key reproduces (Q C^T) * rho / sqrt(head_dim).
+            # Decode dispatch is representation-aware.  When Bolt is actually
+            # compressed (latent_dim < head_dim), keep the historical compact
+            # C+rho execution form.  Materializing K=rho*C for the whole cache
+            # every token defeats the bandwidth/temporary-memory advantage that
+            # compressed Bolt is designed to provide at long context.
+            #
+            # Parameter-matched / expanded Bolt keeps the SDPA route measured
+            # faster for those shapes.  Both branches implement the same Bolt
+            # equation and retain the same persistent C+rho cache.
+            use_sdpa_decode = self.use_sdpa and self.latent_dim >= self.head_dim
+            if use_sdpa_decode:
                 k = (key_cache.float() * rho_used.unsqueeze(-1).float()).to(c_used.dtype)
                 y = _sdpa(
                     q[:, :, None, :], k, c_used,
@@ -1268,6 +1341,14 @@ class Bolt(nn.Module):
             rope_width >= 2 and ext is not None
             and hasattr(ext, "gauss_rope_decode_append_out")
         )
+        no_o_plain = bool(
+            plain_fused and self.out_proj.bias is None
+            and hasattr(ext, "gauss_decode_append_project_out")
+        )
+        no_o_rope = bool(
+            rope_fused and self.out_proj.bias is None
+            and hasattr(ext, "gauss_rope_decode_append_project_out")
+        )
         if self.backend == "native" and not (plain_fused or rope_fused):
             raise RuntimeError(
                 "backend='native' requested but native Gauss decode is unavailable"
@@ -1288,6 +1369,13 @@ class Bolt(nn.Module):
             ws = WORKSPACES.get(
                 "gauss_rope", B, self.num_heads, self.latent_dim, cfg.splits, q.device
             )
+            if no_o_rope:
+                return ext.gauss_rope_decode_append_project_out(
+                    q, c_now3, rho_now2, c_cache, rho_cache,
+                    ws.pm, ws.pl, ws.po, self.out_proj.weight.contiguous(),
+                    1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, pos,
+                    float(self.position.base), rope_width,
+                )
             ext.gauss_rope_decode_append_out(
                 q, c_now3, rho_now2, c_cache, rho_cache,
                 ws.pm, ws.pl, ws.po, ws.out,
@@ -1298,19 +1386,34 @@ class Bolt(nn.Module):
             return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
 
         if plain_fused:
-            if self.autotune_kernels:
-                cfg = autotune(
-                    kind="gauss", q=q, a=c_cache, b=rho_cache,
+            cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
+            if cfg is not None and self.autotune_kernels:
+                cfg = autotune_gauss_no_o(
+                    q=q, c=c_cache, rho=rho_cache,
+                    weight=self.out_proj.weight.contiguous(),
                     head_dim=self.head_dim, ext=ext, force=force_retune,
-                    used_length=used if used != capacity else None,
+                    used_length=used, c_now=c_now3, rho_now=rho_now2, position=pos,
                 )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
-                )
+            if cfg is None:
+                if self.autotune_kernels:
+                    cfg = autotune(
+                        kind="gauss", q=q, a=c_cache, b=rho_cache,
+                        head_dim=self.head_dim, ext=ext, force=force_retune,
+                        used_length=used if used != capacity else None,
+                    )
+                else:
+                    cfg = heuristic_config(
+                        kind="gauss", B=B, H=self.num_heads, T=used, W=self.latent_dim
+                    )
             ws = WORKSPACES.get(
                 "gauss", B, self.num_heads, self.latent_dim, cfg.splits, q.device
             )
+            if no_o_plain:
+                return ext.gauss_decode_append_project_out(
+                    q, c_now3, rho_now2, c_cache, rho_cache,
+                    ws.pm, ws.pl, ws.po, self.out_proj.weight.contiguous(),
+                    1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, pos,
+                )
             ext.gauss_decode_append_out(
                 q, c_now3, rho_now2, c_cache, rho_cache,
                 ws.pm, ws.pl, ws.po, ws.out,
@@ -1389,6 +1492,10 @@ class Bolt(nn.Module):
         ):
             ext = load_cuda_extension()
         native_used_api = bool(ext is not None and hasattr(ext, "gauss_decode_out_used"))
+        no_o_native = bool(
+            ext is not None and self.out_proj.bias is None
+            and hasattr(ext, "gauss_decode_project_out_used")
+        )
         if ext is not None and used != cache_capacity and not native_used_api:
             ext = None
         if self.backend == "native" and (not native_eligible or ext is None):
@@ -1408,25 +1515,34 @@ class Bolt(nn.Module):
             p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             y = torch.matmul(p, c_used)[:, :, 0, :]
         else:
-            if self.autotune_kernels:
-                cfg = autotune(
-                    kind="gauss",
-                    q=q,
-                    a=c_cache,
-                    b=rho_cache,
-                    head_dim=self.head_dim,
-                    ext=ext,
-                    force=force_retune,
-                    used_length=used if used != cache_capacity else None,
+            cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_native else None
+            if cfg is not None and self.autotune_kernels:
+                cfg = autotune_gauss_no_o(
+                    q=q, c=c_cache, rho=rho_cache,
+                    weight=self.out_proj.weight.contiguous(),
+                    head_dim=self.head_dim, ext=ext, force=force_retune,
+                    used_length=used,
                 )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss",
-                    B=B,
-                    H=self.num_heads,
-                    T=used,
-                    W=self.latent_dim,
-                )
+            if cfg is None:
+                if self.autotune_kernels:
+                    cfg = autotune(
+                        kind="gauss",
+                        q=q,
+                        a=c_cache,
+                        b=rho_cache,
+                        head_dim=self.head_dim,
+                        ext=ext,
+                        force=force_retune,
+                        used_length=used if used != cache_capacity else None,
+                    )
+                else:
+                    cfg = heuristic_config(
+                        kind="gauss",
+                        B=B,
+                        H=self.num_heads,
+                        T=used,
+                        W=self.latent_dim,
+                    )
             ws = WORKSPACES.get(
                 "gauss",
                 B,
@@ -1435,6 +1551,20 @@ class Bolt(nn.Module):
                 cfg.splits,
                 q.device,
             )
+            if no_o_native:
+                if used != cache_capacity:
+                    return ext.gauss_decode_project_out_used(
+                        q, c_cache, rho_cache, ws.pm, ws.pl, ws.po,
+                        self.out_proj.weight.contiguous(),
+                        1.0 / math.sqrt(float(self.head_dim)),
+                        cfg.mode, cfg.splits, used,
+                    )
+                return ext.gauss_decode_project_out(
+                    q, c_cache, rho_cache, ws.pm, ws.pl, ws.po,
+                    self.out_proj.weight.contiguous(),
+                    1.0 / math.sqrt(float(self.head_dim)),
+                    cfg.mode, cfg.splits,
+                )
             if used != cache_capacity:
                 ext.gauss_decode_out_used(
                     q, c_cache, rho_cache,
