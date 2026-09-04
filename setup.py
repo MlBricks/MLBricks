@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -43,7 +44,11 @@ def _extension(
 
     source_strings = [_rel(path) for path in sources]
     define_macros = []
-    extra_compile_args: dict[str, list[str]] = {"cxx": ["-O3", "-std=c++17"]}
+    if sys.platform == "win32":
+        cxx_args = ["/O2", "/std:c++17"]
+    else:
+        cxx_args = ["-O3", "-std=c++17"]
+    extra_compile_args: dict[str, list[str]] = {"cxx": cxx_args}
     extension_cls = CppExtension
 
     if has_cuda_toolkit and cuda_source is not None:
@@ -53,7 +58,7 @@ def _extension(
         nvcc = ["-O3"]
         if use_fast_math:
             nvcc.append("--use_fast_math")
-        if lineinfo:
+        if lineinfo and os.getenv("MLBRICKS_NATIVE_LINEINFO", "0") == "1":
             nvcc.append("-lineinfo")
         extra_compile_args["nvcc"] = nvcc
 
@@ -72,7 +77,10 @@ def _extension(
 
 
 def enabled(name: str) -> bool:
-    return os.getenv(name, "1") != "0"
+    # Source installs default to the portable PyTorch implementation so users
+    # never spend minutes compiling unexpectedly. Official release CI sets the
+    # native build flags to 1 and publishes prebuilt platform wheels.
+    return os.getenv(name, "0") == "1"
 
 
 extensions = []

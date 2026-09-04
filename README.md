@@ -435,3 +435,11 @@ The bundled SOUP component license is shipped at `mlbricks/soup/LICENSE_SOUP.txt
 ### Versioning note
 
 MLBricks is released as `1.0.0`. Experimental SOUP retains its independent component version `0.1.0a3`.
+
+## Beta native wheel distribution
+
+MLBricks `1.0.0b1` is distributed with prebuilt native wheels for supported Linux, Windows, and macOS targets plus a `py3-none-any` fallback wheel. On a matching platform, pip selects the platform-specific native wheel; otherwise it installs the portable PyTorch fallback instead of compiling C++/CUDA locally.
+
+For release builds, GitHub CI compiles CUDA wheels with a fat architecture list covering NVIDIA compute capabilities 7.0, 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0+PTX. The beta native ABI is validated against PyTorch `2.10.x`; the package therefore requires `torch>=2.10,<2.11` until the native bindings migrate to the PyTorch stable ABI.
+
+Source installations default native compilation **off**. Developers who intentionally want to compile from source can set the relevant `MLBRICKS_BUILD_*_NATIVE=1` flags. The corresponding `=0` values explicitly disable each extension.

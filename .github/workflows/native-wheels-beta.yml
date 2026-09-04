@@ -1,0 +1,312 @@
+name: Native wheels beta
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "release/**"
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-wheels-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MLBRICKS_VERSION: "1.0.0b1"
+  TORCH_VERSION: "2.10.0"
+  CUDA_VERSION: "12.8.1"
+  # Fat CUDA binary: Volta -> Turing -> Ampere -> Ada -> Hopper -> Blackwell.
+  TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+  MAX_JOBS: "2"
+  MLBRICKS_NATIVE_LINEINFO: "0"
+
+jobs:
+  portable:
+    name: Portable wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build portable artifacts
+        shell: bash
+        env:
+          MLBRICKS_BUILD_CORE_NATIVE: "0"
+          MLBRICKS_BUILD_BOLT_NATIVE: "0"
+          MLBRICKS_BUILD_VESA_NATIVE: "0"
+          MLBRICKS_BUILD_VISION_NATIVE: "0"
+          MLBRICKS_BUILD_FFNBRICK_NATIVE: "0"
+          MLBRICKS_BUILD_RESIDUALBRICK_NATIVE: "0"
+          MLBRICKS_BUILD_ELASTICBIT_NATIVE: "0"
+        run: |
+          python -m pip install -U build twine
+          rm -rf build dist *.egg-info
+          python -m build
+          python -m twine check dist/*
+          ls -lh dist/
+          test -f dist/mlbricks-${MLBRICKS_VERSION}-py3-none-any.whl
+          test -f dist/mlbricks-${MLBRICKS_VERSION}.tar.gz
+          python - <<'PY'
+          import zipfile, pathlib
+          wheel = next(pathlib.Path('dist').glob('*py3-none-any.whl'))
+          with zipfile.ZipFile(wheel) as z:
+              bad = [n for n in z.namelist() if n.endswith(('.so','.pyd','.dll','.dylib'))]
+          assert not bad, bad
+          print('Portable wheel contains no compiled binaries: PASS')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable
+          path: dist/*
+          if-no-files-found: error
+
+  linux-cuda:
+    name: Linux CUDA / ${{ matrix.python_abi }}
+    runs-on: ubuntu-latest
+    container:
+      image: pytorch/manylinux2_28-builder:cuda12.8
+    strategy:
+      fail-fast: false
+      matrix:
+        python_abi:
+          - cp310-cp310
+          - cp311-cp311
+          - cp312-cp312
+          - cp313-cp313
+    env:
+      PYTHON: /opt/python/${{ matrix.python_abi }}/bin/python
+      MLBRICKS_BUILD_CORE_NATIVE: "1"
+      MLBRICKS_BUILD_BOLT_NATIVE: "1"
+      MLBRICKS_BUILD_VESA_NATIVE: "0"
+      MLBRICKS_BUILD_VISION_NATIVE: "1"
+      MLBRICKS_BUILD_FFNBRICK_NATIVE: "1"
+      MLBRICKS_BUILD_RESIDUALBRICK_NATIVE: "1"
+      MLBRICKS_BUILD_ELASTICBIT_NATIVE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build Linux fat-CUDA wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "$PYTHON" -m pip install -U pip wheel build ninja
+          "$PYTHON" -m pip install "torch==${TORCH_VERSION}"
+          nvcc --version
+          "$PYTHON" - <<'PY'
+          import torch
+          print('torch', torch.__version__, 'cuda', torch.version.cuda)
+          assert torch.__version__.split('+')[0].startswith('2.10.')
+          PY
+          rm -rf build dist *.egg-info
+          "$PYTHON" -m build --wheel --no-isolation
+          ls -lh dist/
+          "$PYTHON" - <<'PY'
+          import pathlib, zipfile
+          wheel = next(pathlib.Path('dist').glob('*.whl'))
+          size_mib = wheel.stat().st_size / 1024**2
+          print('wheel:', wheel.name, f'{size_mib:.2f} MiB')
+          assert size_mib < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {size_mib:.2f} MiB'
+          assert 'linux_x86_64' in wheel.name, wheel.name
+          with zipfile.ZipFile(wheel) as z:
+              bins = [n for n in z.namelist() if n.endswith('.so')]
+          expected = ['mlbricks/_C', 'mlbricks/_gauss_cuda', 'mlbricks/_vision_native',
+                      'mlbricks/ffnbrick/_C', 'mlbricks/residualbrick/_C', 'mlbricks/elasticbit/_C']
+          missing = [x for x in expected if not any(x in b for b in bins)]
+          assert not missing, missing
+          print('All six Linux native extensions packaged: PASS')
+          PY
+      - name: Import Linux native extensions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf /tmp/mlbricks-wheel-test
+          "$PYTHON" -m pip install --no-deps --target /tmp/mlbricks-wheel-test dist/*.whl
+          cd /tmp
+          PYTHONPATH=/tmp/mlbricks-wheel-test "$PYTHON" - <<'PY'
+          import importlib, mlbricks
+          print('mlbricks', mlbricks.__version__, mlbricks.__file__)
+          for name in ['mlbricks._C','mlbricks._gauss_cuda','mlbricks._vision_native',
+                       'mlbricks.ffnbrick._C','mlbricks.residualbrick._C','mlbricks.elasticbit._C']:
+              importlib.import_module(name)
+              print('IMPORT PASS', name)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-cuda-${{ matrix.python_abi }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  windows-cuda:
+    name: Windows CUDA / Python ${{ matrix.python }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      MLBRICKS_BUILD_CORE_NATIVE: "1"
+      MLBRICKS_BUILD_BOLT_NATIVE: "1"
+      MLBRICKS_BUILD_VESA_NATIVE: "0"
+      MLBRICKS_BUILD_VISION_NATIVE: "1"
+      MLBRICKS_BUILD_FFNBRICK_NATIVE: "1"
+      MLBRICKS_BUILD_RESIDUALBRICK_NATIVE: "1"
+      MLBRICKS_BUILD_ELASTICBIT_NATIVE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install CUDA 12.8 toolkit
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76
+        with:
+          cuda: "12.8.1"
+          log-file-suffix: "py${{ matrix.python }}.txt"
+      - name: Build Windows fat-CUDA wheel
+        shell: pwsh
+        run: |
+          python -m pip install -U pip wheel build ninja
+          python -m pip install "torch==$env:TORCH_VERSION"
+          nvcc --version
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.__version__.split('+')[0].startswith('2.10.')"
+          Remove-Item -Recurse -Force build,dist -ErrorAction SilentlyContinue
+          Get-ChildItem -Directory -Filter '*.egg-info' | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          python -m build --wheel --no-isolation
+          Get-ChildItem dist
+          python -c "from pathlib import Path; w=next(Path('dist').glob('*.whl')); s=w.stat().st_size/1024**2; print(w.name, f'{s:.2f} MiB'); assert s < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {s:.2f} MiB'"
+      - name: Import Windows native extensions
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'mlbricks-wheel-test'
+          Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $target | Out-Null
+          python -m pip install --no-deps --target $target (Get-ChildItem dist\*.whl).FullName
+          Push-Location $env:RUNNER_TEMP
+          $env:PYTHONPATH = $target
+          python -c "import importlib,mlbricks; print('mlbricks',mlbricks.__version__,mlbricks.__file__); [importlib.import_module(x) for x in ['mlbricks._C','mlbricks._gauss_cuda','mlbricks._vision_native','mlbricks.ffnbrick._C','mlbricks.residualbrick._C','mlbricks.elasticbit._C']]; print('Windows native imports: PASS')"
+          Pop-Location
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-cuda-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos-native:
+    name: macOS CPU native / ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      MLBRICKS_FORCE_CPU: "1"
+      MLBRICKS_BUILD_CORE_NATIVE: "1"
+      MLBRICKS_BUILD_BOLT_NATIVE: "0"
+      MLBRICKS_BUILD_VESA_NATIVE: "0"
+      MLBRICKS_BUILD_VISION_NATIVE: "1"
+      MLBRICKS_BUILD_FFNBRICK_NATIVE: "1"
+      MLBRICKS_BUILD_RESIDUALBRICK_NATIVE: "1"
+      MLBRICKS_BUILD_ELASTICBIT_NATIVE: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Build macOS native CPU wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -U pip wheel build ninja "torch==${TORCH_VERSION}"
+          rm -rf build dist *.egg-info
+          python -m build --wheel --no-isolation
+          ls -lh dist/
+          python - <<'PY'
+          from pathlib import Path
+          w = next(Path('dist').glob('*.whl'))
+          s = w.stat().st_size / 1024**2
+          print(w.name, f'{s:.2f} MiB')
+          assert s < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {s:.2f} MiB'
+          PY
+          rm -rf /tmp/mlbricks-wheel-test
+          python -m pip install --no-deps --target /tmp/mlbricks-wheel-test dist/*.whl
+          cd /tmp
+          PYTHONPATH=/tmp/mlbricks-wheel-test python - <<'PY'
+          import importlib, mlbricks
+          for name in ['mlbricks._C','mlbricks._vision_native','mlbricks.ffnbrick._C','mlbricks.residualbrick._C']:
+              importlib.import_module(name)
+              print('IMPORT PASS', name)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-native-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  release-check:
+    name: Assemble release artifacts
+    runs-on: ubuntu-latest
+    needs: [portable, linux-cuda, windows-cuda, macos-native]
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: "*"
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Validate artifact set
+        shell: bash
+        run: |
+          python -m pip install -U twine
+          ls -lh dist/
+          python -m twine check dist/*
+          python - <<'PY'
+          from pathlib import Path
+          files = list(Path('dist').iterdir())
+          names = [p.name for p in files]
+          assert len(names) == len(set(names)), 'duplicate artifact filenames'
+          assert any('py3-none-any.whl' in n for n in names)
+          assert any('linux_x86_64.whl' in n for n in names)
+          assert any('win_amd64.whl' in n for n in names)
+          assert any('macosx' in n and n.endswith('.whl') for n in names)
+          assert any(n.endswith('.tar.gz') for n in names)
+          print('Release artifact matrix: PASS')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-release-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish beta to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: release-check
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mlbricks
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: pypi-release-artifacts
+          path: dist
+      - name: Require version-matching tag
+        shell: bash
+        run: |
+          test "${GITHUB_REF_NAME}" = "v${MLBRICKS_VERSION}"
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

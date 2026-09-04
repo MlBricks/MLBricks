@@ -1,3 +1,10 @@
+## 1.0.0b1
+
+- Beta packaging release with prebuilt native wheel CI for Linux CUDA, Windows CUDA, and macOS CPU-native targets.
+- Adds a portable `py3-none-any` fallback so unsupported platforms do not compile native code during installation.
+- Native beta ABI is pinned to PyTorch 2.10.x; CUDA release wheels use a multi-architecture fat binary.
+- Source installs now default native compilation off; official wheel CI opts native extensions in explicitly.
+
 # MLBricks Changelog
 
 ## 1.0.0 BOLT compound Stage-1 optimization

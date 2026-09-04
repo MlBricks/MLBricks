@@ -79,7 +79,7 @@ def test_pypi_release_metadata_and_license_files_are_consistent() -> None:
     project = tomllib.loads(
         (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )["project"]
-    assert project["version"] == mlbricks.__version__ == "1.0.0"
+    assert project["version"] == mlbricks.__version__ == "1.0.0b1"
     assert project["license"] == "PolyForm-Noncommercial-1.0.0"
     for relative in project["license-files"]:
         assert (ROOT / relative).is_file(), f"Missing release license file: {relative}"
