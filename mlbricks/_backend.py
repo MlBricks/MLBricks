@@ -321,6 +321,39 @@ def autotune(
     return best
 
 
+def r16_gpu_aware_splits(
+    *, B: int, H: int, T: int, sm_count: int,
+    target_tokens_per_split: int = 256,
+    max_waves: int = 4,
+    max_splits: int = 128,
+) -> int:
+    """Choose deterministic R16 split count from context and GPU capacity.
+
+    ``raw`` targets about ``target_tokens_per_split`` history entries per
+    split. ``quantum`` is one occupancy wave for the current B*H geometry.
+    Larger workloads are rounded up to whole occupancy waves, then capped to
+    avoid excessive partial-output/reduction overhead. No timing benchmark or
+    GPU-name table is involved.
+    """
+    B, H, T, sm_count = map(int, (B, H, T, sm_count))
+    target_tokens_per_split = int(target_tokens_per_split)
+    max_waves = int(max_waves)
+    max_splits = int(max_splits)
+    if min(B, H, T, sm_count, target_tokens_per_split, max_waves, max_splits) < 1:
+        raise ValueError("R16 split-selector inputs must all be >= 1")
+
+    raw = max(1, math.ceil(T / target_tokens_per_split))
+    quantum = max(1, math.ceil(sm_count / (B * H)))
+
+    if raw < max(1.0, quantum / 2.0):
+        splits = raw
+    else:
+        splits = math.ceil(raw / quantum) * quantum
+
+    cap = min(max_splits, max(1, max_waves * quantum))
+    return max(1, min(int(splits), int(cap)))
+
+
 @torch.no_grad()
 def r16_no_o_config(
     *, B: int, H: int, T: int, R: int, D: int, ext=None,
@@ -329,9 +362,9 @@ def r16_no_o_config(
 
     The former second-stage kernel race (stream/tiled8/two-pass/R16) is gone.
     The validated B=1/H=4/R=16/D=128 no-O path always uses mode 3
-    (R16 subwarp).  Only the split count is chosen deterministically from
-    context length and available SMs; no timing benchmark or tune-cache lookup
-    occurs here.
+    (R16 subwarp). The split count is derived deterministically from context
+    length and the active GPU's SM count; no timing benchmark, tune-cache
+    lookup, or GPU-name table is used.
     """
     B, H, T, R, D = map(int, (B, H, T, R, D))
     if T < 1:
@@ -346,21 +379,16 @@ def r16_no_o_config(
             return None
 
     if cuda_available():
-        vals = candidate_splits(B, H, T, 1)
-        if not vals:
-            splits = 1
-        else:
-            sm = torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            # The T4 measurements selected 2/10/20/40 as context grows.
-            # Capping at one split per SM preserves that behavior while
-            # remaining hardware-resource based rather than GPU-name based.
-            at_or_below_sm = [s for s in vals if s <= sm]
-            splits = max(at_or_below_sm or vals)
+        sm_count = int(torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count)
+        splits = r16_gpu_aware_splits(
+            B=B, H=H, T=T, sm_count=sm_count,
+        )
     else:
-        # Deterministic CPU-side fallback used only to construct the config
-        # (the native R16 kernel itself still requires CUDA).
+        # CPU-side config construction only. The native R16 kernel still
+        # requires CUDA; this fallback intentionally avoids inventing GPU
+        # hardware properties when CUDA is unavailable.
         splits = max(1, min(40, math.ceil(T / 256)))
 
     return KernelConfig(3, int(splits))

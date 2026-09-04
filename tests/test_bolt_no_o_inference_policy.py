@@ -80,3 +80,42 @@ def test_no_o_second_stage_planner_is_r16_only():
     assert "_median_us" not in section
     assert "r16_no_o_config" in section
     assert "KernelConfig(3" in backend
+
+def test_r16_gpu_aware_split_selector_scales_with_context_and_sms():
+    from mlbricks._backend import r16_gpu_aware_splits
+
+    # Tesla T4-like geometry: 40 SMs, B=1, H=4 => occupancy quantum 10.
+    expected_t4 = {
+        512: 2,
+        2048: 10,
+        4096: 20,
+        8192: 40,
+        16384: 40,
+        32768: 40,
+        65536: 40,
+        131072: 40,
+        262144: 40,
+    }
+    for context, expected in expected_t4.items():
+        assert r16_gpu_aware_splits(
+            B=1, H=4, T=context, sm_count=40
+        ) == expected
+
+    # A larger GPU must adapt from hardware capacity instead of inheriting
+    # the T4's 40-split ceiling.
+    assert r16_gpu_aware_splits(B=1, H=4, T=32768, sm_count=80) == 80
+    assert r16_gpu_aware_splits(B=1, H=4, T=131072, sm_count=80) == 80
+    assert r16_gpu_aware_splits(B=1, H=4, T=32768, sm_count=108) == 108
+
+    # The public selector remains bounded by the native workspace contract.
+    assert r16_gpu_aware_splits(B=1, H=4, T=1_000_000, sm_count=132) == 128
+
+
+def test_r16_gpu_aware_split_selector_validates_inputs():
+    import pytest
+    from mlbricks._backend import r16_gpu_aware_splits
+
+    with pytest.raises(ValueError):
+        r16_gpu_aware_splits(B=1, H=4, T=0, sm_count=40)
+    with pytest.raises(ValueError):
+        r16_gpu_aware_splits(B=1, H=4, T=512, sm_count=0)
