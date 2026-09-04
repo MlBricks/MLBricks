@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -23,6 +24,27 @@ has_cuda_toolkit = (
     and not force_cpu
     and (torch.version.cuda is not None or force_cuda)
 )
+
+expect_cuda_native = os.getenv("MLBRICKS_EXPECT_CUDA_NATIVE", "0") == "1"
+expected_cuda_version = os.getenv("MLBRICKS_EXPECT_CUDA_VERSION", "").strip()
+if expect_cuda_native:
+    if force_cpu:
+        raise RuntimeError("MLBRICKS_EXPECT_CUDA_NATIVE=1 conflicts with MLBRICKS_FORCE_CPU=1")
+    if CUDA_HOME is None:
+        raise RuntimeError(
+            "CUDA-native release build requested but CUDA_HOME was not detected. "
+            "Install the CUDA toolkit before building the native wheel."
+        )
+    if torch.version.cuda is None:
+        raise RuntimeError(
+            "CUDA-native release build requested but the installed PyTorch build is CPU-only. "
+            "Install the matching CUDA-enabled PyTorch wheel before building."
+        )
+    if expected_cuda_version and not str(torch.version.cuda).startswith(expected_cuda_version):
+        raise RuntimeError(
+            f"CUDA-native release build expected PyTorch CUDA {expected_cuda_version}, "
+            f"but torch.version.cuda={torch.version.cuda!r}."
+        )
 
 
 def _extension(
@@ -43,17 +65,31 @@ def _extension(
 
     source_strings = [_rel(path) for path in sources]
     define_macros = []
-    extra_compile_args: dict[str, list[str]] = {"cxx": ["-O3", "-std=c++17"]}
+    if sys.platform == "win32":
+        # PyTorch 2.10's Windows headers contain a CUDA-specific workaround
+        # for NVCC/MSVC std-namespace ambiguity when USE_CUDA is defined.
+        # Use the conforming MSVC preprocessor as recommended by current CUDA/CCCL.
+        cxx_args = ["/O2", "/std:c++17", "/Zc:preprocessor"]
+    else:
+        cxx_args = ["-O3", "-std=c++17"]
+    extra_compile_args: dict[str, list[str]] = {"cxx": cxx_args}
     extension_cls = CppExtension
 
     if has_cuda_toolkit and cuda_source is not None:
         extension_cls = CUDAExtension
         source_strings.append(_rel(cuda_source))
         define_macros.append(("WITH_CUDA", None))
+        if sys.platform == "win32":
+            # PyTorch compiled_autograd.h explicitly guards its problematic
+            # Windows CUDA template path behind USE_CUDA. Without this macro,
+            # NVCC/MSVC can fail with C2872: ambiguous symbol 'std'.
+            define_macros.append(("USE_CUDA", None))
         nvcc = ["-O3"]
+        if sys.platform == "win32":
+            nvcc.append("-Xcompiler=/Zc:preprocessor")
         if use_fast_math:
             nvcc.append("--use_fast_math")
-        if lineinfo:
+        if lineinfo and os.getenv("MLBRICKS_NATIVE_LINEINFO", "0") == "1":
             nvcc.append("-lineinfo")
         extra_compile_args["nvcc"] = nvcc
 
@@ -72,7 +108,10 @@ def _extension(
 
 
 def enabled(name: str) -> bool:
-    return os.getenv(name, "1") != "0"
+    # Source installs default to the portable PyTorch implementation so users
+    # never spend minutes compiling unexpectedly. Official release CI sets the
+    # native build flags to 1 and publishes prebuilt platform wheels.
+    return os.getenv(name, "0") == "1"
 
 
 extensions = []
@@ -102,7 +141,9 @@ if enabled("MLBRICKS_BUILD_BOLT_NATIVE") and has_cuda_toolkit:
         )
     )
 
-if enabled("MLBRICKS_BUILD_VESA_NATIVE"):
+# Legacy pre-1.0 VESA recurrence extension. Unified VESA now uses mlbricks.esa.
+# Keep explicit opt-in for compatibility, but do not build this unused engine by default.
+if os.getenv("MLBRICKS_BUILD_VESA_NATIVE", "0") == "1":
     csrc = ROOT / "mlbricks" / "vesa" / "csrc"
     extensions.append(
         _extension(

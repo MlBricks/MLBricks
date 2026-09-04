@@ -23,6 +23,7 @@ class ESAARBlock(nn.Module):
         self.mixer = ESAMixer(
             ESAConfig(
                 dim=config.dim,
+                heads=config.heads,
                 backend=config.prefill_backend,
                 chunk_size=config.chunk_size,
             )

@@ -1,3 +1,16 @@
+## 1.0.0b1
+
+- Rebuilt `API.md` from the current package-root API, corrected beta/package naming in docs, and audited component license packaging including SOUP.
+- PyPI distribution name finalized as mlbricks-kit; the Python import namespace remains mlbricks.
+- Beta packaging release with prebuilt native wheel CI for Linux CUDA, Windows CUDA, and macOS CPU-native targets.
+- Adds a portable `py3-none-any` fallback so unsupported platforms do not compile native code during installation.
+- Native beta ABI is pinned to PyTorch 2.10.x; CUDA release wheels use a multi-architecture fat binary.
+- Source installs now default native compilation off; official wheel CI opts native extensions in explicitly.
+- Fixed beta wheel CI to install modern setuptools for no-isolation native builds, use the official PyTorch CUDA 12.8 index on Linux/Windows, fail fast on CPU-only PyTorch during CUDA release builds, and restrict macOS native wheels to Apple Silicon.
+- Upgraded artifact upload/download actions to Node 24-capable releases.
+- Forced macOS beta native builds to emit ARM64-only wheel tags and verify every packaged native binary with `lipo` before upload.
+- Fixed Windows CUDA extension compilation with PyTorch 2.10 by defining `USE_CUDA` for CUDA builds and enabling the conforming MSVC preprocessor, activating PyTorch's built-in Windows CUDA header workaround.
+
 # MLBricks Changelog
 
 ## 1.0.0 BOLT compound Stage-1 optimization
@@ -31,3 +44,4 @@
 - Native training now routes differentiable Thunder scans through the existing chunked native backward path without requiring `MLBRICKS_NATIVE_TRAINING=1`.
 - Fused native readout/full-forward kernels remain inference-only and are explicitly blocked while gradients are enabled.
 
+- Release consistency: MLBricks package version is `1.0.0`; experimental SOUP retains its independent component version `0.1.0a3`.

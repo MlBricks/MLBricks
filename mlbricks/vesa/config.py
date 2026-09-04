@@ -25,16 +25,47 @@ def _canonical_backend(value: str) -> str:
 
 @dataclass(frozen=True)
 class ESAConfig:
+    """VESA adapter configuration for the canonical :mod:`mlbricks.esa` engine.
+
+    ``chunk_size`` and ``gate_bias`` remain accepted for source compatibility
+    with early VESA configurations. New execution uses ESA's production
+    ``compass`` planner and bounded-gate Q/G/V formulation.
+    """
+
     dim: int = 192
+    heads: int = 1
     backend: Backend = "auto"
-    chunk_size: int = 64
-    gate_bias: float = 0.0
+    chunk_size: int = 64  # legacy VESA field; retained for config compatibility
+    compass: int | str | None = "auto"
+    precision: str = "fp16"
+    gate_min: float = 0.80
+    gate_max: float = 0.995
+    eps: float = 1e-5
+    gate_bias: float = 0.0  # legacy field; canonical ESA projections are bias-free
 
     def __post_init__(self) -> None:
         if self.dim <= 0:
             raise ValueError("dim must be positive")
+        if self.heads <= 0:
+            raise ValueError("heads must be positive")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if not (0.0 <= float(self.gate_min) < float(self.gate_max) <= 1.0):
+            raise ValueError("gate_min/gate_max must satisfy 0 <= min < max <= 1")
+        if float(self.eps) <= 0.0:
+            raise ValueError("eps must be positive")
+        compass = self.compass
+        if compass is None:
+            compass = "auto"
+        elif isinstance(compass, str):
+            if compass.strip().lower() != "auto":
+                raise ValueError("compass must be a positive integer or 'auto'")
+            compass = "auto"
+        else:
+            compass = int(compass)
+            if compass <= 0:
+                raise ValueError("compass must be positive")
+        object.__setattr__(self, "compass", compass)
         object.__setattr__(self, "backend", _canonical_backend(self.backend))
 
 

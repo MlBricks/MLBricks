@@ -22,7 +22,7 @@ class ESADiffusionBlock(nn.Module):
         self.reverse = reverse
         self.norm1 = nn.LayerNorm(config.dim, elementwise_affine=False)
         self.mixer = ESAMixer(
-            ESAConfig(dim=config.dim, backend=config.backend, chunk_size=config.chunk_size)
+            ESAConfig(dim=config.dim, heads=config.heads, backend=config.backend, chunk_size=config.chunk_size)
         )
         self.norm2 = nn.LayerNorm(config.dim, elementwise_affine=False)
         self.mlp = MLP(config.dim, config.mlp_mult)

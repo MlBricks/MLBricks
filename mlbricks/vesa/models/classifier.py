@@ -60,7 +60,7 @@ class VisionESABlock(nn.Module):
 
         self.state_norm = PerspectiveNorm(config.dim, config.perspective_groups, backend=config.backend)
         self.mixer = ESAMixer(
-            ESAConfig(dim=config.dim, backend=config.backend, chunk_size=config.chunk_size)
+            ESAConfig(dim=config.dim, heads=config.heads, backend=config.backend, chunk_size=config.chunk_size)
         )
         self.mlp_norm = PerspectiveNorm(config.dim, config.perspective_groups, backend=config.backend)
 

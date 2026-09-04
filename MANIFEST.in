@@ -1,20 +1,28 @@
 include README.md
+include API.md
 include CHANGELOG.md
 include LICENSE.md
 include LICENSING_NOTICE.md
 include COMMERCIAL_LICENSE.md
 include setup.py
 
-recursive-include mlbricks/bolt *.py *.cpp *.cu *.h *.cuh *.txt *.md
-recursive-include mlbricks/vesa *.py *.cpp *.cu *.h *.cuh *.txt
-recursive-include mlbricks/ffnbrick *.py *.cpp *.cu *.h *.cuh *.txt
-recursive-include mlbricks/residualbrick *.py *.cpp *.cu *.h *.cuh *.txt
-recursive-include mlbricks/esa *.py *.cpp *.cu *.h *.cuh *.txt *.md
-recursive-include mlbricks/elasticbit *.py *.cpp *.cu *.h *.cuh *.txt *.md
-recursive-include mlbricks/soup *.py *.cpp *.cu *.h *.cuh *.txt *.md
+recursive-include mlbricks/bolt *.py *.cpp *.cu *.txt
+recursive-include mlbricks/vesa *.py *.cpp *.cu *.txt
+recursive-include mlbricks/ffnbrick *.py *.cpp *.cu *.h *.txt
+recursive-include mlbricks/residualbrick *.py *.cpp *.cu *.h *.txt
+recursive-include mlbricks/esa *.py *.txt *.md
+recursive-include mlbricks/elasticbit *.py *.cu *.txt *.md
+recursive-include mlbricks/soup *.py *.txt *.md
 recursive-include examples *.py
 
 
-recursive-include mlbricks/vision_csrc *.cpp *.cu *.h *.cuh
+recursive-include mlbricks/vision_csrc *.cpp *.cu
 
 include mlbricks/LICENSE_VISUALBOLT.txt
+include mlbricks/bolt/LICENSE_BOLT.txt
+include mlbricks/elasticbit/LICENSE_ELASTICBIT.txt
+include mlbricks/esa/LICENSE_ESA.txt
+include mlbricks/ffnbrick/LICENSE_FFNBRICK.txt
+include mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt
+include mlbricks/soup/LICENSE_SOUP.txt
+include mlbricks/vesa/LICENSE_VESA.txt

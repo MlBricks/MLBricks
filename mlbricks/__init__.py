@@ -91,7 +91,7 @@ from .elasticbit import (
 # Friendly lowercase constructor alias.
 esa = ESA
 
-__version__ = "1.0.0"
+__version__ = "1.0.0b1"
 
 __all__ = [
     "Attention",

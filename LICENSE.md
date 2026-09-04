@@ -63,3 +63,4 @@ remain next to the relevant component source and continue to apply independently
 - `mlbricks/LICENSE_VISUALBOLT.txt`
 - `mlbricks/ffnbrick/LICENSE_FFNBRICK.txt`
 - `mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt`
+- `mlbricks/soup/LICENSE_SOUP.txt`

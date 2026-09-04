@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # See LICENSE_VESA.txt in this directory for the VESA component terms.
 
-"""MLBricks VESA: native VisionESA models and C++/CUDA ESA kernels.
+"""MLBricks VESA: visual models powered by the canonical MLBricks ESA engine.
 
 Simple public usage::
 
@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 
 import torch.nn as nn
 
-from .backends.native import native_available, native_cuda_built
+from ..esa.native import available as native_available, cuda_available as native_cuda_built
 from .config import (
     AutoregressiveConfig,
     DiffusionConfig,

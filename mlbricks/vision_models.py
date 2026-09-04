@@ -28,7 +28,7 @@ from .vision_common import (
 def _make_mixer(family: str, config: VisionConfig, *, causal: bool):
     if family == "esa":
         return ESAMixer(
-            ESAConfig(dim=config.dim, backend=config.backend, chunk_size=config.chunk_size)
+            ESAConfig(dim=config.dim, heads=config.heads, backend=config.backend, chunk_size=config.chunk_size)
         )
     if family == "bolt":
         if config.dim % config.heads:
@@ -203,6 +203,26 @@ class _ARBlock(nn.Module):
         x = x + mixed
         return x + self.mlp(self.norm2(x))
 
+    @torch.no_grad()
+    def prefill(self, x: Tensor):
+        """Prefill through the canonical ESA/Bolt recurrent interface."""
+        normalized = self.norm1(x)
+        mixed, cache = self.mixer.prefill(normalized)
+        x = x + mixed
+        return x + self.mlp(self.norm2(x)), cache
+
+    @torch.no_grad()
+    def decode_step(self, x: Tensor, cache):
+        """Decode one token using the core engine's compact recurrent cache."""
+        normalized = self.norm1(x)
+        mixed, cache = self.mixer.decode_step(normalized, cache)
+        if x.ndim == 2 and mixed.ndim == 3:
+            mixed = mixed[:, 0, :]
+        elif x.ndim == 3 and mixed.ndim == 2:
+            mixed = mixed[:, None, :]
+        x = x + mixed
+        return x + self.mlp(self.norm2(x)), cache
+
 
 class VisualAREngine(nn.Module):
     """Autoregressive visual-token model with scan-order-defined sequence.
@@ -272,22 +292,65 @@ class VisualAREngine(nn.Module):
             x = block(x)
         return self.lm_head(self.final_norm(x))
 
+    def _position_at(self, position: int, device, dtype) -> Tensor | None:
+        if position < 0:
+            raise ValueError("position must be non-negative")
+        pos = self._positions(position + 1, device, dtype)
+        if pos is None:
+            return None
+        return pos[:, position, :]
+
+    @torch.no_grad()
+    def prefill(self, prompt_ids: Tensor):
+        """Prefill the prompt and return next-token logits plus per-block caches."""
+        if prompt_ids.ndim != 2 or prompt_ids.shape[1] == 0:
+            raise ValueError("prompt_ids must have non-empty shape [B,T]")
+        x = self.embedding(prompt_ids)
+        pos = self._positions(x.shape[1], x.device, x.dtype)
+        if pos is not None:
+            x = x + pos
+        caches = []
+        for block in self.blocks:
+            x, cache = block.prefill(x)
+            caches.append(cache)
+        logits = self.lm_head(self.final_norm(x[:, -1, :]))
+        return logits, caches
+
+    @torch.no_grad()
+    def decode_step(self, token_ids: Tensor, position: int, caches):
+        """Decode one visual token through canonical ESA/Bolt core caches."""
+        if token_ids.ndim != 1:
+            raise ValueError("token_ids must have shape [B]")
+        if len(caches) != len(self.blocks):
+            raise ValueError("one recurrent cache is required for every block")
+        x = self.embedding(token_ids)
+        pos = self._position_at(position, x.device, x.dtype)
+        if pos is not None:
+            x = x + pos
+        new_caches = []
+        for block, cache in zip(self.blocks, caches, strict=True):
+            x, cache = block.decode_step(x, cache)
+            new_caches.append(cache)
+        return self.lm_head(self.final_norm(x)), new_caches
+
     @torch.no_grad()
     def generate(self, prompt_ids: Tensor, generated_tokens: int) -> Tensor:
         if generated_tokens < 0:
             raise ValueError("generated_tokens must be non-negative")
         if prompt_ids.ndim != 2 or prompt_ids.shape[1] == 0:
             raise ValueError("prompt_ids must have non-empty shape [B,T]")
-        out = prompt_ids
-        generated = []
-        for _ in range(generated_tokens):
-            logits = self(out)
-            token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated.append(token)
-            out = torch.cat([out, token], dim=1)
-        if not generated:
+        if generated_tokens == 0:
             return prompt_ids.new_empty((prompt_ids.shape[0], 0))
-        return torch.cat(generated, dim=1)
+
+        logits, caches = self.prefill(prompt_ids)
+        token = logits.argmax(dim=-1)
+        generated = [token]
+        for offset in range(generated_tokens - 1):
+            position = prompt_ids.shape[1] + offset
+            logits, caches = self.decode_step(token, position, caches)
+            token = logits.argmax(dim=-1)
+            generated.append(token)
+        return torch.stack(generated, dim=1)
 
 
 __all__ = ["ImageDiffusionEngine", "VisualAREngine"]

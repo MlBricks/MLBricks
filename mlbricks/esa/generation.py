@@ -408,6 +408,78 @@ def esa_prefill(
     return y, states[:, -1].contiguous()
 
 
+def esa_forward_with_state(
+    module: torch.nn.Module,
+    x: torch.Tensor,
+    state: torch.Tensor | None = None,
+    *,
+    backend: str | None = None,
+    compass: int | str | None = None,
+    reverse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable canonical ESA sequence pass with recurrent state.
+
+    This is the compositional-model interface for wrappers such as VESA. It
+    uses the same Q/G/V projection, bounded retention gate, Thunder scan,
+    RMS-normalized query readout, backend planner, and learned projections as
+    :class:`mlbricks.esa.ESA` while additionally returning the final recurrent
+    state.  ``state`` may use either ``[B,H,D]`` or flattened ``[B,C]`` layout.
+
+    ``reverse=True`` scans the sequence in the opposite direction and restores
+    outputs to the original token order.  Unlike :func:`esa_prefill`, this
+    function intentionally keeps autograd enabled and is suitable for training.
+    """
+    if x.ndim != 3 or x.size(1) <= 0:
+        raise ValueError(
+            f"ESA sequence expects non-empty [B,T,C], got {tuple(x.shape)}"
+        )
+
+    work = x.flip(1) if reverse else x
+    B = work.size(0)
+    embd, head, head_dim = _dimensions(module)
+    if work.size(-1) != embd:
+        raise ValueError(f"Expected final dimension {embd}, got {work.size(-1)}")
+
+    q, A, B_write = _project_affine_terms(module, work)
+    requested = None if backend is None else str(backend).lower()
+
+    # Use the canonical Thunder/native scan for the zero-state contribution.
+    states = _backend_scan(
+        module,
+        A,
+        B_write,
+        backend_override=requested,
+        compass_override=compass,
+    )
+
+    # Affine recurrence with a non-zero incoming state:
+    # E_t(state0) = E_t(0) + prod_{i<=t}(A_i) * state0.
+    # This retains the canonical optimized scan and adds the initial-state
+    # contribution without a second recurrence implementation.
+    if state is not None:
+        if state.ndim == 2:
+            if state.shape != (B, embd):
+                raise ValueError(f"flattened state must have shape {(B, embd)}")
+            state_h = state.reshape(B, head, head_dim)
+        elif state.ndim == 3:
+            if state.shape != (B, head, head_dim):
+                raise ValueError(
+                    f"headed state must have shape {(B, head, head_dim)}"
+                )
+            state_h = state
+        else:
+            raise ValueError("state must have shape [B,C] or [B,H,D]")
+
+        prefix_A = torch.cumprod(A.to(states.dtype), dim=1)
+        states = states + prefix_A * state_h.to(states.dtype).unsqueeze(1)
+
+    y = _readout(module, q, states, output_dtype=work.dtype)
+    final_state = states[:, -1].contiguous()
+    if reverse:
+        y = y.flip(1)
+    return y, final_state
+
+
 # Backward-compatible low-level name. With no override it keeps the model's
 # configured backend, matching ESA v2.1 behavior.
 lightning_prefill = esa_prefill

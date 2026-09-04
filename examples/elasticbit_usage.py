@@ -11,7 +11,7 @@ elastic.quantize_module(model, include_embeddings=False)
 
 input_ids = torch.randint(0, config.vocab_size, (1, 32))
 with torch.no_grad():
-    logits = model(input_ids)
+    logits, _ = model(input_ids)
 print(logits.shape)
 
 # On a native CUDA build, choose the true low-memory bitstream path explicitly:
