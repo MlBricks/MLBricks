@@ -1,5 +1,7 @@
 ## 1.0.0b1
 
+- PyPI distribution name finalized as `mlbricks-core`; the Python import namespace remains `mlbricks`.
+
 - Beta packaging release with prebuilt native wheel CI for Linux CUDA, Windows CUDA, and macOS CPU-native targets.
 - Adds a portable `py3-none-any` fallback so unsupported platforms do not compile native code during installation.
 - Native beta ABI is pinned to PyTorch 2.10.x; CUDA release wheels use a multi-architecture fat binary.
