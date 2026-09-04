@@ -19,6 +19,7 @@ env:
   MLBRICKS_VERSION: "1.0.0b1"
   TORCH_VERSION: "2.10.0"
   CUDA_VERSION: "12.8.1"
+  PYTORCH_CUDA_INDEX: "https://download.pytorch.org/whl/cu128"
   # Fat CUDA binary: Volta -> Turing -> Ampere -> Ada -> Hopper -> Blackwell.
   TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX"
   MAX_JOBS: "2"
@@ -45,7 +46,8 @@ jobs:
           MLBRICKS_BUILD_RESIDUALBRICK_NATIVE: "0"
           MLBRICKS_BUILD_ELASTICBIT_NATIVE: "0"
         run: |
-          python -m pip install -U build twine
+          set -euxo pipefail
+          python -m pip install -U build twine "setuptools>=77.0.3" wheel
           rm -rf build dist *.egg-info
           python -m build
           python -m twine check dist/*
@@ -60,7 +62,7 @@ jobs:
           assert not bad, bad
           print('Portable wheel contains no compiled binaries: PASS')
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: portable
           path: dist/*
@@ -81,6 +83,8 @@ jobs:
           - cp313-cp313
     env:
       PYTHON: /opt/python/${{ matrix.python_abi }}/bin/python
+      MLBRICKS_EXPECT_CUDA_NATIVE: "1"
+      MLBRICKS_EXPECT_CUDA_VERSION: "12.8"
       MLBRICKS_BUILD_CORE_NATIVE: "1"
       MLBRICKS_BUILD_BOLT_NATIVE: "1"
       MLBRICKS_BUILD_VESA_NATIVE: "0"
@@ -94,13 +98,16 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          "$PYTHON" -m pip install -U pip wheel build ninja
-          "$PYTHON" -m pip install "torch==${TORCH_VERSION}"
+          "$PYTHON" -m pip install -U pip wheel build ninja "setuptools>=77.0.3" "numpy>=1.24"
+          "$PYTHON" -m pip install "torch==${TORCH_VERSION}" --index-url "${PYTORCH_CUDA_INDEX}"
           nvcc --version
           "$PYTHON" - <<'PY'
           import torch
-          print('torch', torch.__version__, 'cuda', torch.version.cuda)
-          assert torch.__version__.split('+')[0].startswith('2.10.')
+          from torch.utils.cpp_extension import CUDA_HOME
+          print('torch', torch.__version__, 'cuda', torch.version.cuda, 'CUDA_HOME', CUDA_HOME)
+          assert torch.__version__.split('+')[0] == '2.10.0'
+          assert torch.version.cuda is not None and torch.version.cuda.startswith('12.8'), torch.version.cuda
+          assert CUDA_HOME is not None, 'CUDA_HOME must be detected for CUDA-native release wheels'
           PY
           rm -rf build dist *.egg-info
           "$PYTHON" -m build --wheel --no-isolation
@@ -135,7 +142,7 @@ jobs:
               importlib.import_module(name)
               print('IMPORT PASS', name)
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-cuda-${{ matrix.python_abi }}
           path: dist/*.whl
@@ -149,6 +156,9 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13"]
     env:
+      MAX_JOBS: "1"
+      MLBRICKS_EXPECT_CUDA_NATIVE: "1"
+      MLBRICKS_EXPECT_CUDA_VERSION: "12.8"
       MLBRICKS_BUILD_CORE_NATIVE: "1"
       MLBRICKS_BUILD_BOLT_NATIVE: "1"
       MLBRICKS_BUILD_VESA_NATIVE: "0"
@@ -170,15 +180,30 @@ jobs:
       - name: Build Windows fat-CUDA wheel
         shell: pwsh
         run: |
-          python -m pip install -U pip wheel build ninja
-          python -m pip install "torch==$env:TORCH_VERSION"
+          python -m pip install -U pip wheel build ninja "setuptools>=77.0.3" "numpy>=1.24"
+          python -m pip install "torch==$env:TORCH_VERSION" --index-url $env:PYTORCH_CUDA_INDEX
           nvcc --version
-          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); assert torch.__version__.split('+')[0].startswith('2.10.')"
+          python -c "import torch; from torch.utils.cpp_extension import CUDA_HOME; print('torch',torch.__version__,'cuda',torch.version.cuda,'CUDA_HOME',CUDA_HOME); assert torch.__version__.split('+')[0] == '2.10.0'; assert torch.version.cuda is not None and torch.version.cuda.startswith('12.8'); assert CUDA_HOME is not None"
           Remove-Item -Recurse -Force build,dist -ErrorAction SilentlyContinue
           Get-ChildItem -Directory -Filter '*.egg-info' | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
           python -m build --wheel --no-isolation
           Get-ChildItem dist
-          python -c "from pathlib import Path; w=next(Path('dist').glob('*.whl')); s=w.stat().st_size/1024**2; print(w.name, f'{s:.2f} MiB'); assert s < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {s:.2f} MiB'"
+          @'
+          from pathlib import Path
+          import zipfile
+          w = next(Path('dist').glob('*.whl'))
+          s = w.stat().st_size / 1024**2
+          print(w.name, f'{s:.2f} MiB')
+          assert s < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {s:.2f} MiB'
+          assert 'win_amd64' in w.name, w.name
+          with zipfile.ZipFile(w) as z:
+              bins = [n for n in z.namelist() if n.endswith('.pyd')]
+          expected = ['mlbricks/_C', 'mlbricks/_gauss_cuda', 'mlbricks/_vision_native',
+                      'mlbricks/ffnbrick/_C', 'mlbricks/residualbrick/_C', 'mlbricks/elasticbit/_C']
+          missing = [x for x in expected if not any(x in b for b in bins)]
+          assert not missing, missing
+          print('All six Windows native extensions packaged: PASS')
+          '@ | python -
       - name: Import Windows native extensions
         shell: pwsh
         run: |
@@ -190,22 +215,23 @@ jobs:
           $env:PYTHONPATH = $target
           python -c "import importlib,mlbricks; print('mlbricks',mlbricks.__version__,mlbricks.__file__); [importlib.import_module(x) for x in ['mlbricks._C','mlbricks._gauss_cuda','mlbricks._vision_native','mlbricks.ffnbrick._C','mlbricks.residualbrick._C','mlbricks.elasticbit._C']]; print('Windows native imports: PASS')"
           Pop-Location
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-cuda-py${{ matrix.python }}
           path: dist/*.whl
           if-no-files-found: error
 
   macos-native:
-    name: macOS CPU native / ${{ matrix.os }} / Python ${{ matrix.python }}
-    runs-on: ${{ matrix.os }}
+    name: macOS ARM64 native / Python ${{ matrix.python }}
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel]
         python: ["3.10", "3.11", "3.12", "3.13"]
     env:
       MLBRICKS_FORCE_CPU: "1"
+      MAX_JOBS: "1"
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
       MLBRICKS_BUILD_CORE_NATIVE: "1"
       MLBRICKS_BUILD_BOLT_NATIVE: "0"
       MLBRICKS_BUILD_VESA_NATIVE: "0"
@@ -219,20 +245,35 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - name: Build macOS native CPU wheel
+      - name: Build macOS ARM64 native CPU wheel
         shell: bash
         run: |
           set -euxo pipefail
-          python -m pip install -U pip wheel build ninja "torch==${TORCH_VERSION}"
+          python -m pip install -U pip wheel build ninja "setuptools>=77.0.3" "numpy>=1.24" "torch==${TORCH_VERSION}"
+          python - <<'PY'
+          import platform, torch
+          print('machine', platform.machine(), 'torch', torch.__version__)
+          assert platform.machine() == 'arm64', platform.machine()
+          assert torch.__version__.split('+')[0] == '2.10.0'
+          PY
           rm -rf build dist *.egg-info
           python -m build --wheel --no-isolation
           ls -lh dist/
           python - <<'PY'
           from pathlib import Path
+          import zipfile
           w = next(Path('dist').glob('*.whl'))
           s = w.stat().st_size / 1024**2
           print(w.name, f'{s:.2f} MiB')
           assert s < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {s:.2f} MiB'
+          assert 'arm64' in w.name, w.name
+          with zipfile.ZipFile(w) as z:
+              bins = [n for n in z.namelist() if n.endswith(('.so', '.dylib'))]
+          expected = ['mlbricks/_C', 'mlbricks/_vision_native',
+                      'mlbricks/ffnbrick/_C', 'mlbricks/residualbrick/_C']
+          missing = [x for x in expected if not any(x in b for b in bins)]
+          assert not missing, missing
+          print('All four macOS ARM64 native extensions packaged: PASS')
           PY
           rm -rf /tmp/mlbricks-wheel-test
           python -m pip install --no-deps --target /tmp/mlbricks-wheel-test dist/*.whl
@@ -243,9 +284,9 @@ jobs:
               importlib.import_module(name)
               print('IMPORT PASS', name)
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: macos-native-${{ matrix.os }}-py${{ matrix.python }}
+          name: macos-arm64-py${{ matrix.python }}
           path: dist/*.whl
           if-no-files-found: error
 
@@ -254,7 +295,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [portable, linux-cuda, windows-cuda, macos-native]
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           pattern: "*"
           path: dist
@@ -265,6 +306,7 @@ jobs:
       - name: Validate artifact set
         shell: bash
         run: |
+          set -euxo pipefail
           python -m pip install -U twine
           ls -lh dist/
           python -m twine check dist/*
@@ -276,11 +318,15 @@ jobs:
           assert any('py3-none-any.whl' in n for n in names)
           assert any('linux_x86_64.whl' in n for n in names)
           assert any('win_amd64.whl' in n for n in names)
-          assert any('macosx' in n and n.endswith('.whl') for n in names)
+          assert any('macosx' in n and 'arm64' in n and n.endswith('.whl') for n in names)
+          assert not any('x86_64' in n and 'macosx' in n for n in names), names
           assert any(n.endswith('.tar.gz') for n in names)
+          expected_wheels = 1 + 4 + 4 + 4
+          wheel_count = sum(n.endswith('.whl') for n in names)
+          assert wheel_count == expected_wheels, (wheel_count, names)
           print('Release artifact matrix: PASS')
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pypi-release-artifacts
           path: dist/*
@@ -298,7 +344,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/mlbricks
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: pypi-release-artifacts
           path: dist

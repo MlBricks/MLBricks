@@ -25,6 +25,27 @@ has_cuda_toolkit = (
     and (torch.version.cuda is not None or force_cuda)
 )
 
+expect_cuda_native = os.getenv("MLBRICKS_EXPECT_CUDA_NATIVE", "0") == "1"
+expected_cuda_version = os.getenv("MLBRICKS_EXPECT_CUDA_VERSION", "").strip()
+if expect_cuda_native:
+    if force_cpu:
+        raise RuntimeError("MLBRICKS_EXPECT_CUDA_NATIVE=1 conflicts with MLBRICKS_FORCE_CPU=1")
+    if CUDA_HOME is None:
+        raise RuntimeError(
+            "CUDA-native release build requested but CUDA_HOME was not detected. "
+            "Install the CUDA toolkit before building the native wheel."
+        )
+    if torch.version.cuda is None:
+        raise RuntimeError(
+            "CUDA-native release build requested but the installed PyTorch build is CPU-only. "
+            "Install the matching CUDA-enabled PyTorch wheel before building."
+        )
+    if expected_cuda_version and not str(torch.version.cuda).startswith(expected_cuda_version):
+        raise RuntimeError(
+            f"CUDA-native release build expected PyTorch CUDA {expected_cuda_version}, "
+            f"but torch.version.cuda={torch.version.cuda!r}."
+        )
+
 
 def _extension(
     name: str,

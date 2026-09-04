@@ -443,3 +443,9 @@ MLBricks `1.0.0b1` is distributed with prebuilt native wheels for supported Linu
 For release builds, GitHub CI compiles CUDA wheels with a fat architecture list covering NVIDIA compute capabilities 7.0, 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0+PTX. The beta native ABI is validated against PyTorch `2.10.x`; the package therefore requires `torch>=2.10,<2.11` until the native bindings migrate to the PyTorch stable ABI.
 
 Source installations default native compilation **off**. Developers who intentionally want to compile from source can set the relevant `MLBRICKS_BUILD_*_NATIVE=1` flags. The corresponding `=0` values explicitly disable each extension.
+
+### Beta native platform support
+
+For `1.0.0b1`, official prebuilt native wheels target Linux x86_64 with CUDA 12.8, Windows x86_64 with CUDA 12.8, and macOS Apple Silicon (`arm64`) for CPU-native acceleration. Intel macOS is not included because the PyTorch 2.10 binary line used by this beta does not provide the required current x86_64 macOS wheels.
+
+Windows CUDA-native users must use the CUDA 12.8 PyTorch build from the official PyTorch `cu128` index. The MLBricks wheel itself remains precompiled, so MLBricks does not compile native code on the user's machine. If CUDA-native prerequisites are unavailable, MLBricks' PyTorch implementation remains the portable fallback.

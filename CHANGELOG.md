@@ -4,6 +4,8 @@
 - Adds a portable `py3-none-any` fallback so unsupported platforms do not compile native code during installation.
 - Native beta ABI is pinned to PyTorch 2.10.x; CUDA release wheels use a multi-architecture fat binary.
 - Source installs now default native compilation off; official wheel CI opts native extensions in explicitly.
+- Fixed beta wheel CI to install modern setuptools for no-isolation native builds, use the official PyTorch CUDA 12.8 index on Linux/Windows, fail fast on CPU-only PyTorch during CUDA release builds, and restrict macOS native wheels to Apple Silicon.
+- Upgraded artifact upload/download actions to Node 24-capable releases.
 
 # MLBricks Changelog
 
