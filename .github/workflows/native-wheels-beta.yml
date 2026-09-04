@@ -52,8 +52,8 @@ jobs:
           python -m build
           python -m twine check dist/*
           ls -lh dist/
-          test -f dist/mlbricks-${MLBRICKS_VERSION}-py3-none-any.whl
-          test -f dist/mlbricks-${MLBRICKS_VERSION}.tar.gz
+          test -f dist/mlbricks_kit-${MLBRICKS_VERSION}-py3-none-any.whl
+          test -f dist/mlbricks_kit-${MLBRICKS_VERSION}.tar.gz
           python - <<'PY'
           import zipfile, pathlib
           wheel = next(pathlib.Path('dist').glob('*py3-none-any.whl'))
@@ -358,7 +358,7 @@ jobs:
       contents: read
     environment:
       name: pypi
-      url: https://pypi.org/p/mlbricks
+      url: https://pypi.org/p/mlbricks-kit
     steps:
       - uses: actions/download-artifact@v7
         with:

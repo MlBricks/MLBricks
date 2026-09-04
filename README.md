@@ -17,7 +17,7 @@
 - **Execution planner** — automatic backend and execution-route planning.
 - **Native acceleration** — optional C++/CUDA kernels where supported.
 
-The public Python package is `mlbricks`.
+The PyPI distribution is `mlbricks-kit`; the public Python import package remains `mlbricks`.
 
 ## Version
 
@@ -29,10 +29,12 @@ print(mlbricks.__version__)
 
 ## Installation
 
+> Install mlbricks-kit from PyPI; use import mlbricks in Python.
+
 From PyPI:
 
 ```bash
-pip install mlbricks
+pip install mlbricks-kit
 ```
 
 For development or installation directly from the repository root:
