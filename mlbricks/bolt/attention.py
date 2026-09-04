@@ -16,9 +16,9 @@ from .._backend import (
     WORKSPACES,
     KernelConfig,
     autotune,
-    autotune_gauss_no_o,
     autotune_gauss_rope,
     heuristic_config,
+    r16_no_o_config,
     load_cuda_extension,
 )
 
@@ -652,23 +652,17 @@ class Bolt(nn.Module):
         )
 
     def _standalone_no_o_config(self, *, batch: int, used: int):
-        """Exact split schedule from the fastest standalone no-O T4 decode.
+        """Return the R16-only no-O decode config for the validated shape.
 
-        Keep this narrowly specialized until the integrated kernel is benchmarked
-        across more shapes. Other geometries/batches continue through the normal
-        autotuner/heuristic path.
+        The former second-stage mode planner has been removed: stream, tiled8
+        and standalone two-pass are no longer candidates for this path.
         """
-        if (
-            int(batch) == 1
-            and self.num_heads == 4
-            and self.latent_dim == 16
-            and self.d_model == 128
-            and self.position is None
-            and self.out_proj.bias is None
-        ):
-            splits = max(1, min(32, (int(used) + 255) // 256))
-            return KernelConfig(mode=2, splits=splits)
-        return None
+        if self.position is not None or self.out_proj.bias is not None:
+            return None
+        return r16_no_o_config(
+            B=int(batch), H=self.num_heads, T=int(used),
+            R=self.latent_dim, D=self.d_model,
+        )
 
     def _q_c(self, x: torch.Tensor):
         B, T, _ = x.shape
@@ -1160,7 +1154,10 @@ class Bolt(nn.Module):
         # fused projection currently targets the default bias=False BOLT.
         no_o_plain = bool(
             plain_native and self.out_proj.bias is None
+            and self._standalone_no_o_config(batch=B, used=used) is not None
             and hasattr(ext, "gauss_decode_project_out_used")
+            and hasattr(ext, "gauss_r16_scan_supported")
+            and bool(ext.gauss_r16_scan_supported())
         )
         no_o_rope = bool(
             rope_native and self.out_proj.bias is None
@@ -1202,13 +1199,6 @@ class Bolt(nn.Module):
             y = ws.out
         elif plain_native:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
-            if cfg is not None and self.autotune_kernels:
-                cfg = autotune_gauss_no_o(
-                    q=q, c=c_cache, rho=rho_cache,
-                    weight=self.out_proj.weight.contiguous(),
-                    head_dim=self.head_dim, ext=ext, force=force_retune,
-                    used_length=used,
-                )
             if cfg is None:
                 if self.autotune_kernels:
                     cfg = autotune(
@@ -1341,9 +1331,13 @@ class Bolt(nn.Module):
             rope_width >= 2 and ext is not None
             and hasattr(ext, "gauss_rope_decode_append_out")
         )
+        used = pos + 1
         no_o_plain = bool(
             plain_fused and self.out_proj.bias is None
+            and self._standalone_no_o_config(batch=B, used=used) is not None
             and hasattr(ext, "gauss_decode_append_project_out")
+            and hasattr(ext, "gauss_r16_scan_supported")
+            and bool(ext.gauss_r16_scan_supported())
         )
         no_o_rope = bool(
             rope_fused and self.out_proj.bias is None
@@ -1354,7 +1348,6 @@ class Bolt(nn.Module):
                 "backend='native' requested but native Gauss decode is unavailable"
             )
 
-        used = pos + 1
         if rope_fused:
             if self.autotune_kernels:
                 cfg = autotune_gauss_rope(
@@ -1387,13 +1380,6 @@ class Bolt(nn.Module):
 
         if plain_fused:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
-            if cfg is not None and self.autotune_kernels:
-                cfg = autotune_gauss_no_o(
-                    q=q, c=c_cache, rho=rho_cache,
-                    weight=self.out_proj.weight.contiguous(),
-                    head_dim=self.head_dim, ext=ext, force=force_retune,
-                    used_length=used, c_now=c_now3, rho_now=rho_now2, position=pos,
-                )
             if cfg is None:
                 if self.autotune_kernels:
                     cfg = autotune(
@@ -1494,7 +1480,10 @@ class Bolt(nn.Module):
         native_used_api = bool(ext is not None and hasattr(ext, "gauss_decode_out_used"))
         no_o_native = bool(
             ext is not None and self.out_proj.bias is None
+            and self._standalone_no_o_config(batch=B, used=used) is not None
             and hasattr(ext, "gauss_decode_project_out_used")
+            and hasattr(ext, "gauss_r16_scan_supported")
+            and bool(ext.gauss_r16_scan_supported())
         )
         if ext is not None and used != cache_capacity and not native_used_api:
             ext = None
@@ -1516,13 +1505,6 @@ class Bolt(nn.Module):
             y = torch.matmul(p, c_used)[:, :, 0, :]
         else:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_native else None
-            if cfg is not None and self.autotune_kernels:
-                cfg = autotune_gauss_no_o(
-                    q=q, c=c_cache, rho=rho_cache,
-                    weight=self.out_proj.weight.contiguous(),
-                    head_dim=self.head_dim, ext=ext, force=force_retune,
-                    used_length=used,
-                )
             if cfg is None:
                 if self.autotune_kernels:
                     cfg = autotune(

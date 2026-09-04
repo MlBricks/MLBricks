@@ -39,21 +39,12 @@ def test_standalone_no_o_fast_config_is_narrow_and_exact():
         backend="pytorch",
     )
 
-    expected = {
-        1: 1,
-        255: 1,
-        256: 1,
-        257: 2,
-        512: 2,
-        2048: 8,
-        8192: 32,
-        16384: 32,
-    }
-    for used, splits in expected.items():
+    for used in (1, 255, 256, 257, 512, 2048, 8192, 16384):
         cfg = bolt._standalone_no_o_config(batch=1, used=used)
         assert cfg is not None
-        assert cfg.mode == 2
-        assert cfg.splits == splits
+        assert cfg.mode == 3
+        assert cfg.mode_name == "r16_subwarp"
+        assert 1 <= cfg.splits <= 128
 
     # Do not force the standalone schedule outside the measured batch/shape.
     assert bolt._standalone_no_o_config(batch=4, used=8192) is None
@@ -74,3 +65,18 @@ def test_fast_no_o_cuda_reducer_is_present_with_generic_fallback():
     assert "use_fast_no_o_merge" in cuda
     assert "launch_merge_project" in cuda
     assert "merge_project_partial" in cuda
+
+
+def test_no_o_second_stage_planner_is_r16_only():
+    root = Path(__file__).resolve().parents[1]
+    backend = (root / "mlbricks" / "_backend.py").read_text()
+    start = backend.index("def autotune_gauss_no_o(")
+    end = backend.index("def autotune_gauss_rope(", start)
+    section = backend[start:end]
+
+    # Compatibility entry point remains, but it no longer races modes 0/1/2/3.
+    assert "for mode in" not in section
+    assert "TUNE_STORE" not in section
+    assert "_median_us" not in section
+    assert "r16_no_o_config" in section
+    assert "KernelConfig(3" in backend
