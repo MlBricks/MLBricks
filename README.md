@@ -49,15 +49,7 @@ For a CPU-only native build:
 MLBRICKS_FORCE_CPU=1 pip install -e .
 ```
 
-Optional native components can be disabled during installation when needed:
 
-```text
-MLBRICKS_BUILD_CORE_NATIVE=0
-MLBRICKS_BUILD_VISION_NATIVE=0
-MLBRICKS_BUILD_VESA_NATIVE=0
-MLBRICKS_BUILD_FFNBRICK_NATIVE=0
-MLBRICKS_BUILD_RESIDUALBRICK_NATIVE=0
-MLBRICKS_BUILD_ELASTICBIT_NATIVE=0
 ```
 
 ## Quick start
