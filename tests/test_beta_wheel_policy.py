@@ -73,6 +73,9 @@ def test_linux_release_wheels_are_repaired_to_manylinux_for_pypi() -> None:
     assert "--plat manylinux_2_28_x86_64" in workflow
     assert "'manylinux_2_28_x86_64' in wheel.name" in workflow
     assert "'-linux_x86_64.whl' not in wheel.name" in workflow
+    assert "linux_wheels = [" in workflow
+    assert "assert len(linux_wheels) == 4" in workflow
+    assert "all('manylinux_2_28_x86_64' in n for n in linux_wheels)" in workflow
 
 def test_windows_wheel_verifies_all_six_native_extensions_before_upload() -> None:
     workflow = _workflow()

@@ -365,7 +365,16 @@ jobs:
           names = [p.name for p in files]
           assert len(names) == len(set(names)), 'duplicate artifact filenames'
           assert any('py3-none-any.whl' in n for n in names)
-          assert any('linux_x86_64.whl' in n for n in names)
+          linux_wheels = [
+              n for n in names
+              if n.endswith('.whl') and 'manylinux' in n and 'x86_64' in n
+          ]
+          assert len(linux_wheels) == 4, linux_wheels
+          # auditwheel may emit a valid compressed/dual platform tag such as
+          # manylinux_2_27_x86_64.manylinux_2_28_x86_64. Require the requested
+          # manylinux_2_28 compatibility tag instead of an exact filename.
+          assert all('manylinux_2_28_x86_64' in n for n in linux_wheels), linux_wheels
+          assert not any(n.endswith('-linux_x86_64.whl') for n in names), names
           assert any('win_amd64.whl' in n for n in names)
           assert any('macosx' in n and 'arm64' in n and n.endswith('.whl') for n in names)
           assert not any('x86_64' in n and 'macosx' in n for n in names), names
