@@ -31,3 +31,4 @@
 - Native training now routes differentiable Thunder scans through the existing chunked native backward path without requiring `MLBRICKS_NATIVE_TRAINING=1`.
 - Fused native readout/full-forward kernels remain inference-only and are explicitly blocked while gradients are enabled.
 
+- Release consistency: MLBricks package version is `1.0.0`; experimental SOUP retains its independent component version `0.1.0a3`.

@@ -8,7 +8,20 @@ version = "1.0.0"
 description = "MLBricks modular neural-network library with uniform auto/native/pytorch dispatch, hierarchical adaptive execution planner, native C++/CUDA vision engines, ESA, Bolt, Gaussian/BoltModel, VisionBolt, VESA, Bricks, FFNBrick, ResidualBrick, SOUP, and ElasticBit."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE.md" }
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = [
+  "LICENSE.md",
+  "LICENSING_NOTICE.md",
+  "COMMERCIAL_LICENSE.md",
+  "mlbricks/LICENSE_VISUALBOLT.txt",
+  "mlbricks/bolt/LICENSE_BOLT.txt",
+  "mlbricks/elasticbit/LICENSE_ELASTICBIT.txt",
+  "mlbricks/esa/LICENSE_ESA.txt",
+  "mlbricks/ffnbrick/LICENSE_FFNBRICK.txt",
+  "mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt",
+  "mlbricks/soup/LICENSE_SOUP.txt",
+  "mlbricks/vesa/LICENSE_VESA.txt",
+]
 authors = [
   { name = "Zameer Hussain" },
   { name = "Akhtar Hussain" }

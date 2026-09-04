@@ -410,3 +410,19 @@ See [`LICENSE.md`](LICENSE.md), [`LICENSING_NOTICE.md`](LICENSING_NOTICE.md), an
 ## Training compilation
 
 The default remains `training_compile_mode="default"`.
+
+### Bolt native build control
+
+To install MLBricks without compiling the optional Bolt native extension, set:
+
+`MLBRICKS_BUILD_BOLT_NATIVE=0`
+
+Bolt remains available through its PyTorch/fallback implementation; this flag only disables native extension compilation during installation.
+
+### SOUP component license
+
+The bundled SOUP component license is shipped at `mlbricks/soup/LICENSE_SOUP.txt`.
+
+### Versioning note
+
+MLBricks is released as `1.0.0`. Experimental SOUP retains its independent component version `0.1.0a3`.
