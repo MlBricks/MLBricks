@@ -77,12 +77,26 @@ def test_windows_wheel_verifies_all_six_native_extensions_before_upload() -> Non
         assert ext in workflow
 
 
+
+def test_windows_cuda_build_activates_pytorch_header_workaround() -> None:
+    setup = (ROOT / "setup.py").read_text(encoding="utf-8")
+    assert '("USE_CUDA", None)' in setup
+    assert '"/Zc:preprocessor"' in setup
+    assert '"-Xcompiler=/Zc:preprocessor"' in setup
+    assert "C2872" in setup
+
 def test_macos_beta_targets_apple_silicon_only() -> None:
     workflow = _workflow()
     assert "runs-on: macos-14" in workflow
     assert "macos-15-intel" not in workflow
     assert "macOS ARM64 native" in workflow
     assert 'MACOSX_DEPLOYMENT_TARGET: "11.0"' in workflow
+    assert 'ARCHFLAGS: "-arch arm64"' in workflow
+    assert '_PYTHON_HOST_PLATFORM: "macosx-11.0-arm64"' in workflow
+    assert "-C--build-option=macosx_11_0_arm64" in workflow
+    assert "'macosx_11_0_arm64' in w.name" in workflow
+    assert "subprocess.check_output(['lipo', '-archs'" in workflow
+    assert "archs == ['arm64']" in workflow
     assert "platform.machine() == 'arm64'" in workflow
     assert "macos-arm64-py" in workflow
 

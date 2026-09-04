@@ -6,6 +6,8 @@
 - Source installs now default native compilation off; official wheel CI opts native extensions in explicitly.
 - Fixed beta wheel CI to install modern setuptools for no-isolation native builds, use the official PyTorch CUDA 12.8 index on Linux/Windows, fail fast on CPU-only PyTorch during CUDA release builds, and restrict macOS native wheels to Apple Silicon.
 - Upgraded artifact upload/download actions to Node 24-capable releases.
+- Forced macOS beta native builds to emit ARM64-only wheel tags and verify every packaged native binary with `lipo` before upload.
+- Fixed Windows CUDA extension compilation with PyTorch 2.10 by defining `USE_CUDA` for CUDA builds and enabling the conforming MSVC preprocessor, activating PyTorch's built-in Windows CUDA header workaround.
 
 # MLBricks Changelog
 

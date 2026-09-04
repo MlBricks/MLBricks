@@ -66,7 +66,10 @@ def _extension(
     source_strings = [_rel(path) for path in sources]
     define_macros = []
     if sys.platform == "win32":
-        cxx_args = ["/O2", "/std:c++17"]
+        # PyTorch 2.10's Windows headers contain a CUDA-specific workaround
+        # for NVCC/MSVC std-namespace ambiguity when USE_CUDA is defined.
+        # Use the conforming MSVC preprocessor as recommended by current CUDA/CCCL.
+        cxx_args = ["/O2", "/std:c++17", "/Zc:preprocessor"]
     else:
         cxx_args = ["-O3", "-std=c++17"]
     extra_compile_args: dict[str, list[str]] = {"cxx": cxx_args}
@@ -76,7 +79,14 @@ def _extension(
         extension_cls = CUDAExtension
         source_strings.append(_rel(cuda_source))
         define_macros.append(("WITH_CUDA", None))
+        if sys.platform == "win32":
+            # PyTorch compiled_autograd.h explicitly guards its problematic
+            # Windows CUDA template path behind USE_CUDA. Without this macro,
+            # NVCC/MSVC can fail with C2872: ambiguous symbol 'std'.
+            define_macros.append(("USE_CUDA", None))
         nvcc = ["-O3"]
+        if sys.platform == "win32":
+            nvcc.append("-Xcompiler=/Zc:preprocessor")
         if use_fast_math:
             nvcc.append("--use_fast_math")
         if lineinfo and os.getenv("MLBRICKS_NATIVE_LINEINFO", "0") == "1":

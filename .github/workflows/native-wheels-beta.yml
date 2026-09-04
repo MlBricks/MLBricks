@@ -232,6 +232,8 @@ jobs:
       MLBRICKS_FORCE_CPU: "1"
       MAX_JOBS: "1"
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      ARCHFLAGS: "-arch arm64"
+      _PYTHON_HOST_PLATFORM: "macosx-11.0-arm64"
       MLBRICKS_BUILD_CORE_NATIVE: "1"
       MLBRICKS_BUILD_BOLT_NATIVE: "0"
       MLBRICKS_BUILD_VESA_NATIVE: "0"
@@ -257,7 +259,10 @@ jobs:
           assert torch.__version__.split('+')[0] == '2.10.0'
           PY
           rm -rf build dist *.egg-info
-          python -m build --wheel --no-isolation
+          python -m build --wheel --no-isolation \
+            -C--build-option=bdist_wheel \
+            -C--build-option=--plat-name \
+            -C--build-option=macosx_11_0_arm64
           ls -lh dist/
           python - <<'PY'
           from pathlib import Path
@@ -266,14 +271,25 @@ jobs:
           s = w.stat().st_size / 1024**2
           print(w.name, f'{s:.2f} MiB')
           assert s < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {s:.2f} MiB'
-          assert 'arm64' in w.name, w.name
+          assert 'macosx_11_0_arm64' in w.name, w.name
+          import subprocess, tempfile
           with zipfile.ZipFile(w) as z:
               bins = [n for n in z.namelist() if n.endswith(('.so', '.dylib'))]
+              with tempfile.TemporaryDirectory() as td:
+                  extracted = []
+                  for name in bins:
+                      out = Path(td) / Path(name).name
+                      out.write_bytes(z.read(name))
+                      archs = subprocess.check_output(['lipo', '-archs', str(out)], text=True).strip().split()
+                      print(name, 'architectures:', archs)
+                      assert archs == ['arm64'], (name, archs)
+                      extracted.append(name)
           expected = ['mlbricks/_C', 'mlbricks/_vision_native',
                       'mlbricks/ffnbrick/_C', 'mlbricks/residualbrick/_C']
           missing = [x for x in expected if not any(x in b for b in bins)]
           assert not missing, missing
           print('All four macOS ARM64 native extensions packaged: PASS')
+          print('All macOS native binaries are arm64-only: PASS')
           PY
           rm -rf /tmp/mlbricks-wheel-test
           python -m pip install --no-deps --target /tmp/mlbricks-wheel-test dist/*.whl
