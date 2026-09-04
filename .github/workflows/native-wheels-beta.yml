@@ -98,7 +98,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          "$PYTHON" -m pip install -U pip wheel build ninja "setuptools>=77.0.3" "numpy>=1.24"
+          "$PYTHON" -m pip install -U pip wheel build ninja "setuptools>=77.0.3" "numpy>=1.24" "auditwheel>=6" "patchelf>=0.14"
           "$PYTHON" -m pip install "torch==${TORCH_VERSION}" --index-url "${PYTORCH_CUDA_INDEX}"
           nvcc --version
           "$PYTHON" - <<'PY'
@@ -111,6 +111,38 @@ jobs:
           PY
           rm -rf build dist *.egg-info
           "$PYTHON" -m build --wheel --no-isolation
+
+          # PyPI rejects generic linux_x86_64 binary wheels.  This job already
+          # runs inside PyTorch's manylinux_2_28 CUDA builder, so audit/repair
+          # the wheel to a PEP 600 manylinux tag before publishing.  Keep
+          # PyTorch/CUDA runtime libraries external: torch and its NVIDIA
+          # dependency wheels provide those at runtime.
+          mkdir -p unrepaired wheelhouse
+          mv dist/*.whl unrepaired/
+          "$PYTHON" -m auditwheel show unrepaired/*.whl
+          "$PYTHON" -m auditwheel repair \
+            --plat manylinux_2_28_x86_64 \
+            --exclude 'libtorch*.so*' \
+            --exclude 'libc10*.so*' \
+            --exclude 'libcudart.so*' \
+            --exclude 'libcuda.so*' \
+            --exclude 'libcublas*.so*' \
+            --exclude 'libcurand*.so*' \
+            --exclude 'libcusparse*.so*' \
+            --exclude 'libcufft*.so*' \
+            --exclude 'libcusolver*.so*' \
+            --exclude 'libnvrtc*.so*' \
+            --exclude 'libnvJitLink*.so*' \
+            --exclude 'libnvToolsExt*.so*' \
+            --exclude 'libcudnn*.so*' \
+            --exclude 'libstdc++.so*' \
+            --exclude 'libgcc_s.so*' \
+            -w wheelhouse \
+            unrepaired/*.whl
+          rm -rf dist
+          mkdir dist
+          mv wheelhouse/*.whl dist/
+          "$PYTHON" -m auditwheel show dist/*.whl
           ls -lh dist/
           "$PYTHON" - <<'PY'
           import pathlib, zipfile
@@ -118,7 +150,8 @@ jobs:
           size_mib = wheel.stat().st_size / 1024**2
           print('wheel:', wheel.name, f'{size_mib:.2f} MiB')
           assert size_mib < 100.0, f'PyPI default per-file limit is 100 MiB; wheel is {size_mib:.2f} MiB'
-          assert 'linux_x86_64' in wheel.name, wheel.name
+          assert 'manylinux_2_28_x86_64' in wheel.name, wheel.name
+          assert '-linux_x86_64.whl' not in wheel.name, wheel.name
           with zipfile.ZipFile(wheel) as z:
               bins = [n for n in z.namelist() if n.endswith('.so')]
           expected = ['mlbricks/_C', 'mlbricks/_gauss_cuda', 'mlbricks/_vision_native',
@@ -332,7 +365,16 @@ jobs:
           names = [p.name for p in files]
           assert len(names) == len(set(names)), 'duplicate artifact filenames'
           assert any('py3-none-any.whl' in n for n in names)
-          assert any('linux_x86_64.whl' in n for n in names)
+          linux_wheels = [
+              n for n in names
+              if n.endswith('.whl') and 'manylinux' in n and 'x86_64' in n
+          ]
+          assert len(linux_wheels) == 4, linux_wheels
+          # auditwheel may emit a valid compressed/dual platform tag such as
+          # manylinux_2_27_x86_64.manylinux_2_28_x86_64. Require the requested
+          # manylinux_2_28 compatibility tag instead of an exact filename.
+          assert all('manylinux_2_28_x86_64' in n for n in linux_wheels), linux_wheels
+          assert not any(n.endswith('-linux_x86_64.whl') for n in names), names
           assert any('win_amd64.whl' in n for n in names)
           assert any('macosx' in n and 'arm64' in n and n.endswith('.whl') for n in names)
           assert not any('x86_64' in n and 'macosx' in n for n in names), names

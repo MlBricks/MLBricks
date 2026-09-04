@@ -64,6 +64,19 @@ def test_linux_and_windows_use_official_pytorch_cuda_128_index() -> None:
     assert "torch.version.cuda.startswith('12.8')" in workflow or "torch.version.cuda.startswith(\"12.8\")" in workflow
 
 
+
+
+def test_linux_release_wheels_are_repaired_to_manylinux_for_pypi() -> None:
+    workflow = _workflow()
+    assert "pytorch/manylinux2_28-builder:cuda12.8" in workflow
+    assert "auditwheel repair" in workflow
+    assert "--plat manylinux_2_28_x86_64" in workflow
+    assert "'manylinux_2_28_x86_64' in wheel.name" in workflow
+    assert "'-linux_x86_64.whl' not in wheel.name" in workflow
+    assert "linux_wheels = [" in workflow
+    assert "assert len(linux_wheels) == 4" in workflow
+    assert "all('manylinux_2_28_x86_64' in n for n in linux_wheels)" in workflow
+
 def test_windows_wheel_verifies_all_six_native_extensions_before_upload() -> None:
     workflow = _workflow()
     assert "All six Windows native extensions packaged: PASS" in workflow
