@@ -339,6 +339,8 @@ from mlbricks import (
     ResController,
 )
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 model = Bricks(
     vocab_size=50_257,
     dim=384,
@@ -346,7 +348,8 @@ model = Bricks(
     position="sinusoidal",
     layers=[
         Brick(
-            mixer=ESA(embd=384, head=6),
+            # In a composed model, let Bricks own placement and move the parent once.
+            mixer=ESA(embd=384, head=6, device=None),
             ffn=StateAwareFFN(
                 d_model=384,
                 state_dim=128,
@@ -363,8 +366,14 @@ model = Bricks(
             dim=384,
         ),
     ],
-)
+).to(device)
+
+# Place inputs on the same device as the parent model.
+input_ids = torch.randint(0, 50_257, (1, 32), device=device)
+logits = model(input_ids)
 ```
+
+`ESA(device="auto")` is convenient when ESA is used by itself. Inside `Bricks` or another parent `nn.Module`, prefer `ESA(..., device=None)` and move the complete parent model with `.to(device)` so embeddings, residual paths, mixers, FFNs, and inputs remain on one device.
 
 ## Native vision runtime
 
