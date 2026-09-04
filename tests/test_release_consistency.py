@@ -108,3 +108,45 @@ def test_sdist_manifest_contains_linked_api_and_soup_license() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "include API.md" in manifest
     assert "mlbricks/soup/LICENSE_SOUP.txt" in readme
+
+
+
+def test_api_reference_covers_every_package_root_export() -> None:
+    import mlbricks
+
+    api = (ROOT / "API.md").read_text(encoding="utf-8")
+    assert "MLBricks Kit 1.0.0b1 API Reference" in api
+    assert "pip install mlbricks-kit==1.0.0b1" in api
+    for name in mlbricks.__all__:
+        assert f"`{name}`" in api, f"API.md missing root export: {name}"
+
+
+def test_every_component_license_is_documented_and_packaged() -> None:
+    project = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    root_license = (ROOT / "LICENSE.md").read_text(encoding="utf-8")
+    manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+
+    component_licenses = (
+        "mlbricks/esa/LICENSE_ESA.txt",
+        "mlbricks/bolt/LICENSE_BOLT.txt",
+        "mlbricks/elasticbit/LICENSE_ELASTICBIT.txt",
+        "mlbricks/vesa/LICENSE_VESA.txt",
+        "mlbricks/LICENSE_VISUALBOLT.txt",
+        "mlbricks/ffnbrick/LICENSE_FFNBRICK.txt",
+        "mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt",
+        "mlbricks/soup/LICENSE_SOUP.txt",
+    )
+
+    for relative in component_licenses:
+        path = ROOT / relative
+        assert path.is_file(), f"Missing component license: {relative}"
+        text = path.read_text(encoding="utf-8")
+        assert "PolyForm Noncommercial License 1.0.0" in text
+        assert "licensing@mlbricks.io" in text
+        assert relative in project["license-files"]
+        assert relative in readme
+        assert relative in root_license
+        assert f"include {relative}" in manifest

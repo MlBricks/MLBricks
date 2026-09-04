@@ -10,6 +10,6 @@ model = Vesa(
     depth=4,
 )
 
-# Native C++/CUDA is the default backend.
+# backend="auto" is the default; the planner resolves available routes.
 print(model)
 print("Backend:", model.config.backend)

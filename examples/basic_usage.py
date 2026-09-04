@@ -3,7 +3,7 @@ from mlbricks import ESA
 
 x = torch.randn(2, 128, 64)
 
-# Default: Thunder with automatic Compass planning.
+# Default: backend="auto" with automatic Compass planning.
 layer = ESA(embd=64, head=4, precision="fp32", device=None)
 y = layer(x)
 print(y.shape, layer.backend, layer.compass)

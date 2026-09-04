@@ -1,4 +1,4 @@
-# MLBricks v1.0.0
+# MLBricks Kit 1.0.0b1
 
 **MLBricks** is a modular machine-learning library for building efficient language and vision models from reusable components, with PyTorch reference paths and optional native C++/CUDA acceleration.
 
@@ -24,12 +24,12 @@ The PyPI distribution is `mlbricks-kit`; the public Python import package remain
 ```python
 import mlbricks
 print(mlbricks.__version__)
-# 1.0.0
+# 1.0.0b1
 ```
 
 ## Installation
 
-> Install mlbricks-kit from PyPI; use import mlbricks in Python.
+> Install `mlbricks-kit` from PyPI; use `import mlbricks` in Python.
 
 From PyPI:
 
@@ -170,7 +170,7 @@ from mlbricks import ESAModel, ESAModelConfig
 
 ## Bolt
 
-`Bolt` and `BoltAttention` are the public attention names in MLBricks v1.0.0.
+`Bolt` and `BoltAttention` are the public attention names in MLBricks Kit 1.0.0b1.
 
 CUDA FP16 Bolt now uses a compound Stage-1 execution path when the native extension is available: one packed Q/U/G GEMM followed by one fused gate/RMS postprocess emits only `Q`, `C`, and FP32 `rho`. Training keeps the same parameters/equations and uses normalized-key PyTorch SDPA; `use_sdpa=False` remains the explicit reference route.
 
@@ -389,7 +389,7 @@ See [`API.md`](API.md) for the public API reference and [`examples/`](examples/)
 
 ## Component licenses
 
-MLBricks v1.0.0 contains component-specific license notices in addition to the repository-level licensing documents:
+MLBricks Kit 1.0.0b1 contains component-specific license notices in addition to the repository-level licensing documents:
 
 - ESA — `mlbricks/esa/LICENSE_ESA.txt`
 - Bolt — `mlbricks/bolt/LICENSE_BOLT.txt`
@@ -398,12 +398,13 @@ MLBricks v1.0.0 contains component-specific license notices in addition to the r
 - VisualBolt — `mlbricks/LICENSE_VISUALBOLT.txt`
 - FFNBricks — `mlbricks/ffnbrick/LICENSE_FFNBRICK.txt`
 - ResController — `mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt`
+- SOUP — `mlbricks/soup/LICENSE_SOUP.txt`
 
 Also see the repository-level [`LICENSE.md`](LICENSE.md), [`LICENSING_NOTICE.md`](LICENSING_NOTICE.md), and [`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md).
 
 ## Licensing
 
-MLBricks v1.0.0 is source-available software distributed under the **PolyForm Noncommercial License 1.0.0**.
+MLBricks Kit 1.0.0b1 is source-available software distributed under the **PolyForm Noncommercial License 1.0.0**.
 
 The public license permits noncommercial use, including personal use, education, academic study, noncommercial research, experimentation, benchmarking, and hobby projects, subject to the complete PolyForm license terms.
 
@@ -415,7 +416,7 @@ See [`LICENSE.md`](LICENSE.md), [`LICENSING_NOTICE.md`](LICENSING_NOTICE.md), an
 
 ## Release
 
-**MLBricks v1.0.0** is the clean public release line for the package and its current component APIs.
+**MLBricks Kit 1.0.0b1** is the beta release line for the package and its current component APIs.
 
 
 ## Training compilation
@@ -436,7 +437,7 @@ The bundled SOUP component license is shipped at `mlbricks/soup/LICENSE_SOUP.txt
 
 ### Versioning note
 
-MLBricks is released as `1.0.0`. Experimental SOUP retains its independent component version `0.1.0a3`.
+MLBricks Kit is released as `1.0.0b1`. Experimental SOUP retains its independent component version `0.1.0a3`.
 
 ## Beta native wheel distribution
 

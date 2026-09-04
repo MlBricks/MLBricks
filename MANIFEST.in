@@ -19,3 +19,10 @@ recursive-include examples *.py
 recursive-include mlbricks/vision_csrc *.cpp *.cu
 
 include mlbricks/LICENSE_VISUALBOLT.txt
+include mlbricks/bolt/LICENSE_BOLT.txt
+include mlbricks/elasticbit/LICENSE_ELASTICBIT.txt
+include mlbricks/esa/LICENSE_ESA.txt
+include mlbricks/ffnbrick/LICENSE_FFNBRICK.txt
+include mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt
+include mlbricks/soup/LICENSE_SOUP.txt
+include mlbricks/vesa/LICENSE_VESA.txt

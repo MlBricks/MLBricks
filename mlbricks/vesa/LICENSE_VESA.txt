@@ -3,7 +3,7 @@ VESA COMPONENT SOFTWARE LICENSE NOTICE
 Copyright © 2026 Zameer Hussain.
 All rights reserved except as expressly licensed below.
 
-VESA as distributed in MLBricks v1.0.0 is licensed under the
+VESA as distributed with MLBricks is licensed under the
 PolyForm Noncommercial License 1.0.0.
 
 Full public license terms:

@@ -3,7 +3,7 @@ ESA COMPONENT SOFTWARE LICENSE NOTICE
 Copyright © 2026 Zameer Hussain and Akhtar Hussain.
 All rights reserved except as expressly licensed below.
 
-ESA as distributed in MLBricks v1.0.0 is licensed under the
+ESA as distributed with MLBricks is licensed under the
 PolyForm Noncommercial License 1.0.0.
 
 Full public license terms:

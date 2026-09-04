@@ -1,5 +1,6 @@
 ## 1.0.0b1
 
+- Rebuilt `API.md` from the current package-root API, corrected beta/package naming in docs, and audited component license packaging including SOUP.
 - PyPI distribution name finalized as mlbricks-kit; the Python import namespace remains mlbricks.
 - Beta packaging release with prebuilt native wheel CI for Linux CUDA, Windows CUDA, and macOS CPU-native targets.
 - Adds a portable `py3-none-any` fallback so unsupported platforms do not compile native code during installation.
