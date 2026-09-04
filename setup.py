@@ -102,7 +102,9 @@ if enabled("MLBRICKS_BUILD_BOLT_NATIVE") and has_cuda_toolkit:
         )
     )
 
-if enabled("MLBRICKS_BUILD_VESA_NATIVE"):
+# Legacy pre-1.0 VESA recurrence extension. Unified VESA now uses mlbricks.esa.
+# Keep explicit opt-in for compatibility, but do not build this unused engine by default.
+if os.getenv("MLBRICKS_BUILD_VESA_NATIVE", "0") == "1":
     csrc = ROOT / "mlbricks" / "vesa" / "csrc"
     extensions.append(
         _extension(

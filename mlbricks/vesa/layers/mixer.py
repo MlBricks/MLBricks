@@ -1,63 +1,87 @@
 # Copyright (c) 2026 Zameer Hussain
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-"""Projected ESA mixer shared by all model families."""
+"""VESA adapter around the canonical MLBricks ESA engine.
+
+VESA deliberately does not carry a second ESA implementation. Spatial scan,
+local vision processing, normalization, residuals, and model plumbing remain
+VESA responsibilities; sequence mixing is delegated to :class:`mlbricks.esa.ESA`.
+"""
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from ..backends.lightning import lightning_step
-from ..backends.native import native_lightning_step, native_scan
-from ..backends.thunder import thunder_scan
-from ..backends.registry import full_scan
-from ..config import ESAConfig, FullBackend
+from ...esa import ESA
 from ...runtime import normalize_backend
-from ...planner import EXECUTION_PLANNER
+from ..config import ESAConfig, FullBackend
 
 
 class ESAMixer(nn.Module):
+    """Thin compatibility adapter that uses :class:`mlbricks.esa.ESA` as core.
+
+    The historical VESA ``ESAMixer`` API is preserved: ``forward`` returns
+    ``(outputs, final_state)`` and ``step`` performs one recurrent update. The
+    recurrent state is exposed in flattened ``[B, dim]`` layout for backwards
+    compatibility, while the canonical ESA engine internally uses headed state.
+    """
+
     def __init__(self, config: ESAConfig):
         super().__init__()
         self.config = config
-        self.in_proj = nn.Linear(config.dim, 2 * config.dim)
-        self.out_proj = nn.Linear(config.dim, config.dim)
-        if config.gate_bias:
-            with torch.no_grad():
-                self.in_proj.bias[: config.dim].fill_(config.gate_bias)
+        # Early VESA exposed a ``heads`` field that did not constrain its ESA
+        # mixer, so configs such as dim=16, heads=6 were valid. Canonical ESA
+        # requires divisibility. Preserve source compatibility by using the
+        # requested partition when possible and a mathematically equivalent
+        # single-head partition otherwise (ESA recurrence/readout are elementwise).
+        self.core_heads = config.heads if config.dim % config.heads == 0 else 1
+        self.engine = ESA(
+            embd=config.dim,
+            head=self.core_heads,
+            backend=config.backend,
+            precision=config.precision,
+            compass=config.compass,
+            gate_min=config.gate_min,
+            gate_max=config.gate_max,
+            eps=config.eps,
+            device=None,
+            auto_move_input=False,
+        )
 
     @property
     def backend(self) -> str:
-        return str(self.config.backend)
+        return str(self.engine.backend)
+
+    @property
+    def core_engine(self) -> ESA:
+        """Return the canonical ESA instance used by this VESA mixer."""
+        return self.engine
 
     def set_backend(self, backend: str, *, recursive: bool = True):
         del recursive
-        from dataclasses import replace
-        self.config = replace(self.config, backend=normalize_backend(backend, warn_legacy=True))
-        EXECUTION_PLANNER.clear_owner_routes(self)
+        value = normalize_backend(backend, warn_legacy=True)
+        self.config = replace(self.config, backend=value)
+        self.engine.set_backend(value)
         return self
 
     def resolved_backend(self) -> str:
-        policy = normalize_backend(self.config.backend)
-        if policy == "pytorch":
-            return "pytorch"
-        if policy == "native":
-            return "native-required"
-        frozen = EXECUTION_PLANNER.owner_routes(self)
-        routes = sorted(set(frozen.values()))
-        if len(routes) == 1:
-            return routes[0]
-        try:
-            from ..backends.native import native_available
-            return "planner(auto)" if native_available() else "pytorch"
-        except Exception:
-            return "pytorch"
+        return self.engine.resolved_backend()
 
     def project(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        gate_logits, value_logits = self.in_proj(x).chunk(2, dim=-1)
-        return torch.sigmoid(gate_logits), torch.tanh(value_logits)
+        """Return canonical ESA affine recurrence terms ``A`` and ``B_write``.
+
+        This method is retained for compatibility with code that inspected the
+        old VESA projection. Its semantics now intentionally match canonical ESA
+        rather than the removed two-way gate/value projection.
+        """
+        from ...esa.generation import _project_affine_terms
+
+        _, A, B_write = _project_affine_terms(self.engine, x)
+        return A.flatten(2), B_write.flatten(2)
 
     def forward(
         self,
@@ -67,122 +91,40 @@ class ESAMixer(nn.Module):
         reverse: bool = False,
         backend: FullBackend | None = None,
     ) -> tuple[Tensor, Tensor]:
-        selected = normalize_backend(backend or self.config.backend, warn_legacy=True)
-        gates, values = self.project(x)
-        if selected == "auto":
-            is_training = bool(torch.is_grad_enabled())
-            frozen = EXECUTION_PLANNER.owner_routes(self).get(("vesa_scan", is_training))
-            if frozen in {"native", "pytorch"}:
-                selected = frozen
-                native_ok = frozen == "native"
-            else:
-                try:
-                    from ..backends.native import native_available, native_cuda_built
-                    native_ok = bool(native_available())
-                    if gates.is_cuda:
-                        native_ok = native_ok and bool(native_cuda_built())
-                except Exception:
-                    native_ok = False
-            extra = (int(self.config.chunk_size), bool(reverse), int(self.config.dim))
-            if frozen not in {"native", "pytorch"} and not torch.is_grad_enabled() and native_ok:
-                selected = EXECUTION_PLANNER.qualify_operator_once(
-                    self,
-                    "vesa_scan",
-                    gates,
-                    {
-                        "native": lambda: native_scan(
-                            gates, values, initial_state, reverse=reverse
-                        ),
-                        "pytorch": lambda: thunder_scan(
-                            gates, values, initial_state,
-                            chunk_size=self.config.chunk_size, reverse=reverse,
-                        ),
-                    },
-                    requested_backend="auto",
-                    native_available=True,
-                    native_supports_training=True,
-                    training=False,
-                    extra=extra,
-                    default_auto="native",
-                )
-            elif frozen not in {"native", "pytorch"}:
-                selected = EXECUTION_PLANNER.select_operator_once(
-                    self,
-                    "vesa_scan",
-                    gates,
-                    requested_backend="auto",
-                    native_available=native_ok,
-                    native_supports_training=True,
-                    training=bool(torch.is_grad_enabled()),
-                    extra=extra,
-                    default_auto="native",
-                )
-        states, final_state = full_scan(
-            selected,
-            gates,
-            values,
-            initial_state,
-            chunk_size=self.config.chunk_size,
-            reverse=reverse,
+        selected = None if backend is None else normalize_backend(backend, warn_legacy=True)
+        outputs, final_state = self.engine.forward_with_state(
+            x,
+            state=initial_state,
+            backend=selected,
+            reverse=bool(reverse),
         )
-        return self.out_proj(states), final_state
+        return outputs, final_state.reshape(final_state.shape[0], self.config.dim)
+
+    @torch.no_grad()
+    def prefill(
+        self,
+        x: Tensor,
+        initial_state: Tensor | None = None,
+        *,
+        backend: FullBackend | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run canonical ESA prefill and return a flattened recurrent state."""
+        selected = None if backend is None else normalize_backend(backend, warn_legacy=True)
+        outputs, final_state = self.engine.prefill(
+            x,
+            state=initial_state,
+            backend=selected,
+        )
+        return outputs, final_state.reshape(final_state.shape[0], self.config.dim)
 
     def step(self, x: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
         if x.ndim != 2:
             raise ValueError("step input must have shape [batch, dim]")
-        gate, value = self.project(x)
-        selected = normalize_backend(self.config.backend, warn_legacy=True)
-        native_ok = False
-        frozen = None
-        if selected == "auto":
-            frozen = EXECUTION_PLANNER.owner_routes(self).get(
-                ("vesa_decode", bool(torch.is_grad_enabled()))
-            )
-            if frozen in {"native", "pytorch"}:
-                selected = frozen
-                native_ok = frozen == "native"
-        if selected != "pytorch" and frozen not in {"native", "pytorch"}:
-            try:
-                from ..backends.native import native_available, native_cuda_built
-                native_ok = bool(native_available())
-                if gate.is_cuda:
-                    native_ok = native_ok and bool(native_cuda_built())
-            except Exception:
-                native_ok = False
-        if selected == "auto":
-            extra = (int(self.config.dim),)
-            if not torch.is_grad_enabled() and native_ok:
-                selected = EXECUTION_PLANNER.qualify_operator_once(
-                    self,
-                    "vesa_decode",
-                    gate,
-                    {
-                        "native": lambda: native_lightning_step(gate, value, state),
-                        "pytorch": lambda: lightning_step(gate, value, state),
-                    },
-                    requested_backend="auto",
-                    native_available=True,
-                    native_supports_training=True,
-                    training=False,
-                    extra=extra,
-                    default_auto="native",
-                )
-            else:
-                selected = EXECUTION_PLANNER.select_operator_once(
-                    self,
-                    "vesa_decode",
-                    gate,
-                    requested_backend="auto",
-                    native_available=native_ok,
-                    native_supports_training=True,
-                    training=bool(torch.is_grad_enabled()),
-                    extra=extra,
-                    default_auto="native",
-                )
-        if selected == "native":
-            if not native_ok:
-                raise RuntimeError("VESA backend='native' requested but native extension is unavailable")
-            new_state = native_lightning_step(gate, value, state)
-        else:
-            new_state = lightning_step(gate, value, state)
-        return self.out_proj(new_state), new_state
+        if state.ndim not in {2, 3}:
+            raise ValueError("state must have shape [batch, dim] or [batch, heads, head_dim]")
+        output, new_state = self.engine.decode_step(x, state)
+        return output, new_state.reshape(new_state.shape[0], self.config.dim)
+
+    decode_step = step
+    lightning_prefill = prefill
+    lightning_step = step

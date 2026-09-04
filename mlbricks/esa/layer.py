@@ -163,6 +163,31 @@ class ESA(nn.Module):
         from .generation import lightning_init_state
         return lightning_init_state(self, batch, device=device, dtype=dtype, layout=layout)
 
+    def forward_with_state(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | None = None,
+        *,
+        backend: str | None = None,
+        compass: int | str | None = None,
+        reverse: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run canonical ESA and return output plus final recurrent state.
+
+        This differentiable interface is intended for compositional wrappers
+        such as VESA that need the production ESA engine during both training
+        and recurrent inference.
+        """
+        from .generation import esa_forward_with_state
+        return esa_forward_with_state(
+            self,
+            self._prepare_input(x),
+            state=state,
+            backend=backend,
+            compass=compass,
+            reverse=reverse,
+        )
+
     @torch.no_grad()
     def prefill(
         self,
