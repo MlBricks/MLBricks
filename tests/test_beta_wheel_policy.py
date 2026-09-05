@@ -20,7 +20,7 @@ def _workflow() -> str:
 def test_beta_version_and_torch_abi_line_are_pinned() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["name"] == "mlbricks-kit"
-    assert project["version"] == "1.0.0b1"
+    assert project["version"] == "1.0.0b2"
     assert "torch>=2.10,<2.11" in project["dependencies"]
 
 

@@ -1,17 +1,17 @@
-# MLBricks Kit 1.0.0b1 API Reference
+# MLBricks Kit 1.0.0b2 API Reference
 
 `mlbricks-kit` is the PyPI distribution. The Python import namespace remains `mlbricks`.
 
 ```bash
-pip install mlbricks-kit==1.0.0b1
+pip install mlbricks-kit==1.0.0b2
 ```
 
 ```python
 import mlbricks
-print(mlbricks.__version__)  # 1.0.0b1
+print(mlbricks.__version__)  # 1.0.0b2
 ```
 
-This reference is generated against the public package surface exported by `mlbricks.__all__` in the `1.0.0b1` release candidate. The supported backend policy is `auto | native | pytorch` unless a component documents a narrower behavior.
+This reference is generated against the public package surface exported by `mlbricks.__all__` in the `1.0.0b2` release candidate. The supported backend policy is `auto | native | pytorch` unless a component documents a narrower behavior.
 
 ## Quick import surface
 
@@ -309,6 +309,8 @@ compass(
 ### `Bolt` / `BoltAttention`
 
 `BoltAttention` is an alias of the canonical `Bolt` implementation.
+
+In MLBricks Kit 1.0.0b2, the native FP16 compound Stage-1 backward path is dtype-safe with FP32 master Parameters under AMP; the public Bolt API and equations are unchanged.
 
 ```python
 Bolt(
@@ -716,7 +718,7 @@ The following ESA benchmark helpers are exported:
 
 ## Complete package-root export index
 
-The following names are exported by `mlbricks.__all__` in `1.0.0b1`:
+The following names are exported by `mlbricks.__all__` in `1.0.0b2`:
 
 | Group | Exports |
 | --- | --- |

@@ -79,7 +79,7 @@ def test_pypi_release_metadata_and_license_files_are_consistent() -> None:
     project = tomllib.loads(
         (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )["project"]
-    assert project["version"] == mlbricks.__version__ == "1.0.0b1"
+    assert project["version"] == mlbricks.__version__ == "1.0.0b2"
     assert project["license"] == "PolyForm-Noncommercial-1.0.0"
     for relative in project["license-files"]:
         assert (ROOT / relative).is_file(), f"Missing release license file: {relative}"
@@ -115,8 +115,8 @@ def test_api_reference_covers_every_package_root_export() -> None:
     import mlbricks
 
     api = (ROOT / "API.md").read_text(encoding="utf-8")
-    assert "MLBricks Kit 1.0.0b1 API Reference" in api
-    assert "pip install mlbricks-kit==1.0.0b1" in api
+    assert "MLBricks Kit 1.0.0b2 API Reference" in api
+    assert "pip install mlbricks-kit==1.0.0b2" in api
     for name in mlbricks.__all__:
         assert f"`{name}`" in api, f"API.md missing root export: {name}"
 

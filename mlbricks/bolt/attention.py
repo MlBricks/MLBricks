@@ -126,9 +126,34 @@ class _BoltNativeStage1Fn(torch.autograd.Function):
         flat_d = dqcg.reshape(B * T, -1)
         flat_x = x.reshape(B * T, D)
         # Two large GEMMs replace three separate projection backwards.
-        dx = flat_d.matmul(weight).reshape_as(x)
-        dw = flat_d.transpose(0, 1).matmul(flat_x)
-        db = flat_d.sum(dim=0) if ctx.has_bias else None
+        # FP16 AMP can produce an FP16 native adjoint while the packed
+        # projection weight remains an FP32 master Parameter. Run both packed
+        # backward GEMMs in the adjoint working dtype, then return gradients
+        # in the original input/Parameter dtypes.
+        work_dtype = flat_d.dtype
+        weight_work = (
+            weight if weight.dtype == work_dtype
+            else weight.to(dtype=work_dtype)
+        )
+        x_work = (
+            flat_x if flat_x.dtype == work_dtype
+            else flat_x.to(dtype=work_dtype)
+        )
+
+        dx = (
+            flat_d.matmul(weight_work)
+            .reshape_as(x)
+            .to(dtype=x.dtype)
+        )
+        dw = (
+            flat_d.transpose(0, 1)
+            .matmul(x_work)
+            .to(dtype=weight.dtype)
+        )
+        db = (
+            flat_d.sum(dim=0).to(dtype=weight.dtype)
+            if ctx.has_bias else None
+        )
         return dx, dw, db, None, None, None
 
 

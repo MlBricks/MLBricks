@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MLBRICKS_VERSION: "1.0.0b1"
+  MLBRICKS_VERSION: "1.0.0b2"
   TORCH_VERSION: "2.10.0"
   CUDA_VERSION: "12.8.1"
   PYTORCH_CUDA_INDEX: "https://download.pytorch.org/whl/cu128"

@@ -13,6 +13,14 @@
 
 # MLBricks Changelog
 
+## 1.0.0b2
+
+- Fix Bolt native compound Stage-1 backward under FP16 AMP with FP32 master Parameters.
+- Run packed backward GEMMs in the native adjoint working dtype, then return input/parameter gradients in their original dtypes.
+- Add CPU mixed-dtype contract coverage and CUDA AMP output/input/parameter-gradient parity coverage against the PyTorch Bolt route.
+- No Bolt equations, Parameters, state-dict keys, recurrent cache format, or public constructor/API are changed.
+
+
 ## 1.0.0 BOLT compound Stage-1 optimization
 
 - Added a native CUDA compound Stage-1 for FP16 Bolt: packed Q/U/G projection plus fused gate, C-energy reduction and RMS normalization.
