@@ -1,6 +1,8 @@
-# MLBricks Kit 1.0.0b2
+# MLBricks Kit
 
-**MLBricks** is a modular machine-learning library for building efficient language and vision models from reusable components, with PyTorch reference paths and optional native C++/CUDA acceleration.
+MLBricks Kit is a modular neural-network toolkit for building and experimenting with efficient AI systems across PyTorch and optimized native execution paths.
+
+It provides unified `auto`, `native`, and `pytorch` backend dispatch together with reusable components and architectures including **ESA, Bolt, BoltModel, VisionBolt, VESA, Bricks, FFNBrick, ResController, SOUP, and ElasticBit**. MLBricks also includes native C++/CUDA execution paths, adaptive runtime planning, model lifecycle utilities, and production-oriented inference/training APIs.
 
 ## Core components
 
