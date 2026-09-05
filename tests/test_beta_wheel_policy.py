@@ -121,3 +121,20 @@ def test_artifact_actions_use_node24_generation() -> None:
     assert "actions/download-artifact@v7" in workflow
     assert "actions/upload-artifact@v4" not in workflow
     assert "actions/download-artifact@v5" not in workflow
+
+
+
+def test_release_workflow_does_not_run_or_publish_on_branch_pushes() -> None:
+    workflow = (
+        ROOT / ".github" / "workflows" / "native-wheels-beta.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'branches:' not in workflow
+    assert '- "release/**"' not in workflow
+    assert "workflow_dispatch:" in workflow
+    assert 'tags:' in workflow
+    assert '- "v*"' in workflow
+    assert (
+        "if: github.event_name == 'push' && "
+        "startsWith(github.ref, 'refs/tags/v')"
+    ) in workflow
