@@ -1,0 +1,185 @@
+MLBRICKS SOFTWARE LICENSE NOTICE
+
+Copyright © 2026 Zameer Hussain and Akhtar Hussain.
+All rights reserved except as expressly granted under the applicable license.
+
+---
+
+1. NONCOMMERCIAL LICENSE
+
+---
+
+The MLBricks software, source code, optimized implementations,
+kernels, libraries, tools, and other software components distributed
+with this notice are made available under the:
+
+PolyForm Noncommercial License 1.0.0
+
+Full license terms:
+
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+Use of the software is subject to the complete terms and conditions
+of the PolyForm Noncommercial License 1.0.0.
+
+---
+
+2. PERMITTED NONCOMMERCIAL USE
+
+---
+
+Subject to the PolyForm Noncommercial License 1.0.0, the software
+may be used for permitted noncommercial purposes, including, where
+allowed by that license:
+
+* Personal use
+* Personal learning
+* Academic study
+* Student projects
+* Educational activities
+* Noncommercial research
+* Research reproduction
+* Academic benchmarking
+* Experimentation
+* Testing
+* Hobby projects
+* Noncommercial development
+
+The actual rights granted are determined by the PolyForm
+Noncommercial License 1.0.0.
+
+---
+
+3. COMMERCIAL USE
+
+---
+
+No commercial-use rights are granted by this notice beyond any
+rights expressly provided by the applicable license.
+
+A separate written commercial license is required for commercial
+or business use of MLBricks software.
+
+Commercial use may include, where applicable:
+
+* Use in commercial products
+* Use in paid software
+* Use in SaaS products or services
+* Use in cloud services
+* Enterprise deployment
+* Internal commercial business use
+* Commercial AI systems
+* Commercial model training or inference
+* Paid consulting or client projects
+* Integration into products offered for sale
+* Revenue-generating applications or services
+* Commercial redistribution
+* OEM integration
+* Commercial licensing or sublicensing
+* Any other commercial exploitation of the software
+
+Being a student, researcher, individual developer, or academic
+does not automatically make a use noncommercial.
+
+If the software is being used for a commercial or revenue-generating
+purpose, a separate commercial license may be required.
+
+---
+
+4. COMMERCIAL LICENSING
+
+---
+
+For commercial licensing, enterprise licensing, OEM licensing,
+partnerships, sublicensing, or other commercial-use inquiries,
+contact:
+
+[licensing@mlbricks.io](mailto:licensing@mlbricks.io)
+
+Commercial rights may be granted through a separate written
+commercial license issued by the copyright owners or by an entity
+expressly authorized by them.
+
+---
+
+5. COPYRIGHT OWNERSHIP
+
+---
+
+Unless ownership is expressly assigned through a separate written
+agreement, copyright in the MLBricks software covered by this
+notice remains owned by:
+
+Zameer Hussain
+and
+Akhtar Hussain
+
+Publication of the source code, research paper, preprint,
+documentation, benchmarks, or reference implementation does not
+constitute a transfer of copyright ownership.
+
+Access to the source code does not itself grant commercial-use
+rights.
+
+---
+
+6. THIRD-PARTY SOFTWARE
+
+---
+
+MLBricks may include, depend upon, interface with, or distribute
+third-party software.
+
+Third-party software remains subject to its respective copyright
+notices and license terms.
+
+This license does not replace, modify, or override the licenses of
+third-party components.
+
+---
+
+7. RESEARCH PAPERS AND DOCUMENTATION
+
+---
+
+Unless another license is expressly specified, this software license
+applies to software only.
+
+Research papers, preprints, documentation, figures, datasets,
+trained models, model weights, and other materials may be distributed
+under separate licenses.
+
+Users should refer to the applicable file, repository, publication,
+or accompanying notice to determine the license governing each
+material.
+
+---
+
+8. NO IMPLIED COMMERCIAL LICENSE
+
+---
+
+No commercial license is created merely because:
+
+* the source code is publicly accessible;
+* the repository can be cloned;
+* the software can technically be compiled or executed;
+* a research paper describing the technology has been published;
+* the software has been referenced in academic work; or
+* the software has been made available through a public repository.
+
+Commercial rights must arise from the applicable license or from a
+separate written commercial agreement.
+
+---
+
+9. CONTACT
+
+---
+
+Commercial licensing inquiries:
+
+[licensing@mlbricks.io](mailto:licensing@mlbricks.io)
+
+Copyright © 2026 Zameer Hussain and Akhtar Hussain.
+All rights reserved except as expressly licensed.

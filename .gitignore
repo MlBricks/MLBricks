@@ -1,0 +1,13 @@
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python packaging artifacts
+*.egg-info/
+build/
+dist/
+PKG-INFO
+
+# Pytest
+.pytest_cache/
