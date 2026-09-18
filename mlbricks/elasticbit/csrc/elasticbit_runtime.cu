@@ -619,6 +619,36 @@ public:
         ));
     }
 
+    static std::unique_ptr<RuntimeMatrix> compress_selected(
+        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
+        int selected_bits,
+        double threshold,
+        double selected_error,
+        const std::string& decode_policy = "hardwareNative"
+    ) {
+        auto w = weights.request();
+        if (w.ndim != 2) {
+            throw std::invalid_argument("weights must be 2D");
+        }
+        validate_storage_bits(selected_bits);
+        if (!std::isfinite(threshold) || threshold < 0.0) {
+            throw std::invalid_argument("threshold must be a finite non-negative value");
+        }
+        if (!std::isfinite(selected_error) || selected_error < 0.0) {
+            throw std::invalid_argument("selectedError must be a finite non-negative value");
+        }
+        if (selected_bits <= kMaxCompressedBits && selected_error > threshold) {
+            throw std::invalid_argument("selected compressed width does not satisfy threshold");
+        }
+        if (selected_bits == kFallbackBits) {
+            selected_error = 0.0;
+        }
+        return std::unique_ptr<RuntimeMatrix>(new RuntimeMatrix(
+            weights, selected_bits, threshold, selected_error,
+            parse_decode_policy(decode_policy)
+        ));
+    }
+
     static std::unique_ptr<RuntimeMatrix> load(
         const std::string& path,
         const std::string& decode_policy = "hardwareNative"
@@ -1182,6 +1212,12 @@ PYBIND11_MODULE(_C, module) {
         .def_static(
             "compress", &RuntimeMatrix::compress,
             py::arg("weights"), py::arg("calibrationData"), py::arg("threshold"),
+            py::arg("decodePolicy") = "hardwareNative"
+        )
+        .def_static(
+            "_compressSelected", &RuntimeMatrix::compress_selected,
+            py::arg("weights"), py::arg("selectedBits"),
+            py::arg("threshold"), py::arg("selectedError"),
             py::arg("decodePolicy") = "hardwareNative"
         )
         .def_static(

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import io
+import os
 import json
 from pathlib import Path
 import tempfile
@@ -96,6 +97,86 @@ def _moveBatch(batch: Any, device: torch.device) -> Any:
     if isinstance(batch, list):
         return [_moveBatch(value, device) for value in batch]
     return batch
+
+
+def _relativeL2Torch(reference: torch.Tensor, candidate: torch.Tensor) -> float:
+    reference32 = reference.float()
+    candidate32 = candidate.float()
+    denominator = torch.linalg.vector_norm(reference32).clamp_min(1.0e-30)
+    return float((torch.linalg.vector_norm(candidate32 - reference32) / denominator).item())
+
+
+@torch.inference_mode()
+def _selectBitsTorch(
+    weight: torch.Tensor,
+    calibration: np.ndarray,
+    threshold: float,
+) -> tuple[int, float]:
+    """Select ElasticBit storage width on the model GPU.
+
+    This is the model-compression fast path.  It preserves the public
+    threshold-driven contract but avoids the old scalar CPU analyzer, whose
+    cost was O(bits * calibration_rows * weight_elements).  The reference is
+    the real FP16 framework GEMM used by native model execution.
+    """
+    if weight.device.type != "cuda":
+        raise RuntimeError("ElasticBit GPU analyzer requires CUDA weights")
+    if weight.dtype != torch.float16:
+        raise RuntimeError("ElasticBit GPU analyzer requires FP16 weights")
+    if not np.isfinite(threshold) or float(threshold) < 0.0:
+        raise ValueError("threshold must be a finite non-negative value")
+
+    calibrationTensor = torch.from_numpy(
+        np.ascontiguousarray(calibration, dtype=np.float32)
+    ).to(device=weight.device, dtype=torch.float16)
+
+    # Native reference: FP16 activations + FP16 weights + vendor GEMM.
+    reference = F.linear(calibrationTensor, weight).detach()
+
+    weight32 = weight.detach().float()
+    maxAbs = weight32.abs().amax(dim=1)
+
+    for bits in range(3, 16):
+        qmax = float((1 << (bits - 1)) - 1)
+        scale = torch.where(
+            maxAbs > 0.0,
+            maxAbs / qmax,
+            torch.ones_like(maxAbs),
+        )
+
+        quantized = torch.round(weight32 / scale[:, None]).clamp(
+            min=-qmax, max=qmax
+        )
+        dequantized16 = (quantized * scale[:, None]).to(torch.float16)
+
+        # fullPrecision / W16A16 execution.
+        fullOutput = F.linear(calibrationTensor, dequantized16)
+        fullError = _relativeL2Torch(reference, fullOutput)
+
+        if bits <= 8:
+            # hardwareNative low-bit execution keeps activations FP16 and
+            # accumulates the exact integer codes against FP16 activations,
+            # followed by the per-row scale and FP16 output rounding.
+            integerDot = torch.matmul(
+                calibrationTensor.float(),
+                quantized.transpose(0, 1),
+            )
+            hardwareOutput = (integerDot * scale[None, :]).to(torch.float16)
+            hardwareError = _relativeL2Torch(reference, hardwareOutput)
+        else:
+            # 9..15-bit storage executes through W16A16.
+            hardwareError = fullError
+
+        error = max(hardwareError, fullError)
+        if error <= float(threshold):
+            return bits, float(error)
+
+        del quantized, dequantized16, fullOutput
+        if bits <= 8:
+            del integerDot, hardwareOutput
+
+    # FP16 fallback is exact relative to the native FP16 reference.
+    return 16, 0.0
 
 
 def _moduleDevice(module: nn.Module) -> torch.device:
@@ -183,6 +264,22 @@ class RuntimeMatrix:
         w = _toNumpy2D(weights, name="weights")
         c = _toNumpy2D(calibrationData, name="calibrationData")
         return cls(native.RuntimeMatrix.compress(w, c, float(threshold), policy))
+
+    @classmethod
+    def _compressSelected(
+        cls,
+        weights: Any,
+        selectedBits: int,
+        threshold: float,
+        selectedError: float,
+        decodePolicy: str = "hardwareNative",
+    ) -> "RuntimeMatrix":
+        native = _requireNative()
+        policy = _checkPolicy(decodePolicy)
+        w = _toNumpy2D(weights, name="weights")
+        return cls(native.RuntimeMatrix._compressSelected(
+            w, int(selectedBits), float(threshold), float(selectedError), policy
+        ))
 
     @classmethod
     def load(
@@ -541,12 +638,17 @@ class ElasticBit:
         matrixByWeight: dict[int, RuntimeMatrix] = {}
         compressedNames: list[str] = []
         skippedNames: list[str] = []
+        progress = os.environ.get("MLBRICKS_ELASTICBIT_PROGRESS", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        compressible = [
+            (weightId, names)
+            for weightId, names in namesByWeight.items()
+            if weightId not in embeddingWeightIds
+        ]
 
-        for weightId, names in namesByWeight.items():
+        for matrixIndex, (weightId, names) in enumerate(compressible, start=1):
             module = moduleByName[names[0]]
-            if weightId in embeddingWeightIds:
-                skippedNames.extend(names)
-                continue
             samples = [
                 item
                 for name in names
@@ -556,13 +658,36 @@ class ElasticBit:
                 skippedNames.extend(names)
                 continue
             calibration = np.ascontiguousarray(np.concatenate(samples, axis=0), dtype=np.float32)
+
+            if progress:
+                print(
+                    f"[ElasticBit] {matrixIndex}/{len(compressible)} analyzing {names[0]} "
+                    f"shape={tuple(module.weight.shape)} rows={calibration.shape[0]}",
+                    flush=True,
+                )
+
+            selectedBits, selectedError = _selectBitsTorch(
+                module.weight, calibration, float(threshold)
+            )
+
+            if progress:
+                print(
+                    f"[ElasticBit] {matrixIndex}/{len(compressible)} selected "
+                    f"{selectedBits}-bit error={selectedError:.6g}",
+                    flush=True,
+                )
+
+            # Packing is performed once, after the GPU analyzer has selected the
+            # smallest threshold-safe width.  The selected-bit constructor is
+            # private; fixed-bit selection is not part of the public API.
             weights = np.ascontiguousarray(
                 module.weight.detach().float().cpu().numpy(), dtype=np.float32
             )
-            matrixByWeight[weightId] = RuntimeMatrix.compress(
+            matrixByWeight[weightId] = RuntimeMatrix._compressSelected(
                 weights,
-                calibration,
+                selectedBits,
                 float(threshold),
+                selectedError,
                 decodePolicy=policy,
             )
 
