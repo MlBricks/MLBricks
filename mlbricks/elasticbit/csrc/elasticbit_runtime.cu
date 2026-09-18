@@ -2,7 +2,6 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
-#include <ATen/ops/mm.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <cuda_runtime.h>
@@ -42,10 +41,10 @@ namespace py = pybind11;
 // Search: 3..15 bits, with FP16 (16 bit) as the threshold-preserving fallback.
 // Activations remain FP16 in every execution policy.
 // hardwareNative execution is phase- and hardware-aware. Tesla T4 keeps the
-// validated mapping 3..4 -> W4A16, 5..8 -> W8A16, 9..16 -> W16A16. Other
-// CUDA GPUs benchmark the legal W4A16/W8A16/W16A16 candidates for each matrix
-// shape and select the fastest built-in ElasticBit decode kernel.
-// fullPrecision execution: all storage widths -> W16A16.
+// validated mapping 3..4 -> W4A16, 5..8 -> W8A16, 9..16 -> W16A16, with
+// one warp owning one output row for M=1 decode. Other CUDA GPUs benchmark the
+// legal W4A16/W8A16/W16A16 candidates for each matrix shape.
+// fullPrecision execution: all storage widths -> W16A16 FastWarp decode.
 // Prefill always materializes FP16 weights on-device and delegates GEMM to
 // PyTorch/vendor libraries; activations are never quantized.
 // Bit selection validates BOTH low-bit and full-precision arithmetic so policy
@@ -142,6 +141,44 @@ static std::vector<uint8_t> pack_exact_weights(
                         (shifted >> (8 * byte_index)) & 0xffull
                     );
                 }
+            }
+        }
+    }
+    return payload;
+}
+
+static std::vector<uint8_t> pack_exact_codes(
+    const int16_t* codes,
+    int rows,
+    int cols,
+    int bits
+) {
+    validate_storage_bits(bits);
+    if (bits == kFallbackBits) {
+        throw std::invalid_argument("prequantized codes are only valid for 3..15-bit storage");
+    }
+
+    const size_t count = static_cast<size_t>(rows) * cols;
+    const size_t payload_bytes = packed_bytes_for_values(count, bits);
+    std::vector<uint8_t> payload(payload_bytes, 0u);
+    const int32_t qmax = static_cast<int32_t>(qmax_for_bits(bits));
+
+    for (size_t index = 0; index < count; ++index) {
+        const int32_t q = static_cast<int32_t>(codes[index]);
+        if (q < -qmax || q > qmax) {
+            throw std::invalid_argument("prequantized ElasticBit code exceeds selected bit range");
+        }
+        const uint32_t code = static_cast<uint32_t>(q + qmax);
+        const size_t bit_offset = index * static_cast<size_t>(bits);
+        const size_t byte_offset = bit_offset >> 3;
+        const int shift = static_cast<int>(bit_offset & 7u);
+        const uint64_t shifted = static_cast<uint64_t>(code) << shift;
+        for (int byte_index = 0; byte_index < 3; ++byte_index) {
+            const size_t target = byte_offset + static_cast<size_t>(byte_index);
+            if (target < payload.size()) {
+                payload[target] |= static_cast<uint8_t>(
+                    (shifted >> (8 * byte_index)) & 0xffull
+                );
             }
         }
     }
@@ -456,10 +493,11 @@ __device__ __forceinline__ int sign4(uint32_t nibble) {
     return (value ^ 8) - 8;
 }
 
-// Validated T4-style W4A16 decode kernel.  The hot Granite shapes are all
-// multiples of 8, so each thread consumes eight packed 4-bit weights from one
-// 32-bit load and four FP16 half2 activation loads.  A scalar tail path keeps
-// the RuntimeMatrix API correct for arbitrary matrix widths.
+// Validated T4 FastWarp W4A16 decode kernel. One warp owns one output row;
+// a 256-thread block computes up to eight rows with no cross-warp reduction.
+// Granite hot shapes use one 32-bit load for eight packed 4-bit weights and
+// four half2 activation loads per lane iteration. A scalar tail path preserves
+// correctness for arbitrary widths.
 __global__ void w4a16_gemv_kernel(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ scales,
@@ -469,11 +507,10 @@ __global__ void w4a16_gemv_kernel(
     int cols,
     int row_bytes
 ) {
-    constexpr int kWarps = 8;  // launch_width uses 256 threads.
-    const int row = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
+    constexpr int kWarps = 8;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
     if (row >= rows) return;
 
     const uint8_t* row_bytes_ptr = weights + static_cast<size_t>(row) * row_bytes;
@@ -482,7 +519,7 @@ __global__ void w4a16_gemv_kernel(
     if ((cols & 7) == 0) {
         const uint32_t* row4 = reinterpret_cast<const uint32_t*>(row_bytes_ptr);
         const int groups8 = cols >> 3;
-        for (int group = tid; group < groups8; group += blockDim.x) {
+        for (int group = lane; group < groups8; group += 32) {
             const uint32_t packed = row4[group];
             const int col = group << 3;
             const __half2* x2 = reinterpret_cast<const __half2*>(input + col);
@@ -501,7 +538,7 @@ __global__ void w4a16_gemv_kernel(
             partial = fmaf(x3.y, static_cast<float>(sign4(packed >> 28)), partial);
         }
     } else {
-        for (int col = tid; col < cols; col += blockDim.x) {
+        for (int col = lane; col < cols; col += 32) {
             const uint8_t packed = row_bytes_ptr[col >> 1];
             const uint8_t nibble = (col & 1) ? (packed >> 4) : (packed & 0x0f);
             partial = fmaf(
@@ -511,20 +548,12 @@ __global__ void w4a16_gemv_kernel(
     }
 
     partial = warp_sum(partial);
-    __shared__ float warp_sums[kWarps];
-    if (lane == 0) warp_sums[warp] = partial;
-    __syncthreads();
-
-    if (warp == 0) {
-        float total = lane < kWarps ? warp_sums[lane] : 0.0f;
-        total = warp_sum(total);
-        if (lane == 0) output[row] = __float2half_rn(total * scales[row]);
-    }
+    if (lane == 0) output[row] = __float2half_rn(partial * scales[row]);
 }
 
-// Validated T4-style W8A16 decode kernel.  Granite's hot shapes are multiples
-// of 4: one 32-bit weight load supplies four INT8 values and activations are
-// consumed as two half2 values.  The scalar fallback preserves generic shapes.
+// Validated T4 FastWarp W8A16 decode kernel. One warp owns one output row;
+// each lane consumes four INT8 weights from a 32-bit load plus two half2
+// activation values per iteration.
 __global__ void w8a16_gemv_kernel(
     const int8_t* __restrict__ weights,
     const float* __restrict__ scales,
@@ -534,10 +563,9 @@ __global__ void w8a16_gemv_kernel(
     int cols
 ) {
     constexpr int kWarps = 8;
-    const int row = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
     if (row >= rows) return;
 
     const int8_t* row_ptr = weights + static_cast<size_t>(row) * cols;
@@ -546,7 +574,7 @@ __global__ void w8a16_gemv_kernel(
     if ((cols & 3) == 0) {
         const uint32_t* row4 = reinterpret_cast<const uint32_t*>(row_ptr);
         const int groups4 = cols >> 2;
-        for (int group = tid; group < groups4; group += blockDim.x) {
+        for (int group = lane; group < groups4; group += 32) {
             const uint32_t packed = row4[group];
             const int col = group << 2;
             const int q0 = static_cast<int>(static_cast<int8_t>((packed >> 0) & 0xffu));
@@ -562,7 +590,7 @@ __global__ void w8a16_gemv_kernel(
             partial = fmaf(b.y, static_cast<float>(q3), partial);
         }
     } else {
-        for (int col = tid; col < cols; col += blockDim.x) {
+        for (int col = lane; col < cols; col += 32) {
             partial = fmaf(
                 __half2float(input[col]), static_cast<float>(row_ptr[col]), partial
             );
@@ -570,19 +598,12 @@ __global__ void w8a16_gemv_kernel(
     }
 
     partial = warp_sum(partial);
-    __shared__ float warp_sums[kWarps];
-    if (lane == 0) warp_sums[warp] = partial;
-    __syncthreads();
-
-    if (warp == 0) {
-        float total = lane < kWarps ? warp_sums[lane] : 0.0f;
-        total = warp_sum(total);
-        if (lane == 0) output[row] = __float2half_rn(total * scales[row]);
-    }
+    if (lane == 0) output[row] = __float2half_rn(partial * scales[row]);
 }
 
-// Kept for the low-level RuntimeMatrix host/benchmark API.  Model-level W16A16
-// execution bypasses this kernel and uses the framework/vendor GEMM path.
+// FP16 FastWarp control/runtime kernel. It intentionally uses the same
+// one-warp-per-output-row work mapping as W4/W8 so fullPrecision and
+// hardwareNative compare execution width rather than different topologies.
 __global__ void w16a16_gemv_kernel(
     const __half* __restrict__ weights,
     const __half* __restrict__ input,
@@ -591,26 +612,32 @@ __global__ void w16a16_gemv_kernel(
     int cols
 ) {
     constexpr int kWarps = 8;
-    const int row = static_cast<int>(blockIdx.x);
-    const int tid = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
     if (row >= rows) return;
 
     const __half* row_ptr = weights + static_cast<size_t>(row) * cols;
     float partial = 0.0f;
-    for (int col = tid; col < cols; col += blockDim.x) {
-        partial = fmaf(__half2float(row_ptr[col]), __half2float(input[col]), partial);
+
+    if ((cols & 1) == 0) {
+        const __half2* row2 = reinterpret_cast<const __half2*>(row_ptr);
+        const __half2* input2 = reinterpret_cast<const __half2*>(input);
+        const int groups2 = cols >> 1;
+        for (int group = lane; group < groups2; group += 32) {
+            const float2 w = __half22float2(row2[group]);
+            const float2 x = __half22float2(input2[group]);
+            partial = fmaf(x.x, w.x, partial);
+            partial = fmaf(x.y, w.y, partial);
+        }
+    } else {
+        for (int col = lane; col < cols; col += 32) {
+            partial = fmaf(__half2float(row_ptr[col]), __half2float(input[col]), partial);
+        }
     }
+
     partial = warp_sum(partial);
-    __shared__ float warp_sums[kWarps];
-    if (lane == 0) warp_sums[warp] = partial;
-    __syncthreads();
-    if (warp == 0) {
-        float total = lane < kWarps ? warp_sums[lane] : 0.0f;
-        total = warp_sum(total);
-        if (lane == 0) output[row] = __float2half_rn(total);
-    }
+    if (lane == 0) output[row] = __float2half_rn(partial);
 }
 
 __global__ void w4_to_fp16_kernel(
@@ -741,6 +768,38 @@ public:
         ));
     }
 
+    static std::unique_ptr<RuntimeMatrix> compress_selected_codes(
+        py::array_t<int16_t, py::array::c_style | py::array::forcecast> codes,
+        py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+        int selected_bits,
+        double threshold,
+        double selected_error,
+        const std::string& decode_policy = "hardwareNative"
+    ) {
+        auto q = codes.request();
+        auto s = scales.request();
+        if (q.ndim != 2) {
+            throw std::invalid_argument("codes must be 2D");
+        }
+        if (s.ndim != 1 || s.shape[0] != q.shape[0]) {
+            throw std::invalid_argument("scales must contain one value per weight row");
+        }
+        validate_storage_bits(selected_bits);
+        if (selected_bits == kFallbackBits) {
+            throw std::invalid_argument("prequantized codes require 3..15-bit storage");
+        }
+        if (!std::isfinite(threshold) || threshold < 0.0) {
+            throw std::invalid_argument("threshold must be a finite non-negative value");
+        }
+        if (!std::isfinite(selected_error) || selected_error < 0.0 || selected_error > threshold) {
+            throw std::invalid_argument("selected compressed width does not satisfy threshold");
+        }
+        return std::unique_ptr<RuntimeMatrix>(new RuntimeMatrix(
+            codes, scales, selected_bits, threshold, selected_error,
+            parse_decode_policy(decode_policy)
+        ));
+    }
+
     static std::unique_ptr<RuntimeMatrix> load(
         const std::string& path,
         const std::string& decode_policy = "hardwareNative"
@@ -849,16 +908,9 @@ public:
         std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
         shape.back() = rows_;
 
-        if (planned_execution_width_ == 16) {
-            // Match the validated direct experiment: W16A16 stays on the
-            // framework/vendor FP16 path rather than a hand-written scalar
-            // GEMV. materialize_torch() is zero-copy when d_w16_ exists.
-            auto weight = materialize_torch();
-            auto flat = input.reshape({1, cols_});
-            auto output = at::mm(flat, weight.transpose(0, 1));
-            return output.reshape(shape);
-        }
-
+        // M=1 decode uses the same one-warp-per-output-row FastWarp topology
+        // for W4A16, W8A16, and W16A16. Prefill remains in materialize_torch()
+        // + framework/vendor GEMM and is deliberately unchanged.
         auto output = torch::empty(shape, input.options());
         auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
         launch(
@@ -1046,6 +1098,40 @@ private:
     }
 
     RuntimeMatrix(
+        py::array_t<int16_t, py::array::c_style | py::array::forcecast> codes,
+        py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+        int bits,
+        double threshold,
+        double selected_error,
+        DecodePolicy policy
+    ) : storage_bits_(bits), threshold_(threshold), selected_error_(selected_error), decode_policy_(policy) {
+        validate_storage_bits(bits);
+        if (bits == kFallbackBits) {
+            throw std::invalid_argument("prequantized codes require 3..15-bit storage");
+        }
+        auto q = codes.request();
+        auto s = scales.request();
+        if (q.ndim != 2) throw std::invalid_argument("codes must be 2D");
+        rows_ = static_cast<int>(q.shape[0]);
+        cols_ = static_cast<int>(q.shape[1]);
+        if (s.ndim != 1 || s.shape[0] != rows_) {
+            throw std::invalid_argument("scales must contain one value per weight row");
+        }
+        CUDA_CHECK(cudaGetDevice(&device_id_));
+        const float* scale_ptr = static_cast<const float*>(s.ptr);
+        scales_.assign(scale_ptr, scale_ptr + rows_);
+        for (float scale : scales_) {
+            if (!std::isfinite(scale) || scale <= 0.0f) {
+                throw std::invalid_argument("ElasticBit scales must be finite and positive");
+            }
+        }
+        payload_ = pack_exact_codes(
+            static_cast<const int16_t*>(q.ptr), rows_, cols_, storage_bits_
+        );
+        configure_execution_weights();
+    }
+
+    RuntimeMatrix(
         int rows,
         int cols,
         int bits,
@@ -1156,50 +1242,6 @@ private:
         ));
         auto current_stream = c10::cuda::getCurrentCUDAStream(device_id_);
 
-        if (width == 16) {
-            // Auto-tune W16 against the same ATen/cuBLAS path used by model
-            // decode, not against ElasticBit's compatibility GEMV kernel.
-            auto options = torch::TensorOptions()
-                .dtype(torch::kFloat16)
-                .device(torch::Device(torch::kCUDA, device_id_));
-            auto input_view = torch::from_blob(
-                static_cast<void*>(d_host_input_), {1, static_cast<int64_t>(cols_)},
-                [](void*) {}, options
-            );
-            auto output_view = torch::from_blob(
-                static_cast<void*>(d_host_output_), {1, static_cast<int64_t>(rows_)},
-                [](void*) {}, options
-            );
-            auto weight_view = torch::from_blob(
-                static_cast<void*>(d_w16_),
-                {static_cast<int64_t>(rows_), static_cast<int64_t>(cols_)},
-                [](void*) {}, options
-            );
-            auto weight_t = weight_view.transpose(0, 1);
-
-            constexpr int warmups = 6;
-            constexpr int iterations = 24;
-            for (int i = 0; i < warmups; ++i) {
-                at::mm_out(output_view, input_view, weight_t);
-            }
-            CUDA_CHECK(cudaDeviceSynchronize());
-
-            cudaEvent_t start, stop;
-            CUDA_CHECK(cudaEventCreate(&start));
-            CUDA_CHECK(cudaEventCreate(&stop));
-            CUDA_CHECK(cudaEventRecord(start, current_stream.stream()));
-            for (int i = 0; i < iterations; ++i) {
-                at::mm_out(output_view, input_view, weight_t);
-            }
-            CUDA_CHECK(cudaEventRecord(stop, current_stream.stream()));
-            CUDA_CHECK(cudaEventSynchronize(stop));
-            float milliseconds = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-            CUDA_CHECK(cudaEventDestroy(start));
-            CUDA_CHECK(cudaEventDestroy(stop));
-            return static_cast<double>(milliseconds) / iterations;
-        }
-
         constexpr int warmups = 6;
         constexpr int iterations = 24;
         for (int i = 0; i < warmups; ++i) {
@@ -1293,17 +1335,19 @@ private:
 
     void launch_width(int width, const __half* input, __half* output, cudaStream_t stream) {
         constexpr int threads = 256;
+        constexpr int warps_per_block = 8;
+        const int blocks = (rows_ + warps_per_block - 1) / warps_per_block;
         if (width == 4) {
             const int row_bytes = (cols_ + 1) / 2;
-            w4a16_gemv_kernel<<<rows_, threads, 0, stream>>>(
+            w4a16_gemv_kernel<<<blocks, threads, 0, stream>>>(
                 d_w4_, d_scales_, input, output, rows_, cols_, row_bytes
             );
         } else if (width == 8) {
-            w8a16_gemv_kernel<<<rows_, threads, 0, stream>>>(
+            w8a16_gemv_kernel<<<blocks, threads, 0, stream>>>(
                 d_w8_, d_scales_, input, output, rows_, cols_
             );
         } else {
-            w16a16_gemv_kernel<<<rows_, threads, 0, stream>>>(
+            w16a16_gemv_kernel<<<blocks, threads, 0, stream>>>(
                 d_w16_, input, output, rows_, cols_
             );
         }
@@ -1372,6 +1416,12 @@ PYBIND11_MODULE(_C, module) {
         .def_static(
             "_compressSelected", &RuntimeMatrix::compress_selected,
             py::arg("weights"), py::arg("selectedBits"),
+            py::arg("threshold"), py::arg("selectedError"),
+            py::arg("decodePolicy") = "hardwareNative"
+        )
+        .def_static(
+            "_compressSelectedCodes", &RuntimeMatrix::compress_selected_codes,
+            py::arg("codes"), py::arg("scales"), py::arg("selectedBits"),
             py::arg("threshold"), py::arg("selectedError"),
             py::arg("decodePolicy") = "hardwareNative"
         )

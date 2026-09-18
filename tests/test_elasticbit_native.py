@@ -103,3 +103,38 @@ def test_model_compress_switch_and_artifact(tmp_path):
     ElasticBit.load(shell, artifact, decodePolicy="fullPrecision")
     restored = shell(x).detach()
     torch.testing.assert_close(restored, full, atol=0, rtol=0)
+
+
+
+def test_model_analyzer_result_reuse_and_fastwarp_policy(tmp_path):
+    """Compressed/full-precision policies share selected math; M=1 stays stable."""
+    torch.manual_seed(20260918)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(128, 128, bias=False),
+    ).cuda().half().eval()
+    calibrationData = [
+        torch.randn(8, 128, device="cuda", dtype=torch.float16)
+    ]
+    ElasticBit.compress(model, calibrationData, threshold=0.03)
+
+    layer = model[0]
+    matrix = layer.matrix
+    assert matrix.activateDType == "float16"
+    assert 3 <= matrix.storageBits <= 16
+
+    x = torch.randn(1, 128, device="cuda", dtype=torch.float16)
+    model.elasticbit.setDecodePolicy("fullPrecision")
+    fp16_fastwarp = model(x).detach()
+    model.elasticbit.setDecodePolicy("hardwareNative")
+    hardware_fastwarp = model(x).detach()
+
+    # Policies execute the same selected mathematical model; hardwareNative can
+    # differ slightly because integer accumulation and FP16 FastWarp round in a
+    # different order, but should stay tightly aligned.
+    assert torch.nn.functional.cosine_similarity(
+        hardware_fastwarp.float(), fp16_fastwarp.float(), dim=-1
+    ).item() > 0.999
+
+    artifact = tmp_path / "fastwarp.elasticbit"
+    ElasticBit.save(model, artifact)
+    assert artifact.exists()

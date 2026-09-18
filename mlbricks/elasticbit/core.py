@@ -13,9 +13,10 @@ smallest safe storage width automatically.
 Storage and execution are intentionally separate:
 
 * storage search: 3..15 bit, with FP16 as the threshold-preserving fallback;
-* ``hardwareNative`` decode: T4 uses the validated W4A16/W8A16/W16A16 map;
-  other CUDA GPUs auto-tune the legal built-in execution widths per matrix shape;
-* ``fullPrecision`` decode: every stored width executes as W16A16;
+* ``hardwareNative`` decode: T4 uses the validated W4A16/W8A16/W16A16 map
+  with one-warp-per-output-row FastWarp GEMV; other CUDA GPUs auto-tune the
+  legal built-in execution widths per matrix shape;
+* ``fullPrecision`` decode: every stored width executes as W16A16 FastWarp GEMV;
 * prefill materializes FP16 weights on-device and uses framework/vendor GEMM;
 * activations stay FP16 in every execution path.
 
@@ -112,13 +113,16 @@ def _selectBitsTorch(
     weight: torch.Tensor,
     calibration: np.ndarray,
     threshold: float,
-) -> tuple[int, float]:
+) -> tuple[int, float, np.ndarray | None, np.ndarray | None]:
     """Select ElasticBit storage width on the model GPU.
 
     This is the model-compression fast path.  It preserves the public
     threshold-driven contract but avoids the old scalar CPU analyzer, whose
     cost was O(bits * calibration_rows * weight_elements).  The reference is
-    the real FP16 framework GEMM used by native model execution.
+    the real FP16 framework GEMM used by native model execution.  For a
+    compressed selection, the exact selected integer codes and row scales are
+    returned so model compression can pack them directly instead of quantizing
+    the original FP16 weight a second time.
     """
     if weight.device.type != "cuda":
         raise RuntimeError("ElasticBit GPU analyzer requires CUDA weights")
@@ -170,14 +174,24 @@ def _selectBitsTorch(
 
         error = max(hardwareError, fullError)
         if error <= float(threshold):
-            return bits, float(error)
+            # Preserve the exact analyzer result. int16 covers the full signed
+            # range needed by ElasticBit's 3..15-bit storage search. Moving the
+            # chosen codes/scales to CPU is substantially cheaper than copying
+            # the original FP16 weight to CPU and quantizing it again there.
+            selectedCodes = np.ascontiguousarray(
+                quantized.to(torch.int16).cpu().numpy(), dtype=np.int16
+            )
+            selectedScales = np.ascontiguousarray(
+                scale.float().cpu().numpy(), dtype=np.float32
+            )
+            return bits, float(error), selectedCodes, selectedScales
 
         del quantized, dequantized16, fullOutput
         if bits <= 8:
             del integerDot, hardwareOutput
 
     # FP16 fallback is exact relative to the native FP16 reference.
-    return 16, 0.0
+    return 16, 0.0, None, None
 
 
 def _moduleDevice(module: nn.Module) -> torch.device:
@@ -280,6 +294,33 @@ class RuntimeMatrix:
         w = _toNumpy2D(weights, name="weights")
         return cls(native.RuntimeMatrix._compressSelected(
             w, int(selectedBits), float(threshold), float(selectedError), policy
+        ))
+
+    @classmethod
+    def _compressSelectedCodes(
+        cls,
+        codes: np.ndarray,
+        scales: np.ndarray,
+        selectedBits: int,
+        threshold: float,
+        selectedError: float,
+        decodePolicy: str = "hardwareNative",
+    ) -> "RuntimeMatrix":
+        """Pack an already-selected analyzer result without requantizing.
+
+        Internal model-compression fast path. The public API remains
+        threshold-driven and never exposes a user-selected bit width.
+        """
+        native = _requireNative()
+        policy = _checkPolicy(decodePolicy)
+        q = np.ascontiguousarray(codes, dtype=np.int16)
+        s = np.ascontiguousarray(scales, dtype=np.float32)
+        if q.ndim != 2:
+            raise ValueError("codes must be a 2D matrix")
+        if s.ndim != 1 or s.shape[0] != q.shape[0]:
+            raise ValueError("scales must contain one value per weight row")
+        return cls(native.RuntimeMatrix._compressSelectedCodes(
+            q, s, int(selectedBits), float(threshold), float(selectedError), policy
         ))
 
     @classmethod
@@ -404,9 +445,8 @@ class _ElasticLinear(nn.Module):
             )
         rows = x.numel() // self.inFeatures
 
-        # M=1 decode enters RuntimeMatrix directly. W4A16/W8A16 use the
-        # vectorized ElasticBit CUDA kernels; W16A16 is delegated inside the
-        # native extension to ATen/cuBLAS over a zero-copy FP16 weight view.
+        # M=1 decode enters RuntimeMatrix directly. W4A16/W8A16/W16A16 all
+        # use the validated one-warp-per-output-row FastWarp CUDA topology.
         if rows == 1 and x.is_cuda and x.dtype == torch.float16:
             y = self.matrix.forward(x)
             if self.bias is not None:
@@ -678,7 +718,7 @@ class ElasticBit:
                     flush=True,
                 )
 
-            selectedBits, selectedError = _selectBitsTorch(
+            selectedBits, selectedError, selectedCodes, selectedScales = _selectBitsTorch(
                 module.weight, calibration, float(threshold)
             )
 
@@ -695,18 +735,32 @@ class ElasticBit:
                     flush=True,
                 )
 
-            # Move FP16 weights to CPU first, then widen to FP32 on CPU.  Calling
-            # .float() before .cpu() creates a full temporary FP32 copy on the GPU.
-            weights = np.ascontiguousarray(
-                module.weight.detach().cpu().float().numpy(), dtype=np.float32
-            )
-            matrix = RuntimeMatrix._compressSelected(
-                weights,
-                selectedBits,
-                float(threshold),
-                selectedError,
-                decodePolicy=policy,
-            )
+            if selectedBits <= 15:
+                # Reuse the exact analyzer-selected integer codes/scales. This avoids
+                # the old GPU analyze -> discard -> FP16 GPU->CPU -> requantize path.
+                assert selectedCodes is not None and selectedScales is not None
+                matrix = RuntimeMatrix._compressSelectedCodes(
+                    selectedCodes,
+                    selectedScales,
+                    selectedBits,
+                    float(threshold),
+                    selectedError,
+                    decodePolicy=policy,
+                )
+                weights = None
+            else:
+                # FP16 fallback has no quantized analyzer payload. Preserve the
+                # original FP16 values exactly in MLB4.
+                weights = np.ascontiguousarray(
+                    module.weight.detach().cpu().float().numpy(), dtype=np.float32
+                )
+                matrix = RuntimeMatrix._compressSelected(
+                    weights,
+                    selectedBits,
+                    float(threshold),
+                    selectedError,
+                    decodePolicy=policy,
+                )
 
             # Replace every Linear sharing this weight immediately.  This releases
             # the original FP16 parameter group before the next compressed matrix is
@@ -727,7 +781,7 @@ class ElasticBit:
                 collected.pop(name, None)
                 del current, replacement
 
-            del module, weights, calibration, samples, matrix
+            del module, weights, selectedCodes, selectedScales, calibration, samples, matrix
             gc.collect()
             torch.cuda.empty_cache()
 

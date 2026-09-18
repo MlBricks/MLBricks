@@ -1,3 +1,24 @@
+# ElasticBit FastWarp production patch — 2026-09-18
+
+- Keeps prefill unchanged on the existing FP16 framework/vendor GEMM path.
+- Replaces M=1 W4A16/W8A16/W16A16 decode topology with one warp per output row (8 rows per 256-thread block).
+- `fullPrecision` M=1 decode now uses FP16 FastWarp rather than ATen/cuBLAS, matching the clean Granite benchmark.
+- `hardwareNative` <=8-bit matrices use W4/W8 FastWarp; >8-bit matrices use W16 FastWarp.
+- Reuses analyzer-selected integer codes and row scales when building canonical 3..15-bit storage, removing duplicate quantization and the original FP16 GPU->CPU copy for compressed selections.
+- MLB4 file format and public threshold-driven API are unchanged.
+
+Validated experiment on Granite 4.2 3B / Tesla T4 before library patch:
+
+```text
+Native FP16 / F.linear         : 19.606 tok/s
+Adaptive FP16 / FastWarp       : 21.106 tok/s
+HardwareNative / FastWarp      : 23.187 tok/s
+HardwareNative vs native       : 1.183x
+Decode-only resident reduction : ~39.1%
+```
+
+---
+
 # ElasticBit clean adaptive API patch
 
 ## Frozen algorithm

@@ -8,8 +8,8 @@ Activations remain FP16 throughout execution.
 
 ## Execution policies
 
-- `hardwareNative`: hardware-aware decode. On the validated Tesla T4 path, stored 3–4 bit -> W4A16, 5–8 bit -> W8A16, and 9–16 bit -> W16A16. On other CUDA GPUs, ElasticBit benchmarks the legal built-in W4A16/W8A16/W16A16 candidates for each matrix shape and keeps the fastest available execution width.
-- `fullPrecision`: all stored widths execute as W16A16.
+- `hardwareNative`: hardware-aware decode. On the validated Tesla T4 path, stored 3–4 bit -> W4A16, 5–8 bit -> W8A16, and 9–16 bit -> W16A16. M=1 uses the validated FastWarp topology: one warp owns one output row and an 8-warp block computes up to eight rows without inter-warp reduction. On other CUDA GPUs, ElasticBit benchmarks the legal built-in W4A16/W8A16/W16A16 candidates for each matrix shape.
+- `fullPrecision`: all stored widths execute as W16A16. M=1 uses the same FP16 FastWarp topology, which keeps the policy comparison on the same decode work mapping.
 
 The compressed storage does not change when switching policies. Execution width is a runtime decision, not a property of the stored file.
 
@@ -30,7 +30,7 @@ model.elasticbit.setDecodePolicy("fullPrecision")
 model.elasticbit.setDecodePolicy("hardwareNative")
 ```
 
-Prefill expands the compressed weight directly on the current GPU to a transient FP16 tensor, then uses the framework/vendor `Linear` GEMM path. M=1 decode uses the ElasticBit weight-only native runtime. No activation quantization is used.
+Prefill expands the compressed weight directly on the current GPU to a transient FP16 tensor, then uses the framework/vendor `Linear` GEMM path; this behavior is intentionally unchanged. M=1 decode uses the ElasticBit FastWarp runtime. No activation quantization is used. During whole-model compression, analyzer-selected integer codes and row scales are packed directly into canonical storage rather than recomputing quantization a second time.
 
 ## Matrix API
 
