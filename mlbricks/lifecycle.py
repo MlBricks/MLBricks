@@ -108,6 +108,11 @@ def save(
     """
     if not isinstance(model, nn.Module):
         raise TypeError("mlbricks.save() expects a torch.nn.Module")
+    if hasattr(model, "elasticbit"):
+        raise ValueError(
+            "ElasticBit-compressed models must be saved with ElasticBit.save() "
+            "so compressed matrices remain in the ElasticBit artifact format."
+        )
 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -124,14 +129,6 @@ def save(
             "mlbricks_version": _mlbricks_version(),
         }
     )
-
-    try:
-        from .elasticbit import elasticbit_manifest
-        quantization = elasticbit_manifest(model)
-        if quantization is not None:
-            info["quantization"] = quantization
-    except Exception:
-        pass
 
     if metadata:
         info["metadata"] = dict(metadata)
@@ -155,12 +152,6 @@ def _load_legacy_esa(path: Path, device: torch.device, strict: bool) -> nn.Modul
     metadata_path = path / "metadata.json"
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        quantization = metadata.get("quantization")
-        if quantization is not None:
-            from .elasticbit import restore_elasticbit_modules
-            restore_elasticbit_modules(model, quantization)
-            model.to(device=device)
-
     state = torch.load(state_path, map_location=device, weights_only=True)
     model.load_state_dict(state, strict=strict)
     return model
@@ -254,24 +245,6 @@ def compile(
     return torch.compile(model, mode=mode, dynamic=dynamic, fullgraph=fullgraph)
 
 
-def quantize(
-    model: nn.Module,
-    *,
-    method: str = "elasticbit",
-    bits: int = 4,
-    include_embeddings: bool = False,
-    **kwargs: Any,
-) -> nn.Module:
-    """Quantize a model through the unified MLBricks optimization API."""
-    name = str(method).strip().lower().replace("-", "")
-    if name not in {"elasticbit", "eb"}:
-        raise ValueError("method must currently be 'elasticbit'")
-    from .elasticbit import ElasticBitConfig, quantize_module
-
-    config = ElasticBitConfig(bits=int(bits), **kwargs)
-    return quantize_module(model, config, include_embeddings=include_embeddings)
-
-
 def _mlbricks_version() -> str:
     try:
         from importlib.metadata import version
@@ -289,5 +262,4 @@ __all__ = [
     "predict",
     "generate",
     "compile",
-    "quantize",
 ]

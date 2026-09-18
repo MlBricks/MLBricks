@@ -1,6 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -12,7 +14,10 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <sstream>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -20,73 +25,59 @@ namespace py = pybind11;
 
 #define CUDA_CHECK(call)                                                        \
     do {                                                                        \
-        cudaError_t error__ = (call);                                            \
-        if (error__ != cudaSuccess) {                                            \
-            throw std::runtime_error(                                            \
-                std::string("CUDA error: ") + cudaGetErrorString(error__) +     \
-                " at " + __FILE__ + ":" + std::to_string(__LINE__)             \
+        cudaError_t error__ = (call);                                           \
+        if (error__ != cudaSuccess) {                                           \
+            throw std::runtime_error(                                           \
+                std::string("CUDA error: ") + cudaGetErrorString(error__) +   \
+                " at " + __FILE__ + ":" + std::to_string(__LINE__)           \
             );                                                                  \
         }                                                                       \
     } while (0)
 
-enum class ComputeType : uint8_t {
-    INT4 = 1,
-    INT8 = 2,
-    FP16 = 3,
-    FP32 = 4,
-};
+// -----------------------------------------------------------------------------
+// ElasticBit vNext invariants
+// -----------------------------------------------------------------------------
+// Storage is adaptive and threshold-driven. Users never select a bit width.
+// Search: 3..15 bits, with FP16 (16 bit) as the threshold-preserving fallback.
+// Activations remain FP16 in every execution policy.
+// hardwareNative execution is phase- and hardware-aware. Tesla T4 keeps the
+// validated mapping 3..4 -> W4A16, 5..8 -> W8A16, 9..16 -> W16A16. Other
+// CUDA GPUs benchmark the legal W4A16/W8A16/W16A16 candidates for each matrix
+// shape and select the fastest built-in ElasticBit decode kernel.
+// fullPrecision execution: all storage widths -> W16A16.
+// Prefill always materializes FP16 weights on-device and delegates GEMM to
+// PyTorch/vendor libraries; activations are never quantized.
+// Bit selection validates BOTH low-bit and full-precision arithmetic so policy
+// switching and hardware widening never invalidate the compression threshold.
+// -----------------------------------------------------------------------------
 
-static const char* compute_type_name(ComputeType type) {
-    switch (type) {
-        case ComputeType::INT4: return "int4";
-        case ComputeType::INT8: return "int8";
-        case ComputeType::FP16: return "fp16";
-        case ComputeType::FP32: return "fp32";
-        default: return "unknown";
-    }
-}
-
-static ComputeType compute_type_for_bits(int storage_bits) {
-    if (storage_bits == 4) {
-        return ComputeType::INT4;
-    }
-    if (storage_bits <= 8) {
-        return ComputeType::INT8;
-    }
-    if (storage_bits <= 16) {
-        return ComputeType::FP16;
-    }
-    return ComputeType::FP32;
-}
+static constexpr int kMinCompressedBits = 3;
+static constexpr int kMaxCompressedBits = 15;
+static constexpr int kFallbackBits = 16;
 
 static void validate_storage_bits(int bits) {
-    if (bits < 4 || bits > 32) {
-        throw std::invalid_argument(
-            "storage_bits must be between 4 and 32"
-        );
+    if (bits < kMinCompressedBits || bits > kFallbackBits) {
+        throw std::invalid_argument("ElasticBit storage bits must be between 3 and 16");
     }
-}
-
-static inline float round_to_fp16_host(float value) {
-    __half converted = __float2half_rn(value);
-    return __half2float(converted);
-}
-
-static inline float fp16_multiply_host(float left, float right) {
-    const float left_half = round_to_fp16_host(left);
-    const float right_half = round_to_fp16_host(right);
-    return round_to_fp16_host(left_half * right_half);
 }
 
 static inline uint32_t qmax_for_bits(int bits) {
+    if (bits >= 32) return 0x7fffffffu;
     return (1u << (bits - 1)) - 1u;
 }
 
-static inline size_t packed_bytes_for_values(
-    size_t value_count,
-    int bits
-) {
+static inline size_t packed_bytes_for_values(size_t value_count, int bits) {
     return (value_count * static_cast<size_t>(bits) + 7u) / 8u;
+}
+
+static inline float round_to_fp16_host(float value) {
+    return __half2float(__float2half_rn(value));
+}
+
+static inline int32_t quantize_scalar(float value, float scale, int bits) {
+    const int32_t qmax = static_cast<int32_t>(qmax_for_bits(bits));
+    int32_t q = static_cast<int32_t>(std::nearbyint(value / scale));
+    return std::max(-qmax, std::min(qmax, q));
 }
 
 static std::vector<float> make_row_scales(
@@ -95,36 +86,18 @@ static std::vector<float> make_row_scales(
     int cols,
     int bits
 ) {
-    if (bits == 16 || bits == 32) {
-        return {};
-    }
-
+    if (bits == kFallbackBits) return {};
     const float qmax = static_cast<float>(qmax_for_bits(bits));
     std::vector<float> scales(rows, 1.0f);
-
     for (int row = 0; row < rows; ++row) {
         const float* row_ptr = weights + static_cast<size_t>(row) * cols;
         float max_abs = 0.0f;
-
         for (int col = 0; col < cols; ++col) {
             max_abs = std::max(max_abs, std::fabs(row_ptr[col]));
         }
-
         scales[row] = max_abs > 0.0f ? max_abs / qmax : 1.0f;
     }
-
     return scales;
-}
-
-static inline int32_t quantize_scalar(
-    float value,
-    float scale,
-    int bits
-) {
-    const int32_t qmax = static_cast<int32_t>(qmax_for_bits(bits));
-    int32_t q = static_cast<int32_t>(std::nearbyint(value / scale));
-    q = std::max(-qmax, std::min(qmax, q));
-    return q;
 }
 
 static std::vector<uint8_t> pack_exact_weights(
@@ -134,53 +107,43 @@ static std::vector<uint8_t> pack_exact_weights(
     int bits,
     const std::vector<float>& scales
 ) {
+    validate_storage_bits(bits);
     const size_t count = static_cast<size_t>(rows) * cols;
 
-    if (bits == 16) {
+    if (bits == kFallbackBits) {
         std::vector<uint8_t> payload(count * sizeof(__half));
         __half* half_values = reinterpret_cast<__half*>(payload.data());
-
         for (size_t index = 0; index < count; ++index) {
             half_values[index] = __float2half_rn(weights[index]);
         }
-
-        return payload;
-    }
-
-    if (bits == 32) {
-        std::vector<uint8_t> payload(count * sizeof(float));
-        std::memcpy(payload.data(), weights, payload.size());
         return payload;
     }
 
     const size_t payload_bytes = packed_bytes_for_values(count, bits);
     std::vector<uint8_t> payload(payload_bytes, 0u);
-    const uint32_t qmax = qmax_for_bits(bits);
+    const int32_t qmax = static_cast<int32_t>(qmax_for_bits(bits));
 
     for (int row = 0; row < rows; ++row) {
         const float scale = scales[row];
-
         for (int col = 0; col < cols; ++col) {
             const size_t index = static_cast<size_t>(row) * cols + col;
             const int32_t q = quantize_scalar(weights[index], scale, bits);
-            const uint32_t code = static_cast<uint32_t>(q + static_cast<int32_t>(qmax));
-
+            const uint32_t code = static_cast<uint32_t>(q + qmax);
             const size_t bit_offset = index * static_cast<size_t>(bits);
             const size_t byte_offset = bit_offset >> 3;
             const int shift = static_cast<int>(bit_offset & 7u);
             const uint64_t shifted = static_cast<uint64_t>(code) << shift;
-
-            for (int byte_index = 0; byte_index < 5; ++byte_index) {
+            // At most 15 bits plus a 7-bit bit offset => at most 22 bits.
+            for (int byte_index = 0; byte_index < 3; ++byte_index) {
                 const size_t target = byte_offset + static_cast<size_t>(byte_index);
                 if (target < payload.size()) {
                     payload[target] |= static_cast<uint8_t>(
-                        (shifted >> (8 * byte_index)) & 0xFFull
+                        (shifted >> (8 * byte_index)) & 0xffull
                     );
                 }
             }
         }
     }
-
     return payload;
 }
 
@@ -193,19 +156,15 @@ static inline uint32_t extract_code_host(
     const size_t bit_offset = index * static_cast<size_t>(bits);
     const size_t byte_offset = bit_offset >> 3;
     const int shift = static_cast<int>(bit_offset & 7u);
-
-    uint64_t word = 0u;
-    for (int byte_index = 0; byte_index < 5; ++byte_index) {
+    uint32_t word = 0u;
+    for (int byte_index = 0; byte_index < 3; ++byte_index) {
         const size_t source = byte_offset + static_cast<size_t>(byte_index);
         if (source < payload_bytes) {
-            word |= static_cast<uint64_t>(payload[source]) << (8 * byte_index);
+            word |= static_cast<uint32_t>(payload[source]) << (8 * byte_index);
         }
     }
-
-    const uint64_t mask = bits == 32
-        ? 0xFFFFFFFFull
-        : ((1ull << bits) - 1ull);
-    return static_cast<uint32_t>((word >> shift) & mask);
+    const uint32_t mask = (1u << bits) - 1u;
+    return (word >> shift) & mask;
 }
 
 static std::vector<float> dequantize_payload_host(
@@ -213,13 +172,11 @@ static std::vector<float> dequantize_payload_host(
     const std::vector<float>& scales,
     int rows,
     int cols,
-    int bits,
-    bool apply_compute_promotion
+    int bits
 ) {
     const size_t count = static_cast<size_t>(rows) * cols;
     std::vector<float> output(count);
-
-    if (bits == 16) {
+    if (bits == kFallbackBits) {
         const __half* half_values = reinterpret_cast<const __half*>(payload.data());
         for (size_t index = 0; index < count; ++index) {
             output[index] = __half2float(half_values[index]);
@@ -227,67 +184,83 @@ static std::vector<float> dequantize_payload_host(
         return output;
     }
 
-    if (bits == 32) {
-        std::memcpy(output.data(), payload.data(), count * sizeof(float));
-        return output;
-    }
-
     const int32_t qmax = static_cast<int32_t>(qmax_for_bits(bits));
-
     for (int row = 0; row < rows; ++row) {
         const float scale = scales[row];
-
         for (int col = 0; col < cols; ++col) {
             const size_t index = static_cast<size_t>(row) * cols + col;
             const uint32_t code = extract_code_host(
                 payload.data(), payload.size(), index, bits
             );
             const int32_t q = static_cast<int32_t>(code) - qmax;
-            float value = static_cast<float>(q) * scale;
-
-            if (apply_compute_promotion && bits >= 9 && bits <= 16) {
-                value = round_to_fp16_host(value);
-            }
-
-            output[index] = value;
+            output[index] = round_to_fp16_host(static_cast<float>(q) * scale);
         }
     }
-
     return output;
 }
 
-struct BitAnalysis {
-    int bits;
-    ComputeType compute_type;
-    double error;
-    size_t payload_bytes;
-    size_t scale_bytes;
+static int execution_width_for_bits(int storage_bits) {
+    if (storage_bits <= 4) return 4;
+    if (storage_bits <= 8) return 8;
+    return 16;
+}
+
+enum class DecodePolicy : uint8_t {
+    HardwareNative = 1,
+    FullPrecision = 2,
 };
 
-static std::vector<float> reference_outputs(
+static DecodePolicy parse_decode_policy(const std::string& value) {
+    if (value == "hardwareNative") return DecodePolicy::HardwareNative;
+    if (value == "fullPrecision") return DecodePolicy::FullPrecision;
+    throw std::invalid_argument(
+        "decodePolicy must be 'hardwareNative' or 'fullPrecision'"
+    );
+}
+
+static const char* decode_policy_name(DecodePolicy value) {
+    return value == DecodePolicy::HardwareNative
+        ? "hardwareNative"
+        : "fullPrecision";
+}
+
+struct BitAnalysis {
+    int bits = 16;
+    double hardware_native_error = 0.0;
+    double full_precision_error = 0.0;
+    double error = 0.0;
+    size_t storage_bytes = 0;
+};
+
+static std::vector<float> fp16_reference_outputs(
     const float* weights,
     int rows,
     int cols,
     const float* calibration,
     int samples
 ) {
-    std::vector<float> outputs(static_cast<size_t>(samples) * rows, 0.0f);
+    std::vector<float> refs(static_cast<size_t>(samples) * rows, 0.0f);
+    std::vector<float> half_weights(static_cast<size_t>(rows) * cols);
+    for (size_t i = 0; i < half_weights.size(); ++i) {
+        half_weights[i] = round_to_fp16_host(weights[i]);
+    }
 
     for (int sample = 0; sample < samples; ++sample) {
         const float* input = calibration + static_cast<size_t>(sample) * cols;
-        float* output = outputs.data() + static_cast<size_t>(sample) * rows;
-
+        std::vector<float> input_half(cols);
+        for (int col = 0; col < cols; ++col) {
+            input_half[col] = round_to_fp16_host(input[col]);
+        }
         for (int row = 0; row < rows; ++row) {
-            const float* row_ptr = weights + static_cast<size_t>(row) * cols;
-            double sum = 0.0;
+            float sum = 0.0f;
+            const float* row_ptr = half_weights.data() + static_cast<size_t>(row) * cols;
             for (int col = 0; col < cols; ++col) {
-                sum += static_cast<double>(row_ptr[col]) * input[col];
+                sum += row_ptr[col] * input_half[col];
             }
-            output[row] = static_cast<float>(sum);
+            refs[static_cast<size_t>(sample) * rows + row] = sum;
         }
     }
-
-    return outputs;
+    return refs;
 }
 
 static BitAnalysis analyze_one_bit_width(
@@ -300,150 +273,77 @@ static BitAnalysis analyze_one_bit_width(
     int bits
 ) {
     validate_storage_bits(bits);
+    const std::vector<float> scales = make_row_scales(weights, rows, cols, bits);
 
-    std::vector<float> scales = make_row_scales(
-        weights, rows, cols, bits
-    );
-
-    long double numerator = 0.0L;
-    long double denominator = 0.0L;
+    long double hw_num = 0.0L;
+    long double full_num = 0.0L;
+    long double denom = 0.0L;
 
     for (int sample = 0; sample < samples; ++sample) {
         const float* input = calibration + static_cast<size_t>(sample) * cols;
+        std::vector<float> input_half(cols);
+        for (int col = 0; col < cols; ++col) {
+            input_half[col] = round_to_fp16_host(input[col]);
+        }
 
-        if (bits <= 8) {
-            // Compute promotion:
-            // 4-bit storage -> INT4 activation/weight integer math.
-            // 5..8-bit storage -> INT8 activation/weight integer math.
-            const int32_t input_qmax = bits == 4 ? 7 : 127;
-            float input_max_abs = 0.0f;
-            for (int col = 0; col < cols; ++col) {
-                input_max_abs = std::max(input_max_abs, std::fabs(input[col]));
-            }
-            const float input_scale = input_max_abs > 0.0f
-                ? input_max_abs / static_cast<float>(input_qmax)
-                : 1.0f;
+        for (int row = 0; row < rows; ++row) {
+            const float* row_ptr = weights + static_cast<size_t>(row) * cols;
+            float hw_sum = 0.0f;
+            float full_sum = 0.0f;
 
-            std::vector<int8_t> input_q(cols);
-            for (int col = 0; col < cols; ++col) {
-                int32_t q = static_cast<int32_t>(
-                    std::nearbyint(input[col] / input_scale)
-                );
-                q = std::max(-input_qmax, std::min(input_qmax, q));
-                input_q[col] = static_cast<int8_t>(q);
-            }
-
-            for (int row = 0; row < rows; ++row) {
-                const float* row_ptr = weights + static_cast<size_t>(row) * cols;
-                const float weight_scale = scales[row];
-                int64_t integer_sum = 0;
-
+            if (bits == kFallbackBits) {
                 for (int col = 0; col < cols; ++col) {
-                    const int32_t q_weight = quantize_scalar(
-                        row_ptr[col], weight_scale, bits
+                    const float w = round_to_fp16_host(row_ptr[col]);
+                    hw_sum += w * input_half[col];
+                }
+                full_sum = hw_sum;
+            } else if (bits <= 8) {
+                const float scale = scales[row];
+                float integer_dot = 0.0f;
+                for (int col = 0; col < cols; ++col) {
+                    const int32_t q = quantize_scalar(row_ptr[col], scale, bits);
+                    integer_dot += static_cast<float>(q) * input_half[col];
+                    const float deq_half = round_to_fp16_host(
+                        static_cast<float>(q) * scale
                     );
-                    integer_sum += static_cast<int64_t>(q_weight) *
-                        static_cast<int32_t>(input_q[col]);
+                    full_sum += deq_half * input_half[col];
                 }
-
-                const double quantized_sum = static_cast<double>(integer_sum) *
-                    weight_scale * input_scale;
-                const double reference = references[
-                    static_cast<size_t>(sample) * rows + row
-                ];
-                const double difference = quantized_sum - reference;
-
-                numerator += static_cast<long double>(difference) * difference;
-                denominator += static_cast<long double>(reference) * reference;
-            }
-        } else if (bits <= 16) {
-            // 9..16-bit storage -> FP16 weight and activation compute.
-            std::vector<float> input_half(cols);
-            for (int col = 0; col < cols; ++col) {
-                input_half[col] = round_to_fp16_host(input[col]);
-            }
-
-            for (int row = 0; row < rows; ++row) {
-                const float* row_ptr = weights + static_cast<size_t>(row) * cols;
-                double quantized_sum = 0.0;
-
+                hw_sum = integer_dot * scale;
+            } else {
+                const float scale = scales[row];
                 for (int col = 0; col < cols; ++col) {
-                    float weight_value;
-                    if (bits == 16) {
-                        weight_value = round_to_fp16_host(row_ptr[col]);
-                    } else {
-                        const int32_t q_weight = quantize_scalar(
-                            row_ptr[col], scales[row], bits
-                        );
-                        weight_value = round_to_fp16_host(
-                            static_cast<float>(q_weight) * scales[row]
-                        );
-                    }
-
-                    quantized_sum += fp16_multiply_host(
-                        weight_value, input_half[col]
+                    const int32_t q = quantize_scalar(row_ptr[col], scale, bits);
+                    const float deq_half = round_to_fp16_host(
+                        static_cast<float>(q) * scale
                     );
+                    hw_sum += deq_half * input_half[col];
                 }
-
-                const double reference = references[
-                    static_cast<size_t>(sample) * rows + row
-                ];
-                const double difference = quantized_sum - reference;
-
-                numerator += static_cast<long double>(difference) * difference;
-                denominator += static_cast<long double>(reference) * reference;
+                full_sum = hw_sum;
             }
-        } else {
-            // 17..32-bit storage -> FP32 weight and activation compute.
-            for (int row = 0; row < rows; ++row) {
-                const float* row_ptr = weights + static_cast<size_t>(row) * cols;
-                float quantized_sum = 0.0f;
 
-                for (int col = 0; col < cols; ++col) {
-                    float weight_value;
-                    if (bits == 32) {
-                        weight_value = row_ptr[col];
-                    } else {
-                        const int32_t q_weight = quantize_scalar(
-                            row_ptr[col], scales[row], bits
-                        );
-                        weight_value = static_cast<float>(q_weight) * scales[row];
-                    }
-                    quantized_sum += weight_value * input[col];
-                }
-
-                const double reference = references[
-                    static_cast<size_t>(sample) * rows + row
-                ];
-                const double difference = static_cast<double>(quantized_sum) - reference;
-
-                numerator += static_cast<long double>(difference) * difference;
-                denominator += static_cast<long double>(reference) * reference;
-            }
+            const double ref = references[static_cast<size_t>(sample) * rows + row];
+            const double hw_diff = static_cast<double>(hw_sum) - ref;
+            const double full_diff = static_cast<double>(full_sum) - ref;
+            hw_num += static_cast<long double>(hw_diff) * hw_diff;
+            full_num += static_cast<long double>(full_diff) * full_diff;
+            denom += static_cast<long double>(ref) * ref;
         }
     }
 
-    const double error = std::sqrt(
-        static_cast<double>(numerator / std::max(denominator, 1.0e-30L))
-    );
+    const long double safe_denom = std::max(denom, 1.0e-30L);
+    const double hw_error = std::sqrt(static_cast<double>(hw_num / safe_denom));
+    const double full_error = std::sqrt(static_cast<double>(full_num / safe_denom));
+    const double error = std::max(hw_error, full_error);
 
     const size_t count = static_cast<size_t>(rows) * cols;
-    const size_t payload_bytes = bits == 16
+    const size_t payload_bytes = bits == kFallbackBits
         ? count * sizeof(__half)
-        : (bits == 32
-            ? count * sizeof(float)
-            : packed_bytes_for_values(count, bits));
-    const size_t scale_bytes = (bits == 16 || bits == 32)
+        : packed_bytes_for_values(count, bits);
+    const size_t scale_bytes = bits == kFallbackBits
         ? 0u
         : static_cast<size_t>(rows) * sizeof(float);
 
-    return BitAnalysis{
-        bits,
-        compute_type_for_bits(bits),
-        error,
-        payload_bytes,
-        scale_bytes,
-    };
+    return BitAnalysis{bits, hw_error, full_error, error, payload_bytes + scale_bytes};
 }
 
 static std::vector<BitAnalysis> analyze_all_bits(
@@ -451,1211 +351,206 @@ static std::vector<BitAnalysis> analyze_all_bits(
     int rows,
     int cols,
     const float* calibration,
-    int samples,
-    int min_bits,
-    int max_bits
+    int samples
 ) {
-    validate_storage_bits(min_bits);
-    validate_storage_bits(max_bits);
-
-    if (min_bits > max_bits) {
-        throw std::invalid_argument("min_bits must be <= max_bits");
+    if (rows <= 0 || cols <= 0 || samples <= 0) {
+        throw std::invalid_argument("weights and calibration must be non-empty");
     }
-
-    const std::vector<float> references = reference_outputs(
+    const std::vector<float> refs = fp16_reference_outputs(
         weights, rows, cols, calibration, samples
     );
-
     std::vector<BitAnalysis> analyses;
-    analyses.reserve(static_cast<size_t>(max_bits - min_bits + 1));
-
-    for (int bits = min_bits; bits <= max_bits; ++bits) {
-        analyses.push_back(
-            analyze_one_bit_width(
-                weights,
-                rows,
-                cols,
-                calibration,
-                samples,
-                references,
-                bits
-            )
-        );
+    analyses.reserve(kFallbackBits - kMinCompressedBits + 1);
+    for (int bits = kMinCompressedBits; bits <= kFallbackBits; ++bits) {
+        analyses.push_back(analyze_one_bit_width(
+            weights, rows, cols, calibration, samples, refs, bits
+        ));
     }
-
     return analyses;
 }
 
-__device__ __forceinline__ uint32_t extract_code_device(
-    const uint8_t* payload,
-    size_t payload_bytes,
-    size_t index,
-    int bits
+static BitAnalysis select_analysis(
+    const std::vector<BitAnalysis>& analyses,
+    double threshold
 ) {
-    const size_t bit_offset = index * static_cast<size_t>(bits);
-    const size_t byte_offset = bit_offset >> 3;
-    const int shift = static_cast<int>(bit_offset & 7u);
-
-    uint64_t word = 0u;
-
-    #pragma unroll
-    for (int byte_index = 0; byte_index < 5; ++byte_index) {
-        const size_t source = byte_offset + static_cast<size_t>(byte_index);
-        if (source < payload_bytes) {
-            word |= static_cast<uint64_t>(payload[source]) << (8 * byte_index);
+    if (!std::isfinite(threshold) || threshold < 0.0) {
+        throw std::invalid_argument("threshold must be a finite non-negative value");
+    }
+    for (const auto& item : analyses) {
+        if (item.bits <= kMaxCompressedBits && item.error <= threshold) {
+            return item;
         }
     }
-
-    const uint64_t mask = bits == 32
-        ? 0xFFFFFFFFull
-        : ((1ull << bits) - 1ull);
-    return static_cast<uint32_t>((word >> shift) & mask);
+    // FP16 is the threshold-preserving fallback. Its error is zero relative to
+    // the FP16 reference by construction.
+    const auto& fallback = analyses.back();
+    if (fallback.bits != kFallbackBits) {
+        throw std::runtime_error("ElasticBit analyzer internal fallback error");
+    }
+    return fallback;
 }
 
-__global__ void exact_packed_integer_gemv_kernel(
-    const uint8_t* __restrict__ payload,
-    size_t payload_bytes,
-    const float* __restrict__ weight_scales,
-    const int8_t* __restrict__ input_q,
-    float input_scale,
-    float* __restrict__ output,
-    int rows,
-    int cols,
-    int bits
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    const int32_t qmax = static_cast<int32_t>((1u << (bits - 1)) - 1u);
-    int32_t partial = 0;
-
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        const size_t index = static_cast<size_t>(row) * cols + col;
-        const uint32_t code = extract_code_device(
-            payload, payload_bytes, index, bits
-        );
-        const int32_t q_weight = static_cast<int32_t>(code) - qmax;
-        partial += q_weight * static_cast<int32_t>(input_q[col]);
-    }
-
-    __shared__ int32_t reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[row] = static_cast<float>(reduction[0]) *
-            weight_scales[row] * input_scale;
-    }
-}
-
-__global__ void direct_int4_gemv_kernel(
-    const uint8_t* __restrict__ payload,
-    const float* __restrict__ weight_scales,
-    const int8_t* __restrict__ input_q,
-    float input_scale,
-    float* __restrict__ output,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    int32_t partial = 0;
-
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        const size_t index = static_cast<size_t>(row) * cols + col;
-        const uint8_t packed = payload[index >> 1];
-        const uint8_t code = (index & 1u)
-            ? static_cast<uint8_t>((packed >> 4) & 0x0Fu)
-            : static_cast<uint8_t>(packed & 0x0Fu);
-        const int32_t q_weight = static_cast<int32_t>(code) - 7;
-        partial += q_weight * static_cast<int32_t>(input_q[col]);
-    }
-
-    __shared__ int32_t reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[row] = static_cast<float>(reduction[0]) *
-            weight_scales[row] * input_scale;
-    }
-}
-
-__global__ void direct_int8_gemv_kernel(
-    const uint8_t* __restrict__ payload,
-    const float* __restrict__ weight_scales,
-    const int8_t* __restrict__ input_q,
-    float input_scale,
-    float* __restrict__ output,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    int32_t partial = 0;
-
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        const size_t index = static_cast<size_t>(row) * cols + col;
-        const int32_t q_weight = static_cast<int32_t>(payload[index]) - 127;
-        partial += q_weight * static_cast<int32_t>(input_q[col]);
-    }
-
-    __shared__ int32_t reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[row] = static_cast<float>(reduction[0]) *
-            weight_scales[row] * input_scale;
-    }
-}
-
-__global__ void exact_packed_fp16_gemv_kernel(
-    const uint8_t* __restrict__ payload,
-    size_t payload_bytes,
-    const float* __restrict__ weight_scales,
-    const __half* __restrict__ input,
-    float* __restrict__ output,
-    int rows,
-    int cols,
-    int bits
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    const int32_t qmax = static_cast<int32_t>((1u << (bits - 1)) - 1u);
-    float partial = 0.0f;
-
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        const size_t index = static_cast<size_t>(row) * cols + col;
-        const uint32_t code = extract_code_device(
-            payload, payload_bytes, index, bits
-        );
-        const int32_t q_weight = static_cast<int32_t>(code) - qmax;
-        const __half weight = __float2half_rn(
-            static_cast<float>(q_weight) * weight_scales[row]
-        );
-        partial += __half2float(__hmul(weight, input[col]));
-    }
-
-    __shared__ float reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[row] = reduction[0];
-    }
-}
-
-__global__ void fp16_gemv_kernel(
-    const __half* __restrict__ weights,
-    const __half* __restrict__ input,
-    float* __restrict__ output,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    float partial = 0.0f;
-    const __half* row_ptr = weights + static_cast<size_t>(row) * cols;
-
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        partial += __half2float(__hmul(row_ptr[col], input[col]));
-    }
-
-    __shared__ float reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        output[row] = reduction[0];
-    }
-}
-
-#pragma pack(push, 1)
-struct MLB2Header {
-    char magic[4];
-    uint16_t version;
-    uint16_t header_bytes;
-    uint32_t rows;
-    uint32_t cols;
-    uint8_t storage_bits;
-    uint8_t compute_type;
-    uint16_t flags;
-    uint32_t scale_count;
-    uint64_t scale_bytes;
-    uint64_t payload_bytes;
-    uint64_t original_fp16_bytes;
-};
-#pragma pack(pop)
-
-static_assert(sizeof(MLB2Header) == 48, "Unexpected MLB2Header size");
-
-class ElasticBitExactMatrixV2 {
-public:
-    ElasticBitExactMatrixV2(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
-        int storage_bits
-    ) {
-        initialize_from_weights(weights, storage_bits);
-    }
-
-    ~ElasticBitExactMatrixV2() {
-        release_device_memory();
-    }
-
-    ElasticBitExactMatrixV2(const ElasticBitExactMatrixV2&) = delete;
-    ElasticBitExactMatrixV2& operator=(const ElasticBitExactMatrixV2&) = delete;
-
-    static std::unique_ptr<ElasticBitExactMatrixV2> from_auto(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
-        py::array_t<float, py::array::c_style | py::array::forcecast> calibration,
-        double threshold,
-        int min_bits = 4,
-        int max_bits = 32
-    ) {
-        const int selected = select_storage_bits(
-            weights, calibration, threshold, min_bits, max_bits
-        );
-
-        return std::unique_ptr<ElasticBitExactMatrixV2>(
-            new ElasticBitExactMatrixV2(weights, selected)
-        );
-    }
-
-    py::array_t<float> forward(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input
-    ) {
-        auto input_info = input.request();
-        if (input_info.ndim != 1 || input_info.shape[0] != cols_) {
-            throw std::invalid_argument("input must have shape [cols]");
-        }
-
-        ensure_io_buffers();
-        prepare_selected_input(static_cast<const float*>(input_info.ptr));
-        launch_selected_kernel();
-
-        py::array_t<float> output(rows_);
-        auto output_info = output.request();
-
-        CUDA_CHECK(cudaMemcpy(
-            output_info.ptr,
-            d_output_,
-            static_cast<size_t>(rows_) * sizeof(float),
-            cudaMemcpyDeviceToHost
-        ));
-
-        return output;
-    }
-
-    py::array_t<float> forward_fp16(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input
-    ) {
-        auto input_info = input.request();
-        if (input_info.ndim != 1 || input_info.shape[0] != cols_) {
-            throw std::invalid_argument("input must have shape [cols]");
-        }
-
-        ensure_io_buffers();
-        prepare_fp16_input(static_cast<const float*>(input_info.ptr));
-        launch_fp16_baseline_kernel();
-
-        py::array_t<float> output(rows_);
-        auto output_info = output.request();
-
-        CUDA_CHECK(cudaMemcpy(
-            output_info.ptr,
-            d_output_,
-            static_cast<size_t>(rows_) * sizeof(float),
-            cudaMemcpyDeviceToHost
-        ));
-
-        return output;
-    }
-
-    py::array_t<float> forward_reference(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input
-    ) const {
-        auto input_info = input.request();
-        if (input_info.ndim != 1 || input_info.shape[0] != cols_) {
-            throw std::invalid_argument("input must have shape [cols]");
-        }
-
-        const float* input_ptr = static_cast<const float*>(input_info.ptr);
-        py::array_t<float> output(rows_);
-        auto output_info = output.request();
-        float* output_ptr = static_cast<float*>(output_info.ptr);
-
-        if (storage_bits_ <= 8) {
-            const int32_t input_qmax = storage_bits_ == 4 ? 7 : 127;
-            float input_max_abs = 0.0f;
-            for (int col = 0; col < cols_; ++col) {
-                input_max_abs = std::max(input_max_abs, std::fabs(input_ptr[col]));
-            }
-            const float input_scale = input_max_abs > 0.0f
-                ? input_max_abs / static_cast<float>(input_qmax)
-                : 1.0f;
-
-            std::vector<int8_t> input_q(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                int32_t q = static_cast<int32_t>(
-                    std::nearbyint(input_ptr[col] / input_scale)
-                );
-                q = std::max(-input_qmax, std::min(input_qmax, q));
-                input_q[col] = static_cast<int8_t>(q);
-            }
-
-            const int32_t weight_qmax = static_cast<int32_t>(
-                qmax_for_bits(storage_bits_)
-            );
-
-            for (int row = 0; row < rows_; ++row) {
-                int64_t integer_sum = 0;
-                for (int col = 0; col < cols_; ++col) {
-                    const size_t index = static_cast<size_t>(row) * cols_ + col;
-                    const uint32_t code = extract_code_host(
-                        payload_.data(), payload_.size(), index, storage_bits_
-                    );
-                    const int32_t q_weight = static_cast<int32_t>(code) - weight_qmax;
-                    integer_sum += static_cast<int64_t>(q_weight) *
-                        static_cast<int32_t>(input_q[col]);
-                }
-                output_ptr[row] = static_cast<float>(integer_sum) *
-                    scales_[row] * input_scale;
-            }
-        } else {
-            std::vector<float> input_half(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                input_half[col] = round_to_fp16_host(input_ptr[col]);
-            }
-
-            if (storage_bits_ == 16) {
-                const __half* weights_half = reinterpret_cast<const __half*>(
-                    payload_.data()
-                );
-                for (int row = 0; row < rows_; ++row) {
-                    float sum = 0.0f;
-                    for (int col = 0; col < cols_; ++col) {
-                        const size_t index = static_cast<size_t>(row) * cols_ + col;
-                        sum += fp16_multiply_host(
-                            __half2float(weights_half[index]), input_half[col]
-                        );
-                    }
-                    output_ptr[row] = sum;
-                }
-            } else {
-                const int32_t weight_qmax = static_cast<int32_t>(
-                    qmax_for_bits(storage_bits_)
-                );
-                for (int row = 0; row < rows_; ++row) {
-                    float sum = 0.0f;
-                    for (int col = 0; col < cols_; ++col) {
-                        const size_t index = static_cast<size_t>(row) * cols_ + col;
-                        const uint32_t code = extract_code_host(
-                            payload_.data(), payload_.size(), index, storage_bits_
-                        );
-                        const int32_t q_weight = static_cast<int32_t>(code) - weight_qmax;
-                        const float weight_half = round_to_fp16_host(
-                            static_cast<float>(q_weight) * scales_[row]
-                        );
-                        sum += fp16_multiply_host(weight_half, input_half[col]);
-                    }
-                    output_ptr[row] = sum;
-                }
-            }
-        }
-
-        return output;
-    }
-
-    py::dict benchmark(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input,
-        int iterations = 500
-    ) {
-        if (iterations <= 0) {
-            throw std::invalid_argument("iterations must be positive");
-        }
-
-        auto input_info = input.request();
-        if (input_info.ndim != 1 || input_info.shape[0] != cols_) {
-            throw std::invalid_argument("input must have shape [cols]");
-        }
-
-        ensure_io_buffers();
-        prepare_selected_input(static_cast<const float*>(input_info.ptr));
-        prepare_fp16_input(static_cast<const float*>(input_info.ptr));
-
-        for (int warmup = 0; warmup < 20; ++warmup) {
-            launch_selected_kernel();
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        cudaEvent_t start;
-        cudaEvent_t stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-
-        CUDA_CHECK(cudaEventRecord(start));
-        for (int iteration = 0; iteration < iterations; ++iteration) {
-            launch_selected_kernel();
-        }
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-
-        float selected_total_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&selected_total_ms, start, stop));
-
-        for (int warmup = 0; warmup < 20; ++warmup) {
-            launch_fp16_baseline_kernel();
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaEventRecord(start));
-        for (int iteration = 0; iteration < iterations; ++iteration) {
-            launch_fp16_baseline_kernel();
-        }
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-
-        float fp16_total_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&fp16_total_ms, start, stop));
-
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-
-        const double selected_ms = selected_total_ms / iterations;
-        const double fp16_ms = fp16_total_ms / iterations;
-
-        py::dict result;
-        result["storage_bits"] = storage_bits_;
-        result["compute_type"] = compute_type_name(compute_type_);
-        result["selected_ms"] = selected_ms;
-        result["fp16_ms"] = fp16_ms;
-        result["speedup_vs_fp16"] = fp16_ms / selected_ms;
-        result["payload_bytes"] = payload_.size();
-        result["scale_bytes"] = scales_.size() * sizeof(float);
-        result["runtime_weight_bytes"] = runtime_weight_bytes();
-        result["fp16_weight_bytes"] = fp16_weight_bytes();
-        result["storage_reduction_vs_fp16"] = storage_reduction_vs_fp16();
-        return result;
-    }
-
-    py::array_t<float> dequantize() const {
-        std::vector<float> values = dequantize_payload_host(
-            payload_,
-            scales_,
-            rows_,
-            cols_,
-            storage_bits_,
-            true
-        );
-
-        py::array_t<float> output({rows_, cols_});
-        auto info = output.request();
-        std::memcpy(
-            info.ptr,
-            values.data(),
-            values.size() * sizeof(float)
-        );
-        return output;
-    }
-
-    void save(const std::string& path) const {
-        MLB2Header header{};
-        std::memcpy(header.magic, "MLB2", 4);
-        header.version = 2;
-        header.header_bytes = sizeof(MLB2Header);
-        header.rows = static_cast<uint32_t>(rows_);
-        header.cols = static_cast<uint32_t>(cols_);
-        header.storage_bits = static_cast<uint8_t>(storage_bits_);
-        header.compute_type = static_cast<uint8_t>(compute_type_);
-        header.flags = storage_bits_ == 16 ? 1u : 0u;
-        header.scale_count = static_cast<uint32_t>(scales_.size());
-        header.scale_bytes = scales_.size() * sizeof(float);
-        header.payload_bytes = payload_.size();
-        header.original_fp16_bytes = fp16_weight_bytes();
-
-        std::ofstream stream(path, std::ios::binary);
-        if (!stream) {
-            throw std::runtime_error("failed to open output file: " + path);
-        }
-
-        stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
-
-        if (!scales_.empty()) {
-            stream.write(
-                reinterpret_cast<const char*>(scales_.data()),
-                static_cast<std::streamsize>(header.scale_bytes)
-            );
-        }
-
-        stream.write(
-            reinterpret_cast<const char*>(payload_.data()),
-            static_cast<std::streamsize>(header.payload_bytes)
-        );
-
-        if (!stream) {
-            throw std::runtime_error("failed while writing: " + path);
-        }
-    }
-
-    static std::unique_ptr<ElasticBitExactMatrixV2> load(
-        const std::string& path
-    ) {
-        std::ifstream stream(path, std::ios::binary);
-        if (!stream) {
-            throw std::runtime_error("failed to open model file: " + path);
-        }
-
-        MLB2Header header{};
-        stream.read(reinterpret_cast<char*>(&header), sizeof(header));
-
-        if (!stream || std::memcmp(header.magic, "MLB2", 4) != 0) {
-            throw std::runtime_error("invalid MLB2 model file");
-        }
-        if (header.version != 2 || header.header_bytes != sizeof(MLB2Header)) {
-            throw std::runtime_error("unsupported MLB2 version");
-        }
-
-        validate_storage_bits(header.storage_bits);
-
-        std::vector<float> scales(header.scale_count);
-        if (header.scale_bytes != scales.size() * sizeof(float)) {
-            throw std::runtime_error("invalid MLB2 scale byte count");
-        }
-
-        if (!scales.empty()) {
-            stream.read(
-                reinterpret_cast<char*>(scales.data()),
-                static_cast<std::streamsize>(header.scale_bytes)
-            );
-        }
-
-        std::vector<uint8_t> payload(header.payload_bytes);
-        stream.read(
-            reinterpret_cast<char*>(payload.data()),
-            static_cast<std::streamsize>(header.payload_bytes)
-        );
-
-        if (!stream) {
-            throw std::runtime_error("truncated MLB2 model file");
-        }
-
-        return std::unique_ptr<ElasticBitExactMatrixV2>(
-            new ElasticBitExactMatrixV2(
-                static_cast<int>(header.rows),
-                static_cast<int>(header.cols),
-                static_cast<int>(header.storage_bits),
-                std::move(scales),
-                std::move(payload)
-            )
-        );
-    }
-
-    int rows() const { return rows_; }
-    int cols() const { return cols_; }
-    int storage_bits() const { return storage_bits_; }
-    std::string compute_type() const { return compute_type_name(compute_type_); }
-    size_t payload_bytes() const { return payload_.size(); }
-    size_t scale_bytes() const { return scales_.size() * sizeof(float); }
-    size_t runtime_weight_bytes() const {
-        return payload_.size() + scales_.size() * sizeof(float);
-    }
-    size_t fp16_weight_bytes() const {
-        return static_cast<size_t>(rows_) * cols_ * sizeof(__half);
-    }
-    double storage_reduction_vs_fp16() const {
-        return 1.0 - static_cast<double>(runtime_weight_bytes()) /
-            static_cast<double>(fp16_weight_bytes());
-    }
-
-private:
-    int rows_ = 0;
-    int cols_ = 0;
-    int storage_bits_ = 16;
-    ComputeType compute_type_ = ComputeType::FP16;
-
-    std::vector<float> scales_;
-    std::vector<uint8_t> payload_;
-    std::vector<__half> fp16_baseline_;
-
-    uint8_t* d_payload_ = nullptr;
-    float* d_scales_ = nullptr;
-    __half* d_fp16_baseline_ = nullptr;
-    int8_t* d_input_q_ = nullptr;
-    __half* d_input_half_ = nullptr;
-    float* d_output_ = nullptr;
-    float current_input_scale_ = 1.0f;
-
-    ElasticBitExactMatrixV2(
-        int rows,
-        int cols,
-        int storage_bits,
-        std::vector<float>&& scales,
-        std::vector<uint8_t>&& payload
-    ) :
-        rows_(rows),
-        cols_(cols),
-        storage_bits_(storage_bits),
-        compute_type_(compute_type_for_bits(storage_bits)),
-        scales_(std::move(scales)),
-        payload_(std::move(payload))
-    {
-        const std::vector<float> reconstructed = dequantize_payload_host(
-            payload_, scales_, rows_, cols_, storage_bits_, true
-        );
-
-        fp16_baseline_.resize(reconstructed.size());
-        for (size_t index = 0; index < reconstructed.size(); ++index) {
-            fp16_baseline_[index] = __float2half_rn(reconstructed[index]);
-        }
-
-        upload_weights();
-    }
-
-    void initialize_from_weights(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
-        int storage_bits
-    ) {
-        validate_storage_bits(storage_bits);
-
-        auto info = weights.request();
-        if (info.ndim != 2) {
-            throw std::invalid_argument("weights must be a 2D float32 array");
-        }
-
-        rows_ = static_cast<int>(info.shape[0]);
-        cols_ = static_cast<int>(info.shape[1]);
-        storage_bits_ = storage_bits;
-        compute_type_ = compute_type_for_bits(storage_bits_);
-
-        const float* weight_ptr = static_cast<const float*>(info.ptr);
-
-        scales_ = make_row_scales(
-            weight_ptr, rows_, cols_, storage_bits_
-        );
-        payload_ = pack_exact_weights(
-            weight_ptr, rows_, cols_, storage_bits_, scales_
-        );
-
-        const size_t count = static_cast<size_t>(rows_) * cols_;
-        fp16_baseline_.resize(count);
-        for (size_t index = 0; index < count; ++index) {
-            fp16_baseline_[index] = __float2half_rn(weight_ptr[index]);
-        }
-
-        upload_weights();
-    }
-
-    static int select_storage_bits(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
-        py::array_t<float, py::array::c_style | py::array::forcecast> calibration,
-        double threshold,
-        int min_bits,
-        int max_bits
-    ) {
-        auto weight_info = weights.request();
-        auto calibration_info = calibration.request();
-
-        if (weight_info.ndim != 2) {
-            throw std::invalid_argument("weights must be 2D");
-        }
-        if (calibration_info.ndim != 2) {
-            throw std::invalid_argument("calibration must be 2D");
-        }
-
-        const int rows = static_cast<int>(weight_info.shape[0]);
-        const int cols = static_cast<int>(weight_info.shape[1]);
-        const int samples = static_cast<int>(calibration_info.shape[0]);
-
-        if (calibration_info.shape[1] != cols) {
-            throw std::invalid_argument("calibration width must equal weight cols");
-        }
-
-        const auto analyses = analyze_all_bits(
-            static_cast<const float*>(weight_info.ptr),
-            rows,
-            cols,
-            static_cast<const float*>(calibration_info.ptr),
-            samples,
-            min_bits,
-            max_bits
-        );
-
-        for (const auto& analysis : analyses) {
-            if (analysis.error <= threshold) {
-                return analysis.bits;
-            }
-        }
-
-        return max_bits;
-    }
-
-    void upload_weights() {
-        release_device_memory();
-
-        CUDA_CHECK(cudaMalloc(
-            reinterpret_cast<void**>(&d_payload_),
-            std::max<size_t>(payload_.size(), 1u)
-        ));
-        CUDA_CHECK(cudaMemcpy(
-            d_payload_, payload_.data(), payload_.size(), cudaMemcpyHostToDevice
-        ));
-
-        if (!scales_.empty()) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_scales_),
-                scales_.size() * sizeof(float)
-            ));
-            CUDA_CHECK(cudaMemcpy(
-                d_scales_,
-                scales_.data(),
-                scales_.size() * sizeof(float),
-                cudaMemcpyHostToDevice
-            ));
-        }
-
-        CUDA_CHECK(cudaMalloc(
-            reinterpret_cast<void**>(&d_fp16_baseline_),
-            fp16_baseline_.size() * sizeof(__half)
-        ));
-        CUDA_CHECK(cudaMemcpy(
-            d_fp16_baseline_,
-            fp16_baseline_.data(),
-            fp16_baseline_.size() * sizeof(__half),
-            cudaMemcpyHostToDevice
-        ));
-    }
-
-    void ensure_io_buffers() {
-        if (!d_input_q_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_input_q_),
-                static_cast<size_t>(cols_) * sizeof(int8_t)
-            ));
-        }
-        if (!d_input_half_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_input_half_),
-                static_cast<size_t>(cols_) * sizeof(__half)
-            ));
-        }
-        if (!d_output_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_output_),
-                static_cast<size_t>(rows_) * sizeof(float)
-            ));
-        }
-    }
-
-    void prepare_selected_input(const float* input) {
-        if (storage_bits_ <= 8) {
-            const int32_t input_qmax = storage_bits_ == 4 ? 7 : 127;
-            float max_abs = 0.0f;
-            for (int col = 0; col < cols_; ++col) {
-                max_abs = std::max(max_abs, std::fabs(input[col]));
-            }
-            current_input_scale_ = max_abs > 0.0f
-                ? max_abs / static_cast<float>(input_qmax)
-                : 1.0f;
-
-            std::vector<int8_t> quantized(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                int32_t q = static_cast<int32_t>(
-                    std::nearbyint(input[col] / current_input_scale_)
-                );
-                q = std::max(-input_qmax, std::min(input_qmax, q));
-                quantized[col] = static_cast<int8_t>(q);
-            }
-
-            CUDA_CHECK(cudaMemcpy(
-                d_input_q_,
-                quantized.data(),
-                static_cast<size_t>(cols_) * sizeof(int8_t),
-                cudaMemcpyHostToDevice
-            ));
-        } else {
-            prepare_fp16_input(input);
-        }
-    }
-
-    void prepare_fp16_input(const float* input) {
-        std::vector<__half> converted(cols_);
-        for (int col = 0; col < cols_; ++col) {
-            converted[col] = __float2half_rn(input[col]);
-        }
-        CUDA_CHECK(cudaMemcpy(
-            d_input_half_,
-            converted.data(),
-            static_cast<size_t>(cols_) * sizeof(__half),
-            cudaMemcpyHostToDevice
-        ));
-    }
-
-    void launch_selected_kernel() {
-        constexpr int threads = 256;
-
-        if (storage_bits_ == 16) {
-            fp16_gemv_kernel<<<rows_, threads>>>(
-                reinterpret_cast<const __half*>(d_payload_),
-                d_input_half_,
-                d_output_,
-                rows_,
-                cols_
-            );
-        } else if (storage_bits_ == 4) {
-            direct_int4_gemv_kernel<<<rows_, threads>>>(
-                d_payload_,
-                d_scales_,
-                d_input_q_,
-                current_input_scale_,
-                d_output_,
-                rows_,
-                cols_
-            );
-        } else if (storage_bits_ == 8) {
-            direct_int8_gemv_kernel<<<rows_, threads>>>(
-                d_payload_,
-                d_scales_,
-                d_input_q_,
-                current_input_scale_,
-                d_output_,
-                rows_,
-                cols_
-            );
-        } else if (storage_bits_ <= 8) {
-            exact_packed_integer_gemv_kernel<<<rows_, threads>>>(
-                d_payload_,
-                payload_.size(),
-                d_scales_,
-                d_input_q_,
-                current_input_scale_,
-                d_output_,
-                rows_,
-                cols_,
-                storage_bits_
-            );
-        } else {
-            exact_packed_fp16_gemv_kernel<<<rows_, threads>>>(
-                d_payload_,
-                payload_.size(),
-                d_scales_,
-                d_input_half_,
-                d_output_,
-                rows_,
-                cols_,
-                storage_bits_
-            );
-        }
-
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    void launch_fp16_baseline_kernel() {
-        constexpr int threads = 256;
-        fp16_gemv_kernel<<<rows_, threads>>>(
-            d_fp16_baseline_,
-            d_input_half_,
-            d_output_,
-            rows_,
-            cols_
-        );
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    void release_device_memory() {
-        if (d_payload_) {
-            cudaFree(d_payload_);
-            d_payload_ = nullptr;
-        }
-        if (d_scales_) {
-            cudaFree(d_scales_);
-            d_scales_ = nullptr;
-        }
-        if (d_fp16_baseline_) {
-            cudaFree(d_fp16_baseline_);
-            d_fp16_baseline_ = nullptr;
-        }
-        if (d_input_q_) {
-            cudaFree(d_input_q_);
-            d_input_q_ = nullptr;
-        }
-        if (d_input_half_) {
-            cudaFree(d_input_half_);
-            d_input_half_ = nullptr;
-        }
-        if (d_output_) {
-            cudaFree(d_output_);
-            d_output_ = nullptr;
-        }
-    }
-};
-
-static py::dict bitsAnaliser_py(
+static py::dict analyze_py(
     py::array_t<float, py::array::c_style | py::array::forcecast> weights,
     py::array_t<float, py::array::c_style | py::array::forcecast> calibration,
-    double threshold,
-    int min_bits = 4,
-    int max_bits = 32
+    double threshold
 ) {
-    auto weight_info = weights.request();
-    auto calibration_info = calibration.request();
-
-    if (weight_info.ndim != 2 || calibration_info.ndim != 2) {
-        throw std::invalid_argument("weights and calibration must both be 2D");
+    auto w = weights.request();
+    auto c = calibration.request();
+    if (w.ndim != 2 || c.ndim != 2) {
+        throw std::invalid_argument("weights and calibrationData must both be 2D");
     }
-
-    const int rows = static_cast<int>(weight_info.shape[0]);
-    const int cols = static_cast<int>(weight_info.shape[1]);
-    const int samples = static_cast<int>(calibration_info.shape[0]);
-
-    if (calibration_info.shape[1] != cols) {
-        throw std::invalid_argument("calibration width must equal weight cols");
+    const int rows = static_cast<int>(w.shape[0]);
+    const int cols = static_cast<int>(w.shape[1]);
+    const int samples = static_cast<int>(c.shape[0]);
+    if (c.shape[1] != cols) {
+        throw std::invalid_argument("calibrationData width must equal weight cols");
     }
 
     const auto analyses = analyze_all_bits(
-        static_cast<const float*>(weight_info.ptr),
-        rows,
-        cols,
-        static_cast<const float*>(calibration_info.ptr),
-        samples,
-        min_bits,
-        max_bits
+        static_cast<const float*>(w.ptr), rows, cols,
+        static_cast<const float*>(c.ptr), samples
     );
+    const auto selected = select_analysis(analyses, threshold);
 
-    int selected_bits = max_bits;
-    double selected_error = analyses.back().error;
-
-    py::list entries;
-
-    for (const auto& analysis : analyses) {
-        py::dict entry;
-        entry["bits"] = analysis.bits;
-        entry["compute_type"] = compute_type_name(analysis.compute_type);
-        entry["error"] = analysis.error;
-        entry["payload_bytes"] = analysis.payload_bytes;
-        entry["scale_bytes"] = analysis.scale_bytes;
-        entry["runtime_weight_bytes"] = analysis.payload_bytes + analysis.scale_bytes;
-        entry["storage_reduction_vs_fp16"] = 1.0 -
-            static_cast<double>(analysis.payload_bytes + analysis.scale_bytes) /
-            static_cast<double>(static_cast<size_t>(rows) * cols * sizeof(__half));
-        entries.append(entry);
-
-        if (selected_bits == max_bits && analysis.error <= threshold) {
-            selected_bits = analysis.bits;
-            selected_error = analysis.error;
-        }
-    }
-
-    // The logic above cannot distinguish "selected max_bits" from
-    // "not selected yet". Re-run the simple first-pass deterministically.
-    selected_bits = max_bits;
-    selected_error = analyses.back().error;
-    for (const auto& analysis : analyses) {
-        if (analysis.error <= threshold) {
-            selected_bits = analysis.bits;
-            selected_error = analysis.error;
-            break;
-        }
+    py::list candidates;
+    const double original_bytes = static_cast<double>(
+        static_cast<size_t>(rows) * cols * sizeof(__half)
+    );
+    for (const auto& item : analyses) {
+        py::dict row;
+        row["bits"] = item.bits;
+        row["hardwareNativeError"] = item.hardware_native_error;
+        row["fullPrecisionError"] = item.full_precision_error;
+        row["error"] = item.error;
+        row["storageBytes"] = item.storage_bytes;
+        row["memoryReduction"] = 1.0 - static_cast<double>(item.storage_bytes) / original_bytes;
+        row["passes"] = item.error <= threshold;
+        candidates.append(row);
     }
 
     py::dict result;
     result["threshold"] = threshold;
-    result["selected_bits"] = selected_bits;
-    result["selected_error"] = selected_error;
-    result["selected_compute_type"] = compute_type_name(
-        compute_type_for_bits(selected_bits)
-    );
-    result["analyses"] = entries;
+    result["selectedBits"] = selected.bits;
+    result["selectedError"] = selected.error;
+    result["candidates"] = candidates;
     return result;
 }
 
+// -----------------------------------------------------------------------------
+// CUDA execution kernels. Activations are always FP16.
+// -----------------------------------------------------------------------------
 
-
-// ================================================================
-// ElasticBit production runtime
-// - Exact MLB3 storage
-// - Compact or fast runtime modes
-// - Direct signed-code widening for 5..8 bit fast mode
-// - No hidden FP16 benchmark copy in production matrices
-// ================================================================
-
-
-__global__ void fp32_gemv_kernel(
-    const float* __restrict__ weights,
-    const float* __restrict__ input,
-    float* __restrict__ output,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    float partial = 0.0f;
-    const float* row_ptr = weights + static_cast<size_t>(row) * cols;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        partial += row_ptr[col] * input[col];
-    }
-
-    __shared__ float reduction[256];
-    reduction[threadIdx.x] = partial;
+__device__ __forceinline__ float block_sum(float value) {
+    __shared__ float shared[256];
+    shared[threadIdx.x] = value;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
+        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
         __syncthreads();
     }
-    if (threadIdx.x == 0) {
-        output[row] = reduction[0];
-    }
+    return shared[0];
 }
 
-__global__ void exact_packed_fp32_gemv_kernel(
-    const uint8_t* __restrict__ payload,
-    size_t payload_bytes,
-    const float* __restrict__ weight_scales,
-    const float* __restrict__ input,
-    float* __restrict__ output,
+__device__ __forceinline__ int sign4(uint8_t nibble) {
+    const int value = static_cast<int>(nibble & 0x0fu);
+    return (value ^ 8) - 8;
+}
+
+__global__ void w4a16_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ scales,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
     int rows,
     int cols,
-    int bits
+    int row_bytes
 ) {
     const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    const int32_t qmax = static_cast<int32_t>((1u << (bits - 1)) - 1u);
+    if (row >= rows) return;
+    const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
     float partial = 0.0f;
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        const size_t index = static_cast<size_t>(row) * cols + col;
-        const uint32_t code = extract_code_device(payload, payload_bytes, index, bits);
-        const int32_t q_weight = static_cast<int32_t>(code) - qmax;
-        const float weight = static_cast<float>(q_weight) * weight_scales[row];
-        partial += weight * input[col];
+        const uint8_t packed = row_ptr[col >> 1];
+        const uint8_t nibble = (col & 1) ? (packed >> 4) : (packed & 0x0f);
+        const int q = sign4(nibble);
+        partial += __half2float(input[col]) * static_cast<float>(q);
     }
-
-    __shared__ float reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
+    const float sum = block_sum(partial);
     if (threadIdx.x == 0) {
-        output[row] = reduction[0];
+        output[row] = __float2half_rn(sum * scales[row]);
     }
 }
 
-__global__ void direct_signed_int8_gemv_kernel(
+__global__ void w8a16_gemv_kernel(
     const int8_t* __restrict__ weights,
-    const float* __restrict__ weight_scales,
-    const int8_t* __restrict__ input_q,
-    float input_scale,
-    float* __restrict__ output,
+    const float* __restrict__ scales,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
     int rows,
     int cols
 ) {
     const int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    int32_t partial = 0;
-    const size_t row_offset = static_cast<size_t>(row) * cols;
-
+    if (row >= rows) return;
+    const int8_t* row_ptr = weights + static_cast<size_t>(row) * cols;
+    float partial = 0.0f;
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        partial += static_cast<int32_t>(weights[row_offset + col]) *
-            static_cast<int32_t>(input_q[col]);
+        partial += __half2float(input[col]) * static_cast<float>(row_ptr[col]);
     }
-
-    __shared__ int32_t reduction[256];
-    reduction[threadIdx.x] = partial;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
+    const float sum = block_sum(partial);
     if (threadIdx.x == 0) {
-        output[row] = static_cast<float>(reduction[0]) *
-            weight_scales[row] * input_scale;
+        output[row] = __float2half_rn(sum * scales[row]);
     }
 }
 
-enum class RuntimeMode : uint8_t {
-    Compact = 1,
-    Fast = 2,
-};
-
-static RuntimeMode parse_runtime_mode(const std::string& mode) {
-    if (mode == "compact") {
-        return RuntimeMode::Compact;
+__global__ void w16a16_gemv_kernel(
+    const __half* __restrict__ weights,
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    int rows,
+    int cols
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const __half* row_ptr = weights + static_cast<size_t>(row) * cols;
+    float partial = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        partial += __half2float(row_ptr[col]) * __half2float(input[col]);
     }
-    if (mode == "fast") {
-        return RuntimeMode::Fast;
-    }
-    throw std::invalid_argument("runtime mode must be 'compact' or 'fast'");
+    const float sum = block_sum(partial);
+    if (threadIdx.x == 0) output[row] = __float2half_rn(sum);
 }
 
-static const char* runtime_mode_name(RuntimeMode mode) {
-    return mode == RuntimeMode::Compact ? "compact" : "fast";
+__global__ void w4_to_fp16_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ scales,
+    __half* __restrict__ output,
+    int rows,
+    int cols,
+    int row_bytes
+) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t count = static_cast<size_t>(rows) * cols;
+    if (index >= count) return;
+    const int row = static_cast<int>(index / cols);
+    const int col = static_cast<int>(index - static_cast<size_t>(row) * cols);
+    const uint8_t packed = weights[static_cast<size_t>(row) * row_bytes + (col >> 1)];
+    const uint8_t nibble = (col & 1) ? (packed >> 4) : (packed & 0x0f);
+    output[index] = __float2half_rn(static_cast<float>(sign4(nibble)) * scales[row]);
+}
+
+__global__ void w8_to_fp16_kernel(
+    const int8_t* __restrict__ weights,
+    const float* __restrict__ scales,
+    __half* __restrict__ output,
+    int rows,
+    int cols
+) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t count = static_cast<size_t>(rows) * cols;
+    if (index >= count) return;
+    const int row = static_cast<int>(index / cols);
+    output[index] = __float2half_rn(static_cast<float>(weights[index]) * scales[row]);
 }
 
 static uint64_t fnv1a64(const void* data, size_t size) {
@@ -1669,184 +564,122 @@ static uint64_t fnv1a64(const void* data, size_t size) {
 }
 
 #pragma pack(push, 1)
-struct MLB3Header {
+struct MLB4Header {
     char magic[4];
     uint16_t version;
     uint16_t header_bytes;
     uint32_t rows;
     uint32_t cols;
     uint8_t storage_bits;
-    uint8_t compute_type;
-    uint16_t flags;
+    uint8_t reserved[3];
     uint32_t scale_count;
     uint64_t scale_bytes;
     uint64_t payload_bytes;
     uint64_t original_fp16_bytes;
     uint64_t scale_checksum;
     uint64_t payload_checksum;
+    double threshold;
+    double selected_error;
 };
 #pragma pack(pop)
 
-static_assert(sizeof(MLB3Header) == 64, "Unexpected MLB3Header size");
+static_assert(sizeof(MLB4Header) == 80, "Unexpected MLB4Header size");
 
 class RuntimeMatrix {
 public:
-    RuntimeMatrix(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
-        int storage_bits,
-        const std::string& runtime_mode = "compact"
-    ) : mode_(parse_runtime_mode(runtime_mode)) {
-        initialize_from_weights(weights, storage_bits);
-    }
-
-    ~RuntimeMatrix() {
-        release_device_memory();
-    }
-
+    ~RuntimeMatrix() { release_device_memory(); }
     RuntimeMatrix(const RuntimeMatrix&) = delete;
     RuntimeMatrix& operator=(const RuntimeMatrix&) = delete;
 
-    static std::unique_ptr<RuntimeMatrix> from_auto(
+    static std::unique_ptr<RuntimeMatrix> compress(
         py::array_t<float, py::array::c_style | py::array::forcecast> weights,
         py::array_t<float, py::array::c_style | py::array::forcecast> calibration,
         double threshold,
-        const std::string& runtime_mode = "compact",
-        int min_bits = 4,
-        int max_bits = 32
+        const std::string& decode_policy = "hardwareNative"
     ) {
-        auto weight_info = weights.request();
-        auto calibration_info = calibration.request();
-        if (weight_info.ndim != 2 || calibration_info.ndim != 2) {
-            throw std::invalid_argument("weights and calibration must be 2D");
+        auto w = weights.request();
+        auto c = calibration.request();
+        if (w.ndim != 2 || c.ndim != 2) {
+            throw std::invalid_argument("weights and calibrationData must both be 2D");
         }
-        const int rows = static_cast<int>(weight_info.shape[0]);
-        const int cols = static_cast<int>(weight_info.shape[1]);
-        const int samples = static_cast<int>(calibration_info.shape[0]);
-        if (calibration_info.shape[1] != cols) {
-            throw std::invalid_argument("calibration width must equal weight cols");
+        const int rows = static_cast<int>(w.shape[0]);
+        const int cols = static_cast<int>(w.shape[1]);
+        const int samples = static_cast<int>(c.shape[0]);
+        if (c.shape[1] != cols) {
+            throw std::invalid_argument("calibrationData width must equal weight cols");
         }
-
         const auto analyses = analyze_all_bits(
-            static_cast<const float*>(weight_info.ptr),
-            rows,
-            cols,
-            static_cast<const float*>(calibration_info.ptr),
-            samples,
-            min_bits,
-            max_bits
+            static_cast<const float*>(w.ptr), rows, cols,
+            static_cast<const float*>(c.ptr), samples
         );
-
-        int selected_bits = max_bits;
-        for (const auto& analysis : analyses) {
-            if (analysis.error <= threshold) {
-                selected_bits = analysis.bits;
-                break;
-            }
-        }
-
-        return std::unique_ptr<RuntimeMatrix>(
-            new RuntimeMatrix(weights, selected_bits, runtime_mode)
-        );
+        const auto selected = select_analysis(analyses, threshold);
+        return std::unique_ptr<RuntimeMatrix>(new RuntimeMatrix(
+            weights, selected.bits, threshold, selected.error,
+            parse_decode_policy(decode_policy)
+        ));
     }
 
     static std::unique_ptr<RuntimeMatrix> load(
         const std::string& path,
-        const std::string& runtime_mode = "compact"
+        const std::string& decode_policy = "hardwareNative"
     ) {
         std::ifstream stream(path, std::ios::binary | std::ios::ate);
-        if (!stream) {
-            throw std::runtime_error("failed to open model file: " + path);
-        }
-
+        if (!stream) throw std::runtime_error("failed to open ElasticBit file: " + path);
         const std::streamsize file_size = stream.tellg();
         stream.seekg(0, std::ios::beg);
 
-        MLB3Header header{};
+        MLB4Header header{};
         stream.read(reinterpret_cast<char*>(&header), sizeof(header));
-
-        if (!stream || std::memcmp(header.magic, "MLB3", 4) != 0) {
-            throw std::runtime_error("invalid MLB3 model file");
+        if (!stream || std::memcmp(header.magic, "MLB4", 4) != 0) {
+            throw std::runtime_error("invalid ElasticBit MLB4 file");
         }
-        if (header.version != 3 || header.header_bytes != sizeof(MLB3Header)) {
-            throw std::runtime_error("unsupported MLB3 version");
+        if (header.version != 4 || header.header_bytes != sizeof(MLB4Header)) {
+            throw std::runtime_error("unsupported ElasticBit MLB4 version");
         }
-        if (header.rows == 0 || header.cols == 0) {
-            throw std::runtime_error("invalid MLB3 matrix dimensions");
-        }
-
         validate_storage_bits(header.storage_bits);
+        if (header.rows == 0 || header.cols == 0) {
+            throw std::runtime_error("invalid ElasticBit matrix dimensions");
+        }
 
         const size_t count = static_cast<size_t>(header.rows) * header.cols;
-        const size_t expected_payload = header.storage_bits == 16
+        const size_t expected_payload = header.storage_bits == kFallbackBits
             ? count * sizeof(__half)
-            : (header.storage_bits == 32
-                ? count * sizeof(float)
-                : packed_bytes_for_values(count, header.storage_bits));
-        const size_t expected_scales = (header.storage_bits == 16 || header.storage_bits == 32)
-            ? 0u
-            : static_cast<size_t>(header.rows);
+            : packed_bytes_for_values(count, header.storage_bits);
+        const size_t expected_scales = header.storage_bits == kFallbackBits
+            ? 0u : static_cast<size_t>(header.rows);
         const size_t expected_scale_bytes = expected_scales * sizeof(float);
-        const size_t expected_file_size = sizeof(MLB3Header) +
-            expected_scale_bytes + expected_payload;
+        const size_t expected_file_size = sizeof(MLB4Header) + expected_scale_bytes + expected_payload;
 
-        if (header.compute_type != static_cast<uint8_t>(
-                compute_type_for_bits(header.storage_bits))) {
-            throw std::runtime_error("MLB3 compute type does not match storage bits");
-        }
         if (header.scale_count != expected_scales ||
-            header.scale_bytes != expected_scale_bytes) {
-            throw std::runtime_error("invalid MLB3 scale metadata");
-        }
-        if (header.payload_bytes != expected_payload) {
-            throw std::runtime_error("invalid MLB3 payload size");
-        }
-        if (header.original_fp16_bytes != count * sizeof(__half)) {
-            throw std::runtime_error("invalid MLB3 FP16 reference size");
-        }
-        if (file_size != static_cast<std::streamsize>(expected_file_size)) {
-            throw std::runtime_error("MLB3 file size mismatch or trailing data");
+            header.scale_bytes != expected_scale_bytes ||
+            header.payload_bytes != expected_payload ||
+            header.original_fp16_bytes != count * sizeof(__half) ||
+            file_size != static_cast<std::streamsize>(expected_file_size)) {
+            throw std::runtime_error("invalid ElasticBit MLB4 metadata");
         }
 
         std::vector<float> scales(expected_scales);
         if (!scales.empty()) {
-            stream.read(
-                reinterpret_cast<char*>(scales.data()),
-                static_cast<std::streamsize>(expected_scale_bytes)
-            );
+            stream.read(reinterpret_cast<char*>(scales.data()), expected_scale_bytes);
         }
-
         std::vector<uint8_t> payload(expected_payload);
-        stream.read(
-            reinterpret_cast<char*>(payload.data()),
-            static_cast<std::streamsize>(expected_payload)
-        );
-
-        if (!stream) {
-            throw std::runtime_error("truncated MLB3 model file");
-        }
+        stream.read(reinterpret_cast<char*>(payload.data()), expected_payload);
+        if (!stream) throw std::runtime_error("truncated ElasticBit MLB4 file");
 
         const uint64_t scale_checksum = scales.empty()
             ? fnv1a64(nullptr, 0)
             : fnv1a64(scales.data(), expected_scale_bytes);
-        const uint64_t payload_checksum = fnv1a64(
-            payload.data(), payload.size()
-        );
-
-        if (scale_checksum != header.scale_checksum ||
-            payload_checksum != header.payload_checksum) {
-            throw std::runtime_error("MLB3 checksum mismatch");
+        const uint64_t payload_checksum = fnv1a64(payload.data(), payload.size());
+        if (scale_checksum != header.scale_checksum || payload_checksum != header.payload_checksum) {
+            throw std::runtime_error("ElasticBit MLB4 checksum mismatch");
         }
 
-        return std::unique_ptr<RuntimeMatrix>(
-            new RuntimeMatrix(
-                static_cast<int>(header.rows),
-                static_cast<int>(header.cols),
-                static_cast<int>(header.storage_bits),
-                parse_runtime_mode(runtime_mode),
-                std::move(scales),
-                std::move(payload)
-            )
-        );
+        return std::unique_ptr<RuntimeMatrix>(new RuntimeMatrix(
+            static_cast<int>(header.rows), static_cast<int>(header.cols),
+            static_cast<int>(header.storage_bits), header.threshold,
+            header.selected_error, parse_decode_policy(decode_policy),
+            std::move(scales), std::move(payload)
+        ));
     }
 
     py::array_t<float> forward(
@@ -1856,604 +689,50 @@ public:
         if (info.ndim != 1 || info.shape[0] != cols_) {
             throw std::invalid_argument("input must have shape [cols]");
         }
-
-        ensure_io_buffers();
-        prepare_input(static_cast<const float*>(info.ptr));
-        launch_kernel();
-
-        py::array_t<float> output(rows_);
-        auto output_info = output.request();
-        CUDA_CHECK(cudaMemcpy(
-            output_info.ptr,
-            d_output_,
-            static_cast<size_t>(rows_) * sizeof(float),
-            cudaMemcpyDeviceToHost
-        ));
-        return output;
-    }
-
-    py::array_t<float> forward_reference(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input
-    ) const {
-        auto info = input.request();
-        if (info.ndim != 1 || info.shape[0] != cols_) {
-            throw std::invalid_argument("input must have shape [cols]");
-        }
-        const float* input_ptr = static_cast<const float*>(info.ptr);
-
-        py::array_t<float> output(rows_);
-        auto output_info = output.request();
-        float* output_ptr = static_cast<float*>(output_info.ptr);
-
-        if (storage_bits_ <= 8) {
-            const int32_t input_qmax = storage_bits_ == 4 ? 7 : 127;
-            float input_max_abs = 0.0f;
-            for (int col = 0; col < cols_; ++col) {
-                input_max_abs = std::max(input_max_abs, std::fabs(input_ptr[col]));
-            }
-            const float input_scale = input_max_abs > 0.0f
-                ? input_max_abs / static_cast<float>(input_qmax)
-                : 1.0f;
-            std::vector<int8_t> input_q(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                int32_t q = static_cast<int32_t>(
-                    std::nearbyint(input_ptr[col] / input_scale)
-                );
-                q = std::max(-input_qmax, std::min(input_qmax, q));
-                input_q[col] = static_cast<int8_t>(q);
-            }
-
-            const int32_t weight_qmax = static_cast<int32_t>(
-                qmax_for_bits(storage_bits_)
-            );
-            for (int row = 0; row < rows_; ++row) {
-                int64_t sum = 0;
-                for (int col = 0; col < cols_; ++col) {
-                    const size_t index = static_cast<size_t>(row) * cols_ + col;
-                    const uint32_t code = extract_code_host(
-                        payload_.data(), payload_.size(), index, storage_bits_
-                    );
-                    const int32_t q_weight = static_cast<int32_t>(code) - weight_qmax;
-                    sum += static_cast<int64_t>(q_weight) * input_q[col];
-                }
-                output_ptr[row] = static_cast<float>(sum) *
-                    scales_[row] * input_scale;
-            }
-        } else if (storage_bits_ <= 16) {
-            std::vector<float> input_half(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                input_half[col] = round_to_fp16_host(input_ptr[col]);
-            }
-            const std::vector<float> weights = dequantize_payload_host(
-                payload_, scales_, rows_, cols_, storage_bits_, true
-            );
-            for (int row = 0; row < rows_; ++row) {
-                float sum = 0.0f;
-                for (int col = 0; col < cols_; ++col) {
-                    const size_t index = static_cast<size_t>(row) * cols_ + col;
-                    sum += fp16_multiply_host(weights[index], input_half[col]);
-                }
-                output_ptr[row] = sum;
-            }
-        } else {
-            const std::vector<float> weights = dequantize_payload_host(
-                payload_, scales_, rows_, cols_, storage_bits_, false
-            );
-            for (int row = 0; row < rows_; ++row) {
-                float sum = 0.0f;
-                for (int col = 0; col < cols_; ++col) {
-                    const size_t index = static_cast<size_t>(row) * cols_ + col;
-                    sum += weights[index] * input_ptr[col];
-                }
-                output_ptr[row] = sum;
-            }
-        }
-        return output;
-    }
-
-    double benchmark(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input,
-        int iterations = 500
-    ) {
-        if (iterations <= 0) {
-            throw std::invalid_argument("iterations must be positive");
-        }
-        auto info = input.request();
-        if (info.ndim != 1 || info.shape[0] != cols_) {
-            throw std::invalid_argument("input must have shape [cols]");
-        }
-
-        ensure_io_buffers();
-        prepare_input(static_cast<const float*>(info.ptr));
-        for (int warmup = 0; warmup < 20; ++warmup) {
-            launch_kernel();
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        cudaEvent_t start;
-        cudaEvent_t stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-        CUDA_CHECK(cudaEventRecord(start));
-        for (int iteration = 0; iteration < iterations; ++iteration) {
-            launch_kernel();
-        }
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float total_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-        return static_cast<double>(total_ms) / iterations;
-    }
-
-    py::array_t<float> dequantize() const {
-        const std::vector<float> values = dequantize_payload_host(
-            payload_, scales_, rows_, cols_, storage_bits_, true
-        );
-        py::array_t<float> output({rows_, cols_});
-        auto info = output.request();
-        std::memcpy(info.ptr, values.data(), values.size() * sizeof(float));
-        return output;
-    }
-
-    void save(const std::string& path) const {
-        MLB3Header header{};
-        std::memcpy(header.magic, "MLB3", 4);
-        header.version = 3;
-        header.header_bytes = sizeof(MLB3Header);
-        header.rows = static_cast<uint32_t>(rows_);
-        header.cols = static_cast<uint32_t>(cols_);
-        header.storage_bits = static_cast<uint8_t>(storage_bits_);
-        header.compute_type = static_cast<uint8_t>(compute_type_);
-        header.flags = 1u;
-        header.scale_count = static_cast<uint32_t>(scales_.size());
-        header.scale_bytes = scales_.size() * sizeof(float);
-        header.payload_bytes = payload_.size();
-        header.original_fp16_bytes = fp16_weight_bytes();
-        header.scale_checksum = scales_.empty()
-            ? fnv1a64(nullptr, 0)
-            : fnv1a64(scales_.data(), header.scale_bytes);
-        header.payload_checksum = fnv1a64(payload_.data(), payload_.size());
-
-        std::ofstream stream(path, std::ios::binary);
-        if (!stream) {
-            throw std::runtime_error("failed to open output file: " + path);
-        }
-        stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
-        if (!scales_.empty()) {
-            stream.write(
-                reinterpret_cast<const char*>(scales_.data()),
-                static_cast<std::streamsize>(header.scale_bytes)
-            );
-        }
-        stream.write(
-            reinterpret_cast<const char*>(payload_.data()),
-            static_cast<std::streamsize>(header.payload_bytes)
-        );
-        if (!stream) {
-            throw std::runtime_error("failed while writing: " + path);
-        }
-    }
-
-    int rows() const { return rows_; }
-    int cols() const { return cols_; }
-    int storage_bits() const { return storage_bits_; }
-    std::string compute_type() const { return compute_type_name(compute_type_); }
-    std::string runtime_mode() const { return runtime_mode_name(mode_); }
-    size_t file_payload_bytes() const { return payload_.size(); }
-    size_t file_scale_bytes() const { return scales_.size() * sizeof(float); }
-    size_t file_weight_bytes() const { return file_payload_bytes() + file_scale_bytes(); }
-    size_t fp16_weight_bytes() const {
-        return static_cast<size_t>(rows_) * cols_ * sizeof(__half);
-    }
-    size_t gpu_weight_bytes() const { return gpu_weight_bytes_; }
-    double file_reduction_vs_fp16() const {
-        return 1.0 - static_cast<double>(file_weight_bytes()) /
-            static_cast<double>(fp16_weight_bytes());
-    }
-    double gpu_reduction_vs_fp16() const {
-        return 1.0 - static_cast<double>(gpu_weight_bytes_) /
-            static_cast<double>(fp16_weight_bytes());
-    }
-
-private:
-    int rows_ = 0;
-    int cols_ = 0;
-    int storage_bits_ = 16;
-    ComputeType compute_type_ = ComputeType::FP16;
-    RuntimeMode mode_ = RuntimeMode::Compact;
-
-    std::vector<float> scales_;
-    std::vector<uint8_t> payload_;
-
-    uint8_t* d_compact_payload_ = nullptr;
-    float* d_scales_ = nullptr;
-    int8_t* d_fast_int8_ = nullptr;
-    __half* d_fast_half_ = nullptr;
-    float* d_fast_float_ = nullptr;
-    int8_t* d_input_q_ = nullptr;
-    __half* d_input_half_ = nullptr;
-    float* d_input_float_ = nullptr;
-    float* d_output_ = nullptr;
-    float current_input_scale_ = 1.0f;
-    size_t gpu_weight_bytes_ = 0;
-
-    RuntimeMatrix(
-        int rows,
-        int cols,
-        int storage_bits,
-        RuntimeMode mode,
-        std::vector<float>&& scales,
-        std::vector<uint8_t>&& payload
-    ) :
-        rows_(rows),
-        cols_(cols),
-        storage_bits_(storage_bits),
-        compute_type_(compute_type_for_bits(storage_bits)),
-        mode_(mode),
-        scales_(std::move(scales)),
-        payload_(std::move(payload))
-    {
-        initialize_runtime_weights();
-    }
-
-    void initialize_from_weights(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
-        int storage_bits
-    ) {
-        validate_storage_bits(storage_bits);
-        auto info = weights.request();
-        if (info.ndim != 2) {
-            throw std::invalid_argument("weights must be a 2D float32 array");
-        }
-        rows_ = static_cast<int>(info.shape[0]);
-        cols_ = static_cast<int>(info.shape[1]);
-        storage_bits_ = storage_bits;
-        compute_type_ = compute_type_for_bits(storage_bits_);
-        const float* weight_ptr = static_cast<const float*>(info.ptr);
-        scales_ = make_row_scales(weight_ptr, rows_, cols_, storage_bits_);
-        payload_ = pack_exact_weights(
-            weight_ptr, rows_, cols_, storage_bits_, scales_
-        );
-        initialize_runtime_weights();
-    }
-
-    void initialize_runtime_weights() {
-        release_weight_memory();
-        const size_t count = static_cast<size_t>(rows_) * cols_;
-
-        if (mode_ == RuntimeMode::Compact) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_compact_payload_),
-                std::max<size_t>(payload_.size(), 1u)
-            ));
-            CUDA_CHECK(cudaMemcpy(
-                d_compact_payload_, payload_.data(), payload_.size(),
-                cudaMemcpyHostToDevice
-            ));
-            gpu_weight_bytes_ = payload_.size();
-            if (!scales_.empty()) {
-                upload_scales();
-                gpu_weight_bytes_ += scales_.size() * sizeof(float);
-            }
-            return;
-        }
-
-        if (storage_bits_ == 4) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_compact_payload_),
-                std::max<size_t>(payload_.size(), 1u)
-            ));
-            CUDA_CHECK(cudaMemcpy(
-                d_compact_payload_, payload_.data(), payload_.size(),
-                cudaMemcpyHostToDevice
-            ));
-            upload_scales();
-            gpu_weight_bytes_ = payload_.size() + scales_.size() * sizeof(float);
-            return;
-        }
-
-        if (storage_bits_ <= 8) {
-            std::vector<int8_t> widened(count);
-            const int32_t qmax = static_cast<int32_t>(qmax_for_bits(storage_bits_));
-            for (size_t index = 0; index < count; ++index) {
-                const uint32_t code = extract_code_host(
-                    payload_.data(), payload_.size(), index, storage_bits_
-                );
-                widened[index] = static_cast<int8_t>(
-                    static_cast<int32_t>(code) - qmax
-                );
-            }
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_fast_int8_),
-                count * sizeof(int8_t)
-            ));
-            CUDA_CHECK(cudaMemcpy(
-                d_fast_int8_, widened.data(), count * sizeof(int8_t),
-                cudaMemcpyHostToDevice
-            ));
-            upload_scales();
-            gpu_weight_bytes_ = count * sizeof(int8_t) +
-                scales_.size() * sizeof(float);
-            return;
-        }
-
-        if (storage_bits_ <= 16) {
-            std::vector<__half> widened_half(count);
-            if (storage_bits_ == 16) {
-                std::memcpy(
-                    widened_half.data(), payload_.data(), count * sizeof(__half)
-                );
-            } else {
-                const std::vector<float> values = dequantize_payload_host(
-                    payload_, scales_, rows_, cols_, storage_bits_, true
-                );
-                for (size_t index = 0; index < count; ++index) {
-                    widened_half[index] = __float2half_rn(values[index]);
-                }
-            }
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_fast_half_),
-                count * sizeof(__half)
-            ));
-            CUDA_CHECK(cudaMemcpy(
-                d_fast_half_, widened_half.data(), count * sizeof(__half),
-                cudaMemcpyHostToDevice
-            ));
-            gpu_weight_bytes_ = count * sizeof(__half);
-            return;
-        }
-
-        std::vector<float> widened_float(count);
-        if (storage_bits_ == 32) {
-            std::memcpy(widened_float.data(), payload_.data(), count * sizeof(float));
-        } else {
-            widened_float = dequantize_payload_host(
-                payload_, scales_, rows_, cols_, storage_bits_, false
-            );
-        }
-        CUDA_CHECK(cudaMalloc(
-            reinterpret_cast<void**>(&d_fast_float_),
-            count * sizeof(float)
-        ));
-        CUDA_CHECK(cudaMemcpy(
-            d_fast_float_, widened_float.data(), count * sizeof(float),
-            cudaMemcpyHostToDevice
-        ));
-        gpu_weight_bytes_ = count * sizeof(float);
-    }
-
-    void upload_scales() {
-        if (scales_.empty()) {
-            return;
-        }
-        CUDA_CHECK(cudaMalloc(
-            reinterpret_cast<void**>(&d_scales_),
-            scales_.size() * sizeof(float)
-        ));
-        CUDA_CHECK(cudaMemcpy(
-            d_scales_, scales_.data(), scales_.size() * sizeof(float),
-            cudaMemcpyHostToDevice
-        ));
-    }
-
-    void ensure_io_buffers() {
-        if (!d_input_q_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_input_q_),
-                static_cast<size_t>(cols_) * sizeof(int8_t)
-            ));
-        }
-        if (!d_input_half_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_input_half_),
-                static_cast<size_t>(cols_) * sizeof(__half)
-            ));
-        }
-        if (!d_input_float_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_input_float_),
-                static_cast<size_t>(cols_) * sizeof(float)
-            ));
-        }
-        if (!d_output_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_output_),
-                static_cast<size_t>(rows_) * sizeof(float)
-            ));
-        }
-    }
-
-    void prepare_input(const float* input) {
-        if (storage_bits_ <= 8) {
-            const int32_t input_qmax = storage_bits_ == 4 ? 7 : 127;
-            float max_abs = 0.0f;
-            for (int col = 0; col < cols_; ++col) {
-                max_abs = std::max(max_abs, std::fabs(input[col]));
-            }
-            current_input_scale_ = max_abs > 0.0f
-                ? max_abs / static_cast<float>(input_qmax)
-                : 1.0f;
-            std::vector<int8_t> quantized(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                int32_t q = static_cast<int32_t>(
-                    std::nearbyint(input[col] / current_input_scale_)
-                );
-                q = std::max(-input_qmax, std::min(input_qmax, q));
-                quantized[col] = static_cast<int8_t>(q);
-            }
-            CUDA_CHECK(cudaMemcpy(
-                d_input_q_, quantized.data(), static_cast<size_t>(cols_) * sizeof(int8_t),
-                cudaMemcpyHostToDevice
-            ));
-        } else if (storage_bits_ <= 16) {
-            std::vector<__half> converted(cols_);
-            for (int col = 0; col < cols_; ++col) {
-                converted[col] = __float2half_rn(input[col]);
-            }
-            CUDA_CHECK(cudaMemcpy(
-                d_input_half_, converted.data(), static_cast<size_t>(cols_) * sizeof(__half),
-                cudaMemcpyHostToDevice
-            ));
-        } else {
-            CUDA_CHECK(cudaMemcpy(
-                d_input_float_, input, static_cast<size_t>(cols_) * sizeof(float),
-                cudaMemcpyHostToDevice
-            ));
-        }
-    }
-
-    void launch_kernel() {
-        constexpr int threads = 256;
-        if (mode_ == RuntimeMode::Fast) {
-            if (storage_bits_ == 4) {
-                direct_int4_gemv_kernel<<<rows_, threads>>>(
-                    d_compact_payload_, d_scales_, d_input_q_, current_input_scale_,
-                    d_output_, rows_, cols_
-                );
-            } else if (storage_bits_ <= 8) {
-                direct_signed_int8_gemv_kernel<<<rows_, threads>>>(
-                    d_fast_int8_, d_scales_, d_input_q_, current_input_scale_,
-                    d_output_, rows_, cols_
-                );
-            } else if (storage_bits_ <= 16) {
-                fp16_gemv_kernel<<<rows_, threads>>>(
-                    d_fast_half_, d_input_half_, d_output_, rows_, cols_
-                );
-            } else {
-                fp32_gemv_kernel<<<rows_, threads>>>(
-                    d_fast_float_, d_input_float_, d_output_, rows_, cols_
-                );
-            }
-        } else {
-            if (storage_bits_ == 16) {
-                fp16_gemv_kernel<<<rows_, threads>>>(
-                    reinterpret_cast<const __half*>(d_compact_payload_),
-                    d_input_half_, d_output_, rows_, cols_
-                );
-            } else if (storage_bits_ == 32) {
-                fp32_gemv_kernel<<<rows_, threads>>>(
-                    reinterpret_cast<const float*>(d_compact_payload_),
-                    d_input_float_, d_output_, rows_, cols_
-                );
-            } else if (storage_bits_ == 4) {
-                direct_int4_gemv_kernel<<<rows_, threads>>>(
-                    d_compact_payload_, d_scales_, d_input_q_, current_input_scale_,
-                    d_output_, rows_, cols_
-                );
-            } else if (storage_bits_ == 8) {
-                direct_int8_gemv_kernel<<<rows_, threads>>>(
-                    d_compact_payload_, d_scales_, d_input_q_, current_input_scale_,
-                    d_output_, rows_, cols_
-                );
-            } else if (storage_bits_ <= 8) {
-                exact_packed_integer_gemv_kernel<<<rows_, threads>>>(
-                    d_compact_payload_, payload_.size(), d_scales_, d_input_q_,
-                    current_input_scale_, d_output_, rows_, cols_, storage_bits_
-                );
-            } else if (storage_bits_ <= 16) {
-                exact_packed_fp16_gemv_kernel<<<rows_, threads>>>(
-                    d_compact_payload_, payload_.size(), d_scales_, d_input_half_,
-                    d_output_, rows_, cols_, storage_bits_
-                );
-            } else {
-                exact_packed_fp32_gemv_kernel<<<rows_, threads>>>(
-                    d_compact_payload_, payload_.size(), d_scales_, d_input_float_,
-                    d_output_, rows_, cols_, storage_bits_
-                );
-            }
-        }
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    void release_weight_memory() {
-        if (d_compact_payload_) {
-            cudaFree(d_compact_payload_);
-            d_compact_payload_ = nullptr;
-        }
-        if (d_scales_) {
-            cudaFree(d_scales_);
-            d_scales_ = nullptr;
-        }
-        if (d_fast_int8_) {
-            cudaFree(d_fast_int8_);
-            d_fast_int8_ = nullptr;
-        }
-        if (d_fast_half_) {
-            cudaFree(d_fast_half_);
-            d_fast_half_ = nullptr;
-        }
-        if (d_fast_float_) {
-            cudaFree(d_fast_float_);
-            d_fast_float_ = nullptr;
-        }
-        gpu_weight_bytes_ = 0;
-    }
-
-    void release_device_memory() {
-        release_weight_memory();
-        if (d_input_q_) {
-            cudaFree(d_input_q_);
-            d_input_q_ = nullptr;
-        }
-        if (d_input_half_) {
-            cudaFree(d_input_half_);
-            d_input_half_ = nullptr;
-        }
-        if (d_input_float_) {
-            cudaFree(d_input_float_);
-            d_input_float_ = nullptr;
-        }
-        if (d_output_) {
-            cudaFree(d_output_);
-            d_output_ = nullptr;
-        }
-    }
-};
-
-class NativeFP16Matrix {
-public:
-    explicit NativeFP16Matrix(
-        py::array_t<float, py::array::c_style | py::array::forcecast> weights
-    ) {
-        auto info = weights.request();
-        if (info.ndim != 2) {
-            throw std::invalid_argument("weights must be a 2D float32 array");
-        }
-        rows_ = static_cast<int>(info.shape[0]);
-        cols_ = static_cast<int>(info.shape[1]);
-        const size_t count = static_cast<size_t>(rows_) * cols_;
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        ensure_host_io();
+        std::vector<__half> converted(cols_);
         const float* source = static_cast<const float*>(info.ptr);
-        std::vector<__half> converted(count);
-        for (size_t index = 0; index < count; ++index) {
-            converted[index] = __float2half_rn(source[index]);
-        }
-        CUDA_CHECK(cudaMalloc(
-            reinterpret_cast<void**>(&d_weights_), count * sizeof(__half)
-        ));
+        for (int col = 0; col < cols_; ++col) converted[col] = __float2half_rn(source[col]);
         CUDA_CHECK(cudaMemcpy(
-            d_weights_, converted.data(), count * sizeof(__half), cudaMemcpyHostToDevice
+            d_host_input_, converted.data(), static_cast<size_t>(cols_) * sizeof(__half),
+            cudaMemcpyHostToDevice
         ));
-    }
-
-    ~NativeFP16Matrix() {
-        if (d_weights_) cudaFree(d_weights_);
-        if (d_input_) cudaFree(d_input_);
-        if (d_output_) cudaFree(d_output_);
-    }
-
-    py::array_t<float> forward(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input
-    ) {
-        prepare(input);
-        launch();
-        py::array_t<float> output(rows_);
-        auto info = output.request();
+        launch(d_host_input_, d_host_output_, nullptr);
+        std::vector<__half> host_output(rows_);
         CUDA_CHECK(cudaMemcpy(
-            info.ptr, d_output_, static_cast<size_t>(rows_) * sizeof(float),
+            host_output.data(), d_host_output_, static_cast<size_t>(rows_) * sizeof(__half),
             cudaMemcpyDeviceToHost
         ));
+        py::array_t<float> output(rows_);
+        auto out = output.request();
+        float* out_ptr = static_cast<float*>(out.ptr);
+        for (int row = 0; row < rows_; ++row) out_ptr[row] = __half2float(host_output[row]);
+        return output;
+    }
+
+    torch::Tensor forward_torch(torch::Tensor input) {
+        if (!input.is_cuda()) throw std::invalid_argument("forwardTorch requires a CUDA tensor");
+        if (input.scalar_type() != torch::kFloat16) {
+            throw std::invalid_argument("forwardTorch requires FP16 activations");
+        }
+        if (!input.is_contiguous()) input = input.contiguous();
+        if (input.dim() < 1 || input.size(-1) != cols_ || input.numel() != cols_) {
+            throw std::invalid_argument("forwardTorch supports exactly one M=1 activation row");
+        }
+        if (input.get_device() != device_id_) {
+            throw std::invalid_argument("input CUDA device does not match RuntimeMatrix device");
+        }
+
+        std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
+        shape.back() = rows_;
+        auto output = torch::empty(shape, input.options());
+        auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
+        launch(
+            reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+            reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+            stream.stream()
+        );
         return output;
     }
 
@@ -2462,152 +741,473 @@ public:
         int iterations = 500
     ) {
         if (iterations <= 0) throw std::invalid_argument("iterations must be positive");
-        prepare(input);
-        for (int warmup = 0; warmup < 20; ++warmup) launch();
-        CUDA_CHECK(cudaDeviceSynchronize());
-        cudaEvent_t start;
-        cudaEvent_t stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-        CUDA_CHECK(cudaEventRecord(start));
-        for (int iteration = 0; iteration < iterations; ++iteration) launch();
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float total_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
-        CUDA_CHECK(cudaEventDestroy(start));
-        CUDA_CHECK(cudaEventDestroy(stop));
-        return static_cast<double>(total_ms) / iterations;
-    }
-
-    size_t gpu_weight_bytes() const {
-        return static_cast<size_t>(rows_) * cols_ * sizeof(__half);
-    }
-
-private:
-    int rows_ = 0;
-    int cols_ = 0;
-    __half* d_weights_ = nullptr;
-    __half* d_input_ = nullptr;
-    float* d_output_ = nullptr;
-
-    void prepare(
-        py::array_t<float, py::array::c_style | py::array::forcecast> input
-    ) {
         auto info = input.request();
         if (info.ndim != 1 || info.shape[0] != cols_) {
             throw std::invalid_argument("input must have shape [cols]");
         }
-        if (!d_input_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_input_),
-                static_cast<size_t>(cols_) * sizeof(__half)
-            ));
-        }
-        if (!d_output_) {
-            CUDA_CHECK(cudaMalloc(
-                reinterpret_cast<void**>(&d_output_),
-                static_cast<size_t>(rows_) * sizeof(float)
-            ));
-        }
-        const float* source = static_cast<const float*>(info.ptr);
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        ensure_host_io();
         std::vector<__half> converted(cols_);
-        for (int col = 0; col < cols_; ++col) {
-            converted[col] = __float2half_rn(source[col]);
-        }
+        const float* source = static_cast<const float*>(info.ptr);
+        for (int col = 0; col < cols_; ++col) converted[col] = __float2half_rn(source[col]);
         CUDA_CHECK(cudaMemcpy(
-            d_input_, converted.data(), static_cast<size_t>(cols_) * sizeof(__half),
+            d_host_input_, converted.data(), static_cast<size_t>(cols_) * sizeof(__half),
             cudaMemcpyHostToDevice
+        ));
+        for (int warmup = 0; warmup < 20; ++warmup) launch(d_host_input_, d_host_output_, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < iterations; ++i) launch(d_host_input_, d_host_output_, nullptr);
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        return static_cast<double>(ms) / iterations;
+    }
+
+    py::array_t<float> dequantize() const {
+        const auto values = dequantize_payload_host(payload_, scales_, rows_, cols_, storage_bits_);
+        py::array_t<float> output({rows_, cols_});
+        auto info = output.request();
+        std::memcpy(info.ptr, values.data(), values.size() * sizeof(float));
+        return output;
+    }
+
+    void set_decode_policy(const std::string& value) {
+        const DecodePolicy next = parse_decode_policy(value);
+        if (next == decode_policy_) return;
+        decode_policy_ = next;
+        configure_execution_weights();
+    }
+
+    torch::Tensor materialize_torch() {
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        auto options = torch::TensorOptions()
+            .dtype(torch::kFloat16)
+            .device(torch::Device(torch::kCUDA, device_id_));
+        auto output = torch::empty({rows_, cols_}, options);
+        auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
+        __half* out = reinterpret_cast<__half*>(output.data_ptr<at::Half>());
+        const size_t count = static_cast<size_t>(rows_) * cols_;
+
+        if (d_w16_) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                out, d_w16_, count * sizeof(__half), cudaMemcpyDeviceToDevice, stream.stream()
+            ));
+            return output;
+        }
+
+        constexpr int threads = 256;
+        const int blocks = static_cast<int>((count + threads - 1) / threads);
+        if (d_w4_) {
+            const int row_bytes = (cols_ + 1) / 2;
+            w4_to_fp16_kernel<<<blocks, threads, 0, stream.stream()>>>(
+                d_w4_, d_scales_, out, rows_, cols_, row_bytes
+            );
+        } else if (d_w8_) {
+            w8_to_fp16_kernel<<<blocks, threads, 0, stream.stream()>>>(
+                d_w8_, d_scales_, out, rows_, cols_
+            );
+        } else {
+            throw std::runtime_error("ElasticBit has no materialized execution weights");
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
+
+    void save(const std::string& path) const {
+        MLB4Header header{};
+        std::memcpy(header.magic, "MLB4", 4);
+        header.version = 4;
+        header.header_bytes = sizeof(MLB4Header);
+        header.rows = static_cast<uint32_t>(rows_);
+        header.cols = static_cast<uint32_t>(cols_);
+        header.storage_bits = static_cast<uint8_t>(storage_bits_);
+        header.scale_count = static_cast<uint32_t>(scales_.size());
+        header.scale_bytes = scales_.size() * sizeof(float);
+        header.payload_bytes = payload_.size();
+        header.original_fp16_bytes = original_bytes();
+        header.scale_checksum = scales_.empty() ? fnv1a64(nullptr, 0) : fnv1a64(scales_.data(), header.scale_bytes);
+        header.payload_checksum = fnv1a64(payload_.data(), payload_.size());
+        header.threshold = threshold_;
+        header.selected_error = selected_error_;
+
+        std::ofstream stream(path, std::ios::binary);
+        if (!stream) throw std::runtime_error("failed to open ElasticBit output: " + path);
+        stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        if (!scales_.empty()) {
+            stream.write(reinterpret_cast<const char*>(scales_.data()), header.scale_bytes);
+        }
+        stream.write(reinterpret_cast<const char*>(payload_.data()), header.payload_bytes);
+        if (!stream) throw std::runtime_error("failed while writing ElasticBit output");
+    }
+
+    int rows() const { return rows_; }
+    int cols() const { return cols_; }
+    int storage_bits() const { return storage_bits_; }
+    int execution_width() const { return planned_execution_width_; }
+    std::string execution_planner() const { return execution_planner_; }
+    std::string decode_policy() const { return decode_policy_name(decode_policy_); }
+    std::string activate_dtype() const { return "float16"; }
+    size_t storage_bytes() const { return payload_.size() + scales_.size() * sizeof(float); }
+    size_t execution_bytes() const { return execution_bytes_; }
+    size_t original_bytes() const { return static_cast<size_t>(rows_) * cols_ * sizeof(__half); }
+    double memory_reduction() const {
+        return 1.0 - static_cast<double>(storage_bytes()) / static_cast<double>(original_bytes());
+    }
+    double threshold() const { return threshold_; }
+    double error() const { return selected_error_; }
+    py::tuple shape() const { return py::make_tuple(rows_, cols_); }
+
+private:
+    int rows_ = 0;
+    int cols_ = 0;
+    int storage_bits_ = kFallbackBits;
+    double threshold_ = 0.0;
+    double selected_error_ = 0.0;
+    DecodePolicy decode_policy_ = DecodePolicy::HardwareNative;
+    int device_id_ = 0;
+    int planned_execution_width_ = 16;
+    std::string execution_planner_ = "fullPrecision";
+
+    std::vector<float> scales_;
+    std::vector<uint8_t> payload_;
+
+    uint8_t* d_w4_ = nullptr;
+    int8_t* d_w8_ = nullptr;
+    __half* d_w16_ = nullptr;
+    float* d_scales_ = nullptr;
+    __half* d_host_input_ = nullptr;
+    __half* d_host_output_ = nullptr;
+    size_t execution_bytes_ = 0;
+
+    RuntimeMatrix(
+        py::array_t<float, py::array::c_style | py::array::forcecast> weights,
+        int bits,
+        double threshold,
+        double selected_error,
+        DecodePolicy policy
+    ) : storage_bits_(bits), threshold_(threshold), selected_error_(selected_error), decode_policy_(policy) {
+        validate_storage_bits(bits);
+        auto info = weights.request();
+        if (info.ndim != 2) throw std::invalid_argument("weights must be 2D");
+        rows_ = static_cast<int>(info.shape[0]);
+        cols_ = static_cast<int>(info.shape[1]);
+        CUDA_CHECK(cudaGetDevice(&device_id_));
+        const float* ptr = static_cast<const float*>(info.ptr);
+        scales_ = make_row_scales(ptr, rows_, cols_, storage_bits_);
+        payload_ = pack_exact_weights(ptr, rows_, cols_, storage_bits_, scales_);
+        configure_execution_weights();
+    }
+
+    RuntimeMatrix(
+        int rows,
+        int cols,
+        int bits,
+        double threshold,
+        double selected_error,
+        DecodePolicy policy,
+        std::vector<float>&& scales,
+        std::vector<uint8_t>&& payload
+    ) : rows_(rows), cols_(cols), storage_bits_(bits), threshold_(threshold),
+        selected_error_(selected_error), decode_policy_(policy), scales_(std::move(scales)),
+        payload_(std::move(payload)) {
+        CUDA_CHECK(cudaGetDevice(&device_id_));
+        configure_execution_weights();
+    }
+
+    void upload_scales() {
+        if (scales_.empty()) return;
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_scales_), scales_.size() * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(
+            d_scales_, scales_.data(), scales_.size() * sizeof(float), cudaMemcpyHostToDevice
         ));
     }
 
-    void launch() {
+    bool is_validated_t4() const {
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id_));
+        const std::string name(prop.name);
+        return prop.major == 7 && prop.minor == 5 && name.find("T4") != std::string::npos;
+    }
+
+    std::vector<int> legal_execution_widths() const {
+        if (storage_bits_ <= 4) return {4, 8, 16};
+        if (storage_bits_ <= 8) return {8, 16};
+        return {16};
+    }
+
+    void initialize_execution_weights_for_width(int width) {
+        release_weight_memory();
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        const size_t count = static_cast<size_t>(rows_) * cols_;
+
+        if (width == 16) {
+            const auto values = dequantize_payload_host(payload_, scales_, rows_, cols_, storage_bits_);
+            std::vector<__half> half_values(count);
+            for (size_t i = 0; i < count; ++i) half_values[i] = __float2half_rn(values[i]);
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_w16_), count * sizeof(__half)));
+            CUDA_CHECK(cudaMemcpy(
+                d_w16_, half_values.data(), count * sizeof(__half), cudaMemcpyHostToDevice
+            ));
+            execution_bytes_ = count * sizeof(__half);
+            return;
+        }
+
+        if (width != 4 && width != 8) {
+            throw std::invalid_argument("ElasticBit execution width must be 4, 8, or 16");
+        }
+        if (width == 4 && storage_bits_ > 4) {
+            throw std::invalid_argument("W4A16 cannot represent this ElasticBit storage width");
+        }
+        if (width == 8 && storage_bits_ > 8) {
+            throw std::invalid_argument("W8A16 cannot represent this ElasticBit storage width");
+        }
+
+        upload_scales();
+        execution_bytes_ = scales_.size() * sizeof(float);
+        const int32_t qmax = static_cast<int32_t>(qmax_for_bits(storage_bits_));
+
+        if (width == 4) {
+            const int row_bytes = (cols_ + 1) / 2;
+            std::vector<uint8_t> packed(static_cast<size_t>(rows_) * row_bytes, 0u);
+            for (int row = 0; row < rows_; ++row) {
+                for (int col = 0; col < cols_; ++col) {
+                    const size_t index = static_cast<size_t>(row) * cols_ + col;
+                    const uint32_t code = extract_code_host(payload_.data(), payload_.size(), index, storage_bits_);
+                    const int32_t q = static_cast<int32_t>(code) - qmax;
+                    const uint8_t nibble = static_cast<uint8_t>(q) & 0x0fu;
+                    uint8_t& target = packed[static_cast<size_t>(row) * row_bytes + (col >> 1)];
+                    if (col & 1) target |= static_cast<uint8_t>(nibble << 4);
+                    else target |= nibble;
+                }
+            }
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_w4_), packed.size()));
+            CUDA_CHECK(cudaMemcpy(d_w4_, packed.data(), packed.size(), cudaMemcpyHostToDevice));
+            execution_bytes_ += packed.size();
+            return;
+        }
+
+        std::vector<int8_t> widened(count);
+        for (size_t index = 0; index < count; ++index) {
+            const uint32_t code = extract_code_host(payload_.data(), payload_.size(), index, storage_bits_);
+            widened[index] = static_cast<int8_t>(static_cast<int32_t>(code) - qmax);
+        }
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_w8_), count * sizeof(int8_t)));
+        CUDA_CHECK(cudaMemcpy(d_w8_, widened.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice));
+        execution_bytes_ += count * sizeof(int8_t);
+    }
+
+    double benchmark_current_width(int width) {
+        ensure_host_io();
+        std::vector<__half> host_input(cols_);
+        for (int col = 0; col < cols_; ++col) {
+            const float value = static_cast<float>((col % 29) - 14) / 14.0f;
+            host_input[col] = __float2half_rn(value);
+        }
+        CUDA_CHECK(cudaMemcpy(
+            d_host_input_, host_input.data(), static_cast<size_t>(cols_) * sizeof(__half),
+            cudaMemcpyHostToDevice
+        ));
+
+        constexpr int warmups = 6;
+        constexpr int iterations = 24;
+        for (int i = 0; i < warmups; ++i) {
+            launch_width(width, d_host_input_, d_host_output_, nullptr);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < iterations; ++i) {
+            launch_width(width, d_host_input_, d_host_output_, nullptr);
+        }
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float milliseconds = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        return static_cast<double>(milliseconds) / iterations;
+    }
+
+    int autotune_execution_width() {
+        const auto candidates = legal_execution_widths();
+        if (candidates.size() == 1) return candidates.front();
+
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id_));
+        const int bucket = storage_bits_ <= 4 ? 4 : storage_bits_ <= 8 ? 8 : 16;
+        std::ostringstream keyStream;
+        keyStream << device_id_ << ':' << prop.major << '.' << prop.minor << ':'
+                  << rows_ << 'x' << cols_ << ':' << bucket;
+        const std::string key = keyStream.str();
+
+        static std::mutex cacheMutex;
+        static std::unordered_map<std::string, int> cache;
+        {
+            std::lock_guard<std::mutex> guard(cacheMutex);
+            const auto found = cache.find(key);
+            if (found != cache.end()) return found->second;
+        }
+
+        int best_width = candidates.front();
+        double best_ms = std::numeric_limits<double>::infinity();
+        for (int width : candidates) {
+            initialize_execution_weights_for_width(width);
+            const double elapsed = benchmark_current_width(width);
+            if (elapsed < best_ms) {
+                best_ms = elapsed;
+                best_width = width;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(cacheMutex);
+            cache[key] = best_width;
+        }
+        return best_width;
+    }
+
+    void configure_execution_weights() {
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        if (decode_policy_ == DecodePolicy::FullPrecision) {
+            planned_execution_width_ = 16;
+            execution_planner_ = "fullPrecision";
+            initialize_execution_weights_for_width(16);
+            return;
+        }
+
+        if (is_validated_t4()) {
+            planned_execution_width_ = execution_width_for_bits(storage_bits_);
+            execution_planner_ = "t4Validated";
+            initialize_execution_weights_for_width(planned_execution_width_);
+            return;
+        }
+
+        planned_execution_width_ = autotune_execution_width();
+        execution_planner_ = "cudaAutoTune";
+        initialize_execution_weights_for_width(planned_execution_width_);
+    }
+
+    void ensure_host_io() {
+        if (!d_host_input_) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_host_input_), static_cast<size_t>(cols_) * sizeof(__half)));
+        }
+        if (!d_host_output_) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_host_output_), static_cast<size_t>(rows_) * sizeof(__half)));
+        }
+    }
+
+    void launch_width(int width, const __half* input, __half* output, cudaStream_t stream) {
         constexpr int threads = 256;
-        fp16_gemv_kernel<<<rows_, threads>>>(
-            d_weights_, d_input_, d_output_, rows_, cols_
-        );
+        if (width == 4) {
+            const int row_bytes = (cols_ + 1) / 2;
+            w4a16_gemv_kernel<<<rows_, threads, 0, stream>>>(
+                d_w4_, d_scales_, input, output, rows_, cols_, row_bytes
+            );
+        } else if (width == 8) {
+            w8a16_gemv_kernel<<<rows_, threads, 0, stream>>>(
+                d_w8_, d_scales_, input, output, rows_, cols_
+            );
+        } else {
+            w16a16_gemv_kernel<<<rows_, threads, 0, stream>>>(
+                d_w16_, input, output, rows_, cols_
+            );
+        }
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    void launch(const __half* input, __half* output, cudaStream_t stream) {
+        launch_width(planned_execution_width_, input, output, stream);
+    }
+
+    void release_weight_memory() {
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        if (d_w4_) { cudaFree(d_w4_); d_w4_ = nullptr; }
+        if (d_w8_) { cudaFree(d_w8_); d_w8_ = nullptr; }
+        if (d_w16_) { cudaFree(d_w16_); d_w16_ = nullptr; }
+        if (d_scales_) { cudaFree(d_scales_); d_scales_ = nullptr; }
+        execution_bytes_ = 0;
+    }
+
+    void release_device_memory() {
+        release_weight_memory();
+        if (d_host_input_) { cudaFree(d_host_input_); d_host_input_ = nullptr; }
+        if (d_host_output_) { cudaFree(d_host_output_); d_host_output_ = nullptr; }
     }
 };
 
+static py::dict backend_info_py() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp prop{};
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    py::dict result;
+    result["device"] = std::string(prop.name);
+    result["deviceIndex"] = device;
+    result["architecture"] = "sm" + std::to_string(prop.major) + std::to_string(prop.minor);
+    result["weightWidths"] = py::make_tuple(4, 8, 16);
+    result["activateDType"] = "float16";
+    result["prefill"] = "native";
+    const std::string name(prop.name);
+    const bool validated_t4 = prop.major == 7 && prop.minor == 5 && name.find("T4") != std::string::npos;
+    result["decodePlanner"] = validated_t4 ? "t4Validated" : "cudaAutoTune";
+    result["validated"] = validated_t4;
+    return result;
+}
+
 PYBIND11_MODULE(_C, module) {
-    module.doc() = "ElasticBit exact-storage CUDA runtime";
+    module.doc() = "ElasticBit adaptive threshold-driven weight-only CUDA runtime";
 
     module.def(
-        "bitsAnaliser",
-        &bitsAnaliser_py,
+        "analyze",
+        &analyze_py,
         py::arg("weights"),
-        py::arg("calibration"),
-        py::arg("threshold"),
-        py::arg("min_bits") = 4,
-        py::arg("max_bits") = 32
+        py::arg("calibrationData"),
+        py::arg("threshold")
     );
+    module.def("backendInfo", &backend_info_py);
 
-    py::class_<
-        RuntimeMatrix,
-        std::unique_ptr<RuntimeMatrix>
-    >(
-        module,
-        "RuntimeMatrix",
-        py::module_local()
+    py::class_<RuntimeMatrix, std::unique_ptr<RuntimeMatrix>>(
+        module, "RuntimeMatrix", py::module_local()
     )
-        .def(
-            py::init<
-                py::array_t<float, py::array::c_style | py::array::forcecast>,
-                int,
-                const std::string&
-            >(),
-            py::arg("weights"),
-            py::arg("storage_bits"),
-            py::arg("runtime_mode") = "compact"
+        .def_static(
+            "compress", &RuntimeMatrix::compress,
+            py::arg("weights"), py::arg("calibrationData"), py::arg("threshold"),
+            py::arg("decodePolicy") = "hardwareNative"
         )
         .def_static(
-            "from_auto",
-            &RuntimeMatrix::from_auto,
-            py::arg("weights"),
-            py::arg("calibration"),
-            py::arg("threshold"),
-            py::arg("runtime_mode") = "compact",
-            py::arg("min_bits") = 4,
-            py::arg("max_bits") = 32
-        )
-        .def_static(
-            "load",
-            &RuntimeMatrix::load,
-            py::arg("path"),
-            py::arg("runtime_mode") = "compact"
+            "load", &RuntimeMatrix::load,
+            py::arg("path"), py::arg("decodePolicy") = "hardwareNative"
         )
         .def("forward", &RuntimeMatrix::forward)
-        .def("forward_reference", &RuntimeMatrix::forward_reference)
+        .def("forwardTorch", &RuntimeMatrix::forward_torch)
         .def("benchmark", &RuntimeMatrix::benchmark,
             py::arg("input"), py::arg("iterations") = 500)
         .def("dequantize", &RuntimeMatrix::dequantize)
+        .def("_materializeTorch", &RuntimeMatrix::materialize_torch)
+        .def("setDecodePolicy", &RuntimeMatrix::set_decode_policy)
         .def("save", &RuntimeMatrix::save)
         .def_property_readonly("rows", &RuntimeMatrix::rows)
         .def_property_readonly("cols", &RuntimeMatrix::cols)
-        .def_property_readonly("storage_bits", &RuntimeMatrix::storage_bits)
-        .def_property_readonly("compute_type", &RuntimeMatrix::compute_type)
-        .def_property_readonly("runtime_mode", &RuntimeMatrix::runtime_mode)
-        .def_property_readonly("file_payload_bytes", &RuntimeMatrix::file_payload_bytes)
-        .def_property_readonly("file_scale_bytes", &RuntimeMatrix::file_scale_bytes)
-        .def_property_readonly("file_weight_bytes", &RuntimeMatrix::file_weight_bytes)
-        .def_property_readonly("gpu_weight_bytes", &RuntimeMatrix::gpu_weight_bytes)
-        .def_property_readonly("fp16_weight_bytes", &RuntimeMatrix::fp16_weight_bytes)
-        .def_property_readonly("file_reduction_vs_fp16", &RuntimeMatrix::file_reduction_vs_fp16)
-        .def_property_readonly("gpu_reduction_vs_fp16", &RuntimeMatrix::gpu_reduction_vs_fp16);
-
-    py::class_<NativeFP16Matrix, std::unique_ptr<NativeFP16Matrix>>(
-        module,
-        "NativeFP16Matrix",
-        py::module_local()
-    )
-        .def(py::init<
-            py::array_t<float, py::array::c_style | py::array::forcecast>
-        >(), py::arg("weights"))
-        .def("forward", &NativeFP16Matrix::forward)
-        .def("benchmark", &NativeFP16Matrix::benchmark,
-            py::arg("input"), py::arg("iterations") = 500)
-        .def_property_readonly("gpu_weight_bytes", &NativeFP16Matrix::gpu_weight_bytes);
-
-
+        .def_property_readonly("shape", &RuntimeMatrix::shape)
+        .def_property_readonly("storageBits", &RuntimeMatrix::storage_bits)
+        .def_property_readonly("executionWidth", &RuntimeMatrix::execution_width)
+        .def_property_readonly("executionPlanner", &RuntimeMatrix::execution_planner)
+        .def_property_readonly("decodePolicy", &RuntimeMatrix::decode_policy)
+        .def_property_readonly("activateDType", &RuntimeMatrix::activate_dtype)
+        .def_property_readonly("storageBytes", &RuntimeMatrix::storage_bytes)
+        .def_property_readonly("executionBytes", &RuntimeMatrix::execution_bytes)
+        .def_property_readonly("originalBytes", &RuntimeMatrix::original_bytes)
+        .def_property_readonly("memoryReduction", &RuntimeMatrix::memory_reduction)
+        .def_property_readonly("threshold", &RuntimeMatrix::threshold)
+        .def_property_readonly("error", &RuntimeMatrix::error);
 }

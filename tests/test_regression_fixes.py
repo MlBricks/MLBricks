@@ -4,7 +4,7 @@ import json
 
 import torch
 
-from mlbricks import ESA, ElasticBit, ElasticEmbedding, ElasticLinear, ESAModel, ESAModelConfig, thunderBoost, save, load
+from mlbricks import ESA, ESAModel, ESAModelConfig, thunderBoost
 from mlbricks.planner import sequence_bucket
 
 
@@ -49,57 +49,6 @@ def test_prefill_compiled_alias_uses_direct_native_path(monkeypatch):
     assert alias[2] == native[2]
     assert not hasattr(model, "_compiled_prefill_cache")
     assert not hasattr(model, "_prefill_compile_failures")
-
-
-def test_elasticbit_init_state_and_checkpoint_roundtrip(tmp_path):
-    torch.manual_seed(0)
-    model = _tiny_model().eval()
-    ElasticBit(bits=4, group_size=8, scale_dtype=torch.float32).quantize_module(model)
-
-    assert isinstance(model.blocks[0].esa.layer.qgv, ElasticLinear)
-    state = model.blocks[0].esa.init_state(2)
-    assert state.shape == (2, 2, 4)
-
-    ids = torch.randint(0, 32, (1, 5))
-    reference, _ = model(ids)
-    path = tmp_path / "packed"
-    save(model, path)
-
-    metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
-    assert metadata["quantization"]["type"] == "elasticbit"
-
-    loaded = load(path, device="cpu").eval()
-    assert isinstance(loaded.blocks[0].esa.layer.qgv, ElasticLinear)
-    output, _ = loaded(ids)
-    torch.testing.assert_close(output, reference, atol=0, rtol=0)
-
-
-def test_elasticbit_caches_materialized_weight():
-    layer = torch.nn.Linear(8, 4, bias=False)
-    packed = ElasticBit(bits=4, group_size=8).linear(layer)
-    x = torch.randn(2, 8)
-    packed(x)
-    assert len(packed._dequant_cache) == 1
-    first = next(iter(packed._dequant_cache.values()))
-    packed(x)
-    second = next(iter(packed._dequant_cache.values()))
-    assert first.data_ptr() == second.data_ptr()
-
-
-def test_elasticbit_preserves_tied_storage_when_embeddings_are_included():
-    model = _tiny_model().eval()
-    ElasticBit(bits=4, group_size=8).quantize_module(model, include_embeddings=True)
-    assert isinstance(model.wte, ElasticEmbedding)
-    assert isinstance(model.lm_head, ElasticLinear)
-    assert model.wte.packed_weight.data_ptr() == model.lm_head.packed_weight.data_ptr()
-    assert model.wte.scales.data_ptr() == model.lm_head.scales.data_ptr()
-
-
-def test_elasticbit_does_not_duplicate_tied_lm_head_when_embeddings_excluded():
-    model = _tiny_model().eval()
-    ElasticBit(bits=4, group_size=8).quantize_module(model, include_embeddings=False)
-    assert not isinstance(model.wte, ElasticEmbedding)
-    assert not isinstance(model.lm_head, ElasticLinear)
 
 
 def test_batch_eos_is_persistent(monkeypatch):
@@ -159,25 +108,3 @@ def test_thunderboost_restores_eval_mode():
     assert boosted.training is False
 
 
-def test_elasticbit_tied_storage_survives_checkpoint_load(tmp_path):
-    model = _tiny_model().eval()
-    ElasticBit(bits=4, group_size=8).quantize_module(model, include_embeddings=True)
-    path = tmp_path / "packed_tied"
-    save(model, path)
-    loaded = load(path, device="cpu").eval()
-    assert isinstance(loaded.wte, ElasticEmbedding)
-    assert isinstance(loaded.lm_head, ElasticLinear)
-    assert loaded.wte.packed_weight.data_ptr() == loaded.lm_head.packed_weight.data_ptr()
-    ids = torch.randint(0, 32, (1, 3))
-    loaded(ids)
-    assert loaded.wte._dequant_cache is loaded.lm_head._dequant_cache
-
-
-def test_elasticbit_bitstream_roundtrip_for_all_supported_widths():
-    from mlbricks.elasticbit import _pack_unsigned, _unpack_unsigned
-
-    torch.manual_seed(4)
-    for bits in range(2, 9):
-        values = torch.randint(0, 1 << bits, (257,), dtype=torch.int16)
-        restored = _unpack_unsigned(_pack_unsigned(values, bits), values.numel(), bits)
-        assert torch.equal(values, restored)

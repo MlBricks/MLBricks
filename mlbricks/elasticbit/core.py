@@ -2,844 +2,712 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 # See LICENSE and LICENSING_NOTICE.md; commercial use requires a separate written license.
 
-"""ElasticBit portable weight quantization for MLBricks.
+"""ElasticBit adaptive threshold-driven weight compression.
 
-ElasticBit stores weights in a packed 2–8 bit representation. The cached
-portable runtime lazily materializes one dequantized execution weight, while
-the native CUDA ``runtime="packed"`` linear consumes the bitstream directly and
-avoids full-weight materialization. Both runtimes use the same checkpoint
-representation.
+Public contract
+---------------
+ElasticBit has no fixed-bit quantization API.  The user supplies representative
+calibration data and an allowed error threshold.  ElasticBit selects the
+smallest safe storage width automatically.
+
+Storage and execution are intentionally separate:
+
+* storage search: 3..15 bit, with FP16 as the threshold-preserving fallback;
+* ``hardwareNative`` decode: T4 uses the validated W4A16/W8A16/W16A16 map;
+  other CUDA GPUs auto-tune the legal built-in execution widths per matrix shape;
+* ``fullPrecision`` decode: every stored width executes as W16A16;
+* prefill materializes FP16 weights on-device and uses framework/vendor GEMM;
+* activations stay FP16 in every execution path.
+
+The analyzer validates both low-bit and full-precision arithmetic before
+accepting a storage width, so policy switching or hardware widening never
+requires recalibration or recompression.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+import io
+import json
+from pathlib import Path
+import tempfile
+from typing import Any, Iterable, Mapping, Sequence
+import zipfile
 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..runtime import normalize_backend
-from .native_api import RuntimeMatrix, NativeFP16Matrix, bitsAnaliser, available as native_runtime_available
-from ..planner import EXECUTION_PLANNER
+from .native_api import available as _nativeAvailable
+from .native_api import importError as _nativeImportError
+from .native_api import requireNative as _requireNative
 
 
-_DTYPE_NAMES: dict[torch.dtype, str] = {
-    torch.float16: "float16",
-    torch.bfloat16: "bfloat16",
-    torch.float32: "float32",
-    torch.float64: "float64",
-}
-_NAME_DTYPES = {name: dtype for dtype, name in _DTYPE_NAMES.items()}
+_VALID_POLICIES = {"hardwareNative", "fullPrecision"}
+_MODEL_FORMAT = "ElasticBitModel"
+_MODEL_FORMAT_VERSION = 1
 
 
-def _dtype_name(dtype: torch.dtype | None) -> str | None:
-    if dtype is None:
-        return None
-    if dtype not in _DTYPE_NAMES:
-        raise ValueError(f"Unsupported ElasticBit dtype: {dtype}")
-    return _DTYPE_NAMES[dtype]
+def _checkPolicy(value: str) -> str:
+    value = str(value)
+    if value not in _VALID_POLICIES:
+        raise ValueError("decodePolicy must be 'hardwareNative' or 'fullPrecision'")
+    return value
 
 
-def _dtype_from_name(name: str | None) -> torch.dtype | None:
-    if name is None:
-        return None
+def _toNumpy2D(value: Any, *, name: str) -> np.ndarray:
+    if torch.is_tensor(value):
+        value = value.detach().float().cpu().numpy()
+    array = np.asarray(value, dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be a 2D matrix")
+    return np.ascontiguousarray(array, dtype=np.float32)
+
+
+def _toCalibrationBatches(calibrationData: Any) -> list[Any]:
+    if torch.is_tensor(calibrationData) or isinstance(calibrationData, Mapping):
+        return [calibrationData]
+    if isinstance(calibrationData, (str, bytes)):
+        raise TypeError("calibrationData must contain model inputs, not text")
     try:
-        return _NAME_DTYPES[str(name)]
-    except KeyError as exc:
-        raise ValueError(f"Unknown ElasticBit dtype name: {name!r}") from exc
-
-
-@dataclass(frozen=True)
-class ElasticBitConfig:
-    """Configuration for symmetric group-wise weight quantization."""
-
-    bits: int = 4
-    group_size: int = 128
-    scale_dtype: torch.dtype = torch.float16
-    compute_dtype: torch.dtype | None = None
-    cache_dequantized: bool = True
-    runtime: str = "auto"
-    backend: str = "auto"
-
-    def __post_init__(self) -> None:
-        if not 2 <= self.bits <= 8:
-            raise ValueError("bits must be between 2 and 8")
-        if self.group_size <= 0:
-            raise ValueError("group_size must be positive")
-        if self.scale_dtype not in {torch.float16, torch.float32, torch.bfloat16}:
-            raise ValueError("scale_dtype must be float16, bfloat16, or float32")
-        if self.compute_dtype is not None and self.compute_dtype not in {
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-            torch.float64,
-        }:
-            raise ValueError("compute_dtype must be a floating-point dtype or None")
-        runtime = str(self.runtime).strip().lower()
-        if runtime not in {"auto", "cached", "packed"}:
-            raise ValueError("runtime must be one of: auto, cached, packed")
-        backend = normalize_backend(self.backend, warn_legacy=True)
-        # Legacy runtime names remain loadable, but backend is the canonical API.
-        if backend == "auto" and runtime == "packed":
-            backend = "native"
-        elif backend == "auto" and runtime == "cached":
-            backend = "pytorch"
-        object.__setattr__(self, "runtime", runtime)
-        object.__setattr__(self, "backend", backend)
-
-    def to_manifest(self) -> dict[str, Any]:
-        return {
-            "bits": int(self.bits),
-            "group_size": int(self.group_size),
-            "scale_dtype": _dtype_name(self.scale_dtype),
-            "compute_dtype": _dtype_name(self.compute_dtype),
-            "cache_dequantized": bool(self.cache_dequantized),
-            "runtime": self.runtime,
-            "backend": self.backend,
-        }
-
-    @classmethod
-    def from_manifest(cls, data: dict[str, Any]) -> "ElasticBitConfig":
-        return cls(
-            bits=int(data.get("bits", 4)),
-            group_size=int(data.get("group_size", 128)),
-            scale_dtype=_dtype_from_name(data.get("scale_dtype")) or torch.float16,
-            compute_dtype=_dtype_from_name(data.get("compute_dtype")),
-            cache_dequantized=bool(data.get("cache_dequantized", True)),
-            runtime=str(data.get("runtime", "auto")),
-            backend=str(data.get("backend", "auto")),
-        )
-
-
-@dataclass
-class PackedElasticBit:
-    packed: torch.Tensor
-    scales: torch.Tensor
-    shape: tuple[int, ...]
-    bits: int
-    group_size: int
-    original_numel: int
-
-    @property
-    def storage_bytes(self) -> int:
-        return (
-            self.packed.numel() * self.packed.element_size()
-            + self.scales.numel() * self.scales.element_size()
-        )
-
-
-def _pack_unsigned(values: torch.Tensor, bits: int) -> torch.Tensor:
-    """Pack unsigned values into a compact uint8 bitstream without Python loops."""
-    values = values.detach().to(device="cpu", dtype=torch.int64).flatten()
-    if values.numel() == 0:
-        return torch.empty(0, dtype=torch.uint8)
-    mask = (1 << bits) - 1
-    values = values & mask
-    bit_pos = torch.arange(values.numel(), dtype=torch.int64) * int(bits)
-    byte_index = bit_pos >> 3
-    offset = bit_pos & 7
-    output_size = (values.numel() * int(bits) + 7) // 8
-    accum = torch.zeros(output_size, dtype=torch.int64)
-
-    low = (values << offset) & 0xFF
-    accum.index_add_(0, byte_index, low)
-
-    spill_mask = offset + int(bits) > 8
-    if bool(spill_mask.any()):
-        spill_index = byte_index[spill_mask] + 1
-        high = values[spill_mask] >> (8 - offset[spill_mask])
-        accum.index_add_(0, spill_index, high)
-
-    return (accum & 0xFF).to(torch.uint8)
-
-
-def _unpack_unsigned(packed: torch.Tensor, count: int, bits: int) -> torch.Tensor:
-    """Vectorized unpack that runs on the same device as ``packed``."""
-    if count <= 0:
-        return torch.empty(0, dtype=torch.int16, device=packed.device)
-    data = packed.detach().to(dtype=torch.int64).flatten()
-    bit_pos = torch.arange(count, device=data.device, dtype=torch.int64) * int(bits)
-    byte_index = bit_pos >> 3
-    offset = bit_pos & 7
-    value = data[byte_index] >> offset
-    spill_mask = offset + int(bits) > 8
-    if bool(spill_mask.any()):
-        high = data[byte_index[spill_mask] + 1] << (8 - offset[spill_mask])
-        value = value.clone()
-        value[spill_mask] |= high
-    return (value & ((1 << bits) - 1)).to(torch.int16)
-
-
-def quantize_tensor(
-    tensor: torch.Tensor,
-    config: ElasticBitConfig | None = None,
-) -> PackedElasticBit:
-    """Quantize a floating tensor using symmetric per-group scaling."""
-    config = config or ElasticBitConfig()
-    if not tensor.is_floating_point():
-        raise TypeError("ElasticBit only quantizes floating-point tensors")
-
-    source = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous().flatten()
-    numel = source.numel()
-    groups = (numel + config.group_size - 1) // config.group_size
-    padded_numel = groups * config.group_size
-    if padded_numel != numel:
-        source = F.pad(source, (0, padded_numel - numel))
-    grouped = source.view(groups, config.group_size)
-
-    qmax = (1 << (config.bits - 1)) - 1
-    qmin = -(1 << (config.bits - 1))
-    max_abs = grouped.abs().amax(dim=1)
-    scales = torch.where(max_abs > 0, max_abs / qmax, torch.ones_like(max_abs))
-    quantized = torch.round(grouped / scales[:, None]).clamp(qmin, qmax).to(torch.int16)
-    unsigned = quantized - qmin
-
-    return PackedElasticBit(
-        packed=_pack_unsigned(unsigned, config.bits),
-        scales=scales.to(config.scale_dtype),
-        shape=tuple(tensor.shape),
-        bits=config.bits,
-        group_size=config.group_size,
-        original_numel=numel,
-    )
-
-
-def dequantize_tensor(
-    value: PackedElasticBit,
-    *,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """Restore a packed tensor, unpacking on the destination device when possible."""
-    target = value.packed.device if device is None else torch.device(device)
-    packed = value.packed.to(target, non_blocking=True)
-    scales = value.scales.to(target, non_blocking=True)
-    groups = scales.numel()
-    count = groups * value.group_size
-    unsigned = _unpack_unsigned(packed, count, value.bits).to(torch.int32)
-    qmin = -(1 << (value.bits - 1))
-    signed = unsigned + qmin
-    grouped = signed.view(groups, value.group_size).to(torch.float32)
-    restored = grouped * scales.to(torch.float32)[:, None]
-    restored = restored.flatten()[: value.original_numel].view(value.shape)
-    return restored.to(dtype=dtype)
-
-
-class _ElasticWeightMixin:
-    _dequant_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor]
-
-    def _init_cache(self) -> None:
-        self._dequant_cache = {}
-
-    def clear_cache(self) -> None:
-        self._dequant_cache.clear()
-
-    def _apply(self, fn):
-        self.clear_cache()
-        EXECUTION_PLANNER.clear_owner_routes(self)
-        return super()._apply(fn)
-
-    def _load_from_state_dict(self, *args, **kwargs):
-        self.clear_cache()
-        EXECUTION_PLANNER.clear_owner_routes(self)
-        return super()._load_from_state_dict(*args, **kwargs)
-
-    @property
-    def backend(self) -> str:
-        return self.config.backend
-
-    def set_backend(self, backend: str, *, recursive: bool = True):
-        del recursive
-        value = normalize_backend(backend, warn_legacy=True)
-        data = self.config.to_manifest()
-        data["backend"] = value
-        data["runtime"] = "auto"
-        self.config = ElasticBitConfig.from_manifest(data)
-        self.clear_cache()
-        EXECUTION_PLANNER.clear_owner_routes(self)
-        return self
-
-    def resolved_backend(self) -> str:
-        if self.backend == "pytorch":
-            return "pytorch"
-        if self.backend == "native":
-            return "native-required"
-        routes = EXECUTION_PLANNER.owner_routes(self)
-        if routes:
-            return "+".join(sorted(set(routes.values())))
-        return "planner(auto; qualify-once)"
-
-    def _materialized_weight(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        key = (device.type, device.index, dtype)
-        if self.config.cache_dequantized:
-            cached = self._dequant_cache.get(key)
-            if cached is not None:
-                return cached
-        weight = dequantize_tensor(self.packed(), device=device, dtype=dtype)
-        if self.config.cache_dequantized:
-            self._dequant_cache[key] = weight
-        return weight
-
-
-class ElasticLinear(_ElasticWeightMixin, nn.Module):
-    """Inference-only packed replacement for ``nn.Linear``.
-
-    The speed-first cached runtime lazily dequantizes the weight once. The
-    CUDA ``runtime="packed"`` path consumes the bitstream directly for true
-    low-memory inference without constructing a full dequantized weight.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        *,
-        bias: bool = True,
-        config: ElasticBitConfig | None = None,
-    ) -> None:
-        super().__init__()
-        self.in_features = int(in_features)
-        self.out_features = int(out_features)
-        self.config = config or ElasticBitConfig()
-        self.original_numel = out_features * in_features
-        groups = (self.original_numel + self.config.group_size - 1) // self.config.group_size
-        packed_bytes = (groups * self.config.group_size * self.config.bits + 7) // 8
-        self.register_buffer("packed_weight", torch.zeros(packed_bytes, dtype=torch.uint8))
-        self.register_buffer("scales", torch.zeros(groups, dtype=self.config.scale_dtype))
-        self.register_buffer(
-            "weight_shape",
-            torch.tensor([out_features, in_features], dtype=torch.int64),
-        )
-        self.bias = (
-            nn.Parameter(torch.zeros(out_features), requires_grad=False)
-            if bias
-            else None
-        )
-        self._init_cache()
-
-    def _assign_packed(self, packed: PackedElasticBit) -> None:
-        self.packed_weight = packed.packed
-        self.scales = packed.scales
-        self.weight_shape = torch.tensor(packed.shape, dtype=torch.int64)
-        self.original_numel = packed.original_numel
-        self.clear_cache()
-
-    @classmethod
-    def from_linear(
-        cls,
-        layer: nn.Linear,
-        config: ElasticBitConfig | None = None,
-    ) -> "ElasticLinear":
-        result = cls(
-            layer.in_features,
-            layer.out_features,
-            bias=layer.bias is not None,
-            config=config,
-        )
-        result._assign_packed(quantize_tensor(layer.weight, result.config))
-        if layer.bias is not None:
-            result.bias.data.copy_(layer.bias.detach().to(result.bias))
-        return result.to(device=layer.weight.device)
-
-    def packed(self) -> PackedElasticBit:
-        return PackedElasticBit(
-            packed=self.packed_weight,
-            scales=self.scales,
-            shape=tuple(int(v) for v in self.weight_shape.detach().cpu().tolist()),
-            bits=self.config.bits,
-            group_size=self.config.group_size,
-            original_numel=self.original_numel,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = self.config.compute_dtype or x.dtype
-        x_compute = x.to(dtype)
-        policy = self.config.backend
-        extra = (
-            int(self.in_features), int(self.out_features),
-            int(self.config.bits), int(self.config.group_size),
-        )
-
-        def native_impl_available():
-            packed_linear = None
-            available = False
-            if x_compute.is_cuda:
-                try:
-                    from ..esa.native import elastic_linear_packed as packed_linear
-                    from ..esa.native import custom_ops_registered as custom_ops_registered
-                    from ..esa.native import cuda_available as native_cuda_available
-                    available = bool(custom_ops_registered() and native_cuda_available())
-                except (ImportError, AttributeError, RuntimeError):
-                    available = False
-            return available, packed_linear
-
-        frozen = EXECUTION_PLANNER.owner_routes(self).get(("elastic_linear", False))
-        packed_linear = None
-        native_available = False
-
-        if policy == "pytorch":
-            route = "pytorch"
-        elif policy == "native":
-            native_available, packed_linear = native_impl_available()
-            if not native_available or packed_linear is None:
-                raise RuntimeError(
-                    "ElasticBit backend='native' requires the packed MLBricks CUDA extension"
-                )
-            route = "native"
-        elif frozen in {"native", "pytorch"}:
-            # Element-local auto decision was already qualified. Do not probe or
-            # benchmark again on subsequent forwards.
-            route = frozen
-            if route == "native":
-                try:
-                    from ..esa.native import elastic_linear_packed as packed_linear
-                    native_available = True
-                except (ImportError, AttributeError, RuntimeError):
-                    native_available = False
-        elif torch.is_grad_enabled():
-            # Packed native ElasticLinear is inference-only. Keep training on
-            # the transparent PyTorch graph and do not freeze an inference route.
-            route = "pytorch"
-        else:
-            native_available, packed_linear = native_impl_available()
-            if native_available and packed_linear is not None:
-                # Materialize/copy steady-state operands before qualification so
-                # the one-time benchmark compares execution, not lazy setup.
-                weight = self._materialized_weight(x.device, dtype)
-                bias = None if self.bias is None else self.bias.to(device=x.device, dtype=dtype)
-                native_bias = (
-                    x_compute.new_empty(0) if bias is None else bias
-                )
-                route = EXECUTION_PLANNER.qualify_operator_once(
-                    self,
-                    "elastic_linear",
-                    x_compute,
-                    {
-                        "native": lambda: packed_linear(
-                            x_compute, self.packed_weight, self.scales, native_bias,
-                            self.config.bits, self.config.group_size,
-                            self.out_features, self.in_features,
-                        ),
-                        "pytorch": lambda: F.linear(x_compute, weight, bias),
-                    },
-                    requested_backend="auto",
-                    native_available=True,
-                    native_supports_training=False,
-                    training=False,
-                    extra=extra,
-                    default_auto="pytorch",
-                )
-            else:
-                route = EXECUTION_PLANNER.select_operator_once(
-                    self,
-                    "elastic_linear",
-                    x_compute,
-                    requested_backend="auto",
-                    native_available=False,
-                    native_supports_training=False,
-                    training=False,
-                    extra=extra,
-                    default_auto="pytorch",
-                )
-
-        if route == "native":
-            if packed_linear is None:
-                native_available, packed_linear = native_impl_available()
-            if native_available and packed_linear is not None:
-                bias = (
-                    x_compute.new_empty(0)
-                    if self.bias is None
-                    else self.bias.to(device=x_compute.device, dtype=x_compute.dtype)
-                )
-                output = packed_linear(
-                    x_compute, self.packed_weight, self.scales, bias,
-                    self.config.bits, self.config.group_size,
-                    self.out_features, self.in_features,
-                )
-                return output.to(x.dtype) if output.dtype != x.dtype else output
-
-            if policy == "native":
-                raise RuntimeError(
-                    "ElasticBit backend='native' requires the packed MLBricks CUDA extension"
-                )
-
-            # A frozen native route can only become invalid after an explicit
-            # environment/device change. Clear this element and safely demote.
-            EXECUTION_PLANNER.clear_owner_routes(self)
-            route = EXECUTION_PLANNER.select_operator_once(
-                self, "elastic_linear", x_compute, requested_backend="auto",
-                native_available=False, native_supports_training=False, training=False,
-                extra=extra, default_auto="pytorch",
-            )
-
-        weight = self._materialized_weight(x.device, dtype)
-        bias = None if self.bias is None else self.bias.to(device=x.device, dtype=dtype)
-        output = F.linear(x_compute, weight, bias)
-        return output.to(x.dtype) if output.dtype != x.dtype else output
-
-    def extra_repr(self) -> str:
-        return (
-            f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bits={self.config.bits}, group_size={self.config.group_size}, "
-            f"bias={self.bias is not None}"
-        )
-
-
-class ElasticEmbedding(_ElasticWeightMixin, nn.Module):
-    """Inference-only packed replacement for ``nn.Embedding``."""
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        *,
-        config: ElasticBitConfig | None = None,
-    ) -> None:
-        super().__init__()
-        self.num_embeddings = int(num_embeddings)
-        self.embedding_dim = int(embedding_dim)
-        self.config = config or ElasticBitConfig()
-        self.original_numel = num_embeddings * embedding_dim
-        groups = (self.original_numel + self.config.group_size - 1) // self.config.group_size
-        packed_bytes = (groups * self.config.group_size * self.config.bits + 7) // 8
-        self.register_buffer("packed_weight", torch.zeros(packed_bytes, dtype=torch.uint8))
-        self.register_buffer("scales", torch.zeros(groups, dtype=self.config.scale_dtype))
-        self.register_buffer(
-            "weight_shape",
-            torch.tensor([num_embeddings, embedding_dim], dtype=torch.int64),
-        )
-        self._init_cache()
-
-    def _assign_packed(self, packed: PackedElasticBit) -> None:
-        self.packed_weight = packed.packed
-        self.scales = packed.scales
-        self.weight_shape = torch.tensor(packed.shape, dtype=torch.int64)
-        self.original_numel = packed.original_numel
-        self.clear_cache()
-
-    @classmethod
-    def from_embedding(
-        cls,
-        layer: nn.Embedding,
-        config: ElasticBitConfig | None = None,
-    ) -> "ElasticEmbedding":
-        result = cls(layer.num_embeddings, layer.embedding_dim, config=config)
-        result._assign_packed(quantize_tensor(layer.weight, result.config))
-        return result.to(device=layer.weight.device)
-
-    def packed(self) -> PackedElasticBit:
-        return PackedElasticBit(
-            self.packed_weight,
-            self.scales,
-            tuple(int(v) for v in self.weight_shape.detach().cpu().tolist()),
-            self.config.bits,
-            self.config.group_size,
-            self.original_numel,
-        )
-
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if self.config.backend == "native":
-            raise RuntimeError(
-                "ElasticEmbedding does not yet have a packed native kernel; use auto/pytorch"
-            )
-        dtype = self.config.compute_dtype or torch.get_default_dtype()
-        weight = self._materialized_weight(input_ids.device, dtype)
-        return F.embedding(input_ids, weight)
-
-
-class ElasticBit:
-    """ElasticBit 4-32 bit runtime plus MLBricks compatibility helpers.
-
-    The standalone ElasticBit 0.2 API is available as class attributes:
-    ``ElasticBit.RuntimeMatrix``, ``ElasticBit.NativeFP16Matrix`` and
-    ``ElasticBit.bitsAnaliser``. Existing MLBricks tensor/module quantization
-    helpers remain available for compatibility and PyTorch fallback execution.
-    """
-
-    RuntimeMatrix = RuntimeMatrix
-    NativeFP16Matrix = NativeFP16Matrix
-    bitsAnaliser = staticmethod(bitsAnaliser)
-    native_runtime_available = staticmethod(native_runtime_available)
-
-    def __init__(
-        self,
-        bits: int = 4,
-        group_size: int = 128,
-        *,
-        scale_dtype: torch.dtype = torch.float16,
-        compute_dtype: torch.dtype | None = None,
-        cache_dequantized: bool = True,
-        runtime: str = "auto",
-        backend: str = "auto",
-    ) -> None:
-        self.config = ElasticBitConfig(
-            bits=bits,
-            group_size=group_size,
-            scale_dtype=scale_dtype,
-            compute_dtype=compute_dtype,
-            cache_dequantized=cache_dequantized,
-            runtime=runtime,
-            backend=backend,
-        )
-
-    @property
-    def backend(self) -> str:
-        return self.config.backend
-
-    def set_backend(self, backend: str):
-        value = normalize_backend(backend, warn_legacy=True)
-        data = self.config.to_manifest()
-        data["backend"] = value
-        data["runtime"] = "auto"
-        self.config = ElasticBitConfig.from_manifest(data)
-        return self
-
-    def resolved_backend(self) -> str:
-        if self.backend == "pytorch":
-            return "pytorch"
-        if self.backend == "native":
-            return "native-required"
-        routes = EXECUTION_PLANNER.owner_routes(self)
-        if routes:
-            return "+".join(sorted(set(routes.values())))
-        return "planner(auto; qualify-once)"
-
-    @property
-    def bits(self) -> int:
-        return self.config.bits
-
-    @property
-    def group_size(self) -> int:
-        return self.config.group_size
-
-    def quantize(self, tensor: torch.Tensor) -> PackedElasticBit:
-        return quantize_tensor(tensor, self.config)
-
-    def dequantize(
-        self,
-        value: PackedElasticBit,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        return dequantize_tensor(value, device=device, dtype=dtype)
-
-    def linear(self, layer: nn.Linear) -> ElasticLinear:
-        return ElasticLinear.from_linear(layer, self.config)
-
-    def embedding(self, layer: nn.Embedding) -> ElasticEmbedding:
-        return ElasticEmbedding.from_embedding(layer, self.config)
-
-    def quantize_module(
-        self,
-        module: nn.Module,
-        *,
-        include_embeddings: bool = False,
-        skip_names: Iterable[str] = (),
-    ) -> nn.Module:
-        return quantize_module(
-            module,
-            self.config,
-            include_embeddings=include_embeddings,
-            skip_names=skip_names,
-        )
-
-    apply = quantize_module
-
-    def __repr__(self) -> str:
-        return (
-            f"ElasticBit(bits={self.config.bits}, "
-            f"group_size={self.config.group_size}, "
-            f"scale_dtype={self.config.scale_dtype}, "
-            f"compute_dtype={self.config.compute_dtype}, "
-            f"cache_dequantized={self.config.cache_dequantized}, "
-            f"runtime={self.config.runtime!r}, backend={self.config.backend!r})"
-        )
-
-
-def _weight_identity(layer: nn.Module) -> int | None:
-    weight = getattr(layer, "weight", None)
-    return id(weight) if isinstance(weight, nn.Parameter) else None
-
-
-def _share_packed(target: ElasticLinear | ElasticEmbedding, source: ElasticLinear | ElasticEmbedding) -> None:
-    target.packed_weight = source.packed_weight
-    target.scales = source.scales
-    target.weight_shape = source.weight_shape
-    target.original_numel = source.original_numel
-    # Tied modules share both packed storage and the lazy materialized weight.
-    target._dequant_cache = source._dequant_cache
-
-
-def quantize_module(
-    module: nn.Module,
-    config: ElasticBitConfig | None = None,
-    *,
-    include_embeddings: bool = False,
-    skip_names: Iterable[str] = (),
-) -> nn.Module:
-    """Recursively replace supported layers while preserving shared weights.
-
-    If embeddings are excluded, a Linear whose weight is tied to an embedding
-    is left untouched instead of creating a duplicate packed LM-head copy.
-    When embeddings are included, tied embedding/LM-head modules share the same
-    packed buffers.
-    """
-    config = config or ElasticBitConfig()
-    skipped = set(skip_names)
-    embedding_weight_ids = {
-        ident
-        for child in module.modules()
-        if isinstance(child, nn.Embedding)
-        for ident in [_weight_identity(child)]
-        if ident is not None
-    }
-    shared: dict[int, ElasticLinear | ElasticEmbedding] = {}
-
-    def recurse(parent: nn.Module) -> None:
-        for name, child in list(parent.named_children()):
-            if name in skipped:
-                continue
-            ident = _weight_identity(child)
-            replacement: ElasticLinear | ElasticEmbedding | None = None
-
-            if isinstance(child, nn.Linear):
-                if not include_embeddings and ident in embedding_weight_ids:
-                    continue
-                replacement = ElasticLinear(
-                    child.in_features,
-                    child.out_features,
-                    bias=child.bias is not None,
-                    config=config,
-                )
-                if ident is not None and ident in shared:
-                    _share_packed(replacement, shared[ident])
-                else:
-                    replacement._assign_packed(quantize_tensor(child.weight, config))
-                    if ident is not None:
-                        shared[ident] = replacement
-                if child.bias is not None:
-                    replacement.bias.data.copy_(child.bias.detach().to(replacement.bias))
-
-            elif include_embeddings and isinstance(child, nn.Embedding):
-                replacement = ElasticEmbedding(
-                    child.num_embeddings,
-                    child.embedding_dim,
-                    config=config,
-                )
-                if ident is not None and ident in shared:
-                    _share_packed(replacement, shared[ident])
-                else:
-                    replacement._assign_packed(quantize_tensor(child.weight, config))
-                    if ident is not None:
-                        shared[ident] = replacement
-
-            if replacement is not None:
-                source_weight = getattr(child, "weight", None)
-                if isinstance(source_weight, nn.Parameter):
-                    replacement.to(device=source_weight.device)
-                setattr(parent, name, replacement)
-            else:
-                recurse(child)
-
-    recurse(module)
-    return module
-
-
-def elasticbit_manifest(module: nn.Module) -> dict[str, Any] | None:
-    """Return serialization metadata for all ElasticBit modules in ``module``."""
-    entries: list[dict[str, Any]] = []
-    shared_ids: dict[tuple[int, int, int], str] = {}
-    next_group = 0
-    for name, child in module.named_modules():
-        if not isinstance(child, (ElasticLinear, ElasticEmbedding)):
-            continue
-        storage = child.packed_weight.untyped_storage()
-        key = (int(storage.data_ptr()), int(storage.nbytes()), int(child.packed_weight.storage_offset()))
-        group = shared_ids.get(key)
-        if group is None:
-            group = f"w{next_group}"
-            next_group += 1
-            shared_ids[key] = group
-        entry: dict[str, Any] = {
-            "name": name,
-            "kind": "linear" if isinstance(child, ElasticLinear) else "embedding",
-            "config": child.config.to_manifest(),
-            "shared_group": group,
-        }
-        if isinstance(child, ElasticLinear):
-            entry.update(
-                in_features=int(child.in_features),
-                out_features=int(child.out_features),
-                bias=child.bias is not None,
-            )
-        else:
-            entry.update(
-                num_embeddings=int(child.num_embeddings),
-                embedding_dim=int(child.embedding_dim),
-            )
-        entries.append(entry)
-    if not entries:
-        return None
-    return {"type": "elasticbit", "format_version": 1, "modules": entries}
-
-
-def _replace_named_module(root: nn.Module, name: str, replacement: nn.Module) -> None:
+        batches = list(calibrationData)
+    except TypeError as exc:
+        raise TypeError("calibrationData must be a model input or an iterable of model inputs") from exc
+    if not batches:
+        raise ValueError("calibrationData cannot be empty")
+    return batches
+
+
+def _callModel(model: nn.Module, batch: Any) -> Any:
+    if isinstance(batch, Mapping):
+        return model(**batch)
+    if isinstance(batch, tuple):
+        return model(*batch)
+    return model(batch)
+
+
+def _moveBatch(batch: Any, device: torch.device) -> Any:
+    if torch.is_tensor(batch):
+        return batch.to(device)
+    if isinstance(batch, Mapping):
+        return {key: _moveBatch(value, device) for key, value in batch.items()}
+    if isinstance(batch, tuple):
+        return tuple(_moveBatch(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [_moveBatch(value, device) for value in batch]
+    return batch
+
+
+def _moduleDevice(module: nn.Module) -> torch.device:
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
+
+
+def _replaceNamedModule(root: nn.Module, name: str, replacement: nn.Module) -> None:
     parts = name.split(".") if name else []
     if not parts:
-        raise ValueError("Cannot replace the root module from an ElasticBit manifest")
+        raise ValueError("ElasticBit cannot replace the root module")
     parent = root
     for part in parts[:-1]:
         parent = parent._modules[part]
     parent._modules[parts[-1]] = replacement
 
 
-def restore_elasticbit_modules(module: nn.Module, manifest: dict[str, Any] | None) -> nn.Module:
-    """Recreate ElasticBit wrappers before loading a packed state dict."""
-    if not manifest:
-        return module
-    if manifest.get("type") != "elasticbit":
-        raise ValueError(f"Unsupported quantization manifest: {manifest.get('type')!r}")
+@dataclass(frozen=True)
+class BitCandidate:
+    bits: int
+    hardwareNativeError: float
+    fullPrecisionError: float
+    error: float
+    storageBytes: int
+    memoryReduction: float
+    passes: bool
 
-    shared: dict[str, ElasticLinear | ElasticEmbedding] = {}
-    for entry in manifest.get("modules", []):
-        config = ElasticBitConfig.from_manifest(entry.get("config", {}))
-        kind = entry.get("kind")
-        if kind == "linear":
-            replacement: ElasticLinear | ElasticEmbedding = ElasticLinear(
-                int(entry["in_features"]),
-                int(entry["out_features"]),
-                bias=bool(entry.get("bias", True)),
-                config=config,
-            )
-        elif kind == "embedding":
-            replacement = ElasticEmbedding(
-                int(entry["num_embeddings"]),
-                int(entry["embedding_dim"]),
-                config=config,
-            )
+
+@dataclass(frozen=True)
+class BitAnalysis:
+    threshold: float
+    selectedBits: int
+    selectedError: float
+    candidates: tuple[BitCandidate, ...]
+
+
+@dataclass(frozen=True)
+class BackendInfo:
+    available: bool
+    device: str | None
+    deviceIndex: int | None
+    architecture: str | None
+    weightWidths: tuple[int, ...]
+    activateDType: str | None
+    prefill: str | None
+    decodePlanner: str | None
+    validated: bool
+    error: str | None = None
+
+    def __str__(self) -> str:
+        if not self.available:
+            return f"ElasticBitBackend(unavailable, error={self.error!r})"
+        return (
+            "ElasticBitBackend("
+            f"device={self.device!r}, architecture={self.architecture!r}, "
+            f"weightWidths={self.weightWidths}, activateDType={self.activateDType!r}, "
+            f"prefill={self.prefill!r}, decodePlanner={self.decodePlanner!r}, "
+            f"validated={self.validated})"
+        )
+
+
+class RuntimeMatrix:
+    """Advanced single-matrix ElasticBit runtime.
+
+    Construction is intentionally restricted to :meth:`compress` and
+    :meth:`load`; there is no constructor that accepts a user-selected bit width.
+    """
+
+    def __init__(self, native: Any) -> None:
+        self._native = native
+
+    @classmethod
+    def compress(
+        cls,
+        weights: Any,
+        calibrationData: Any,
+        threshold: float,
+        decodePolicy: str = "hardwareNative",
+    ) -> "RuntimeMatrix":
+        native = _requireNative()
+        policy = _checkPolicy(decodePolicy)
+        w = _toNumpy2D(weights, name="weights")
+        c = _toNumpy2D(calibrationData, name="calibrationData")
+        return cls(native.RuntimeMatrix.compress(w, c, float(threshold), policy))
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        decodePolicy: str = "hardwareNative",
+    ) -> "RuntimeMatrix":
+        native = _requireNative()
+        policy = _checkPolicy(decodePolicy)
+        return cls(native.RuntimeMatrix.load(str(path), policy))
+
+    def forward(self, x: Any) -> Any:
+        if torch.is_tensor(x):
+            if x.is_cuda and x.dtype == torch.float16 and x.numel() == self.cols:
+                return self._native.forwardTorch(x.contiguous())
+            values = np.asarray(x.detach().float().cpu().numpy(), dtype=np.float32).reshape(-1)
+            output = self._native.forward(np.ascontiguousarray(values))
+            return torch.from_numpy(np.asarray(output)).to(device=x.device, dtype=x.dtype)
+        values = np.asarray(x, dtype=np.float32).reshape(-1)
+        return np.asarray(self._native.forward(np.ascontiguousarray(values)))
+
+    def benchmark(self, x: Any, iterations: int = 500) -> float:
+        if torch.is_tensor(x):
+            x = x.detach().float().cpu().numpy()
+        values = np.ascontiguousarray(np.asarray(x, dtype=np.float32).reshape(-1))
+        return float(self._native.benchmark(values, int(iterations)))
+
+    def dequantize(self) -> np.ndarray:
+        return np.asarray(self._native.dequantize(), dtype=np.float32)
+
+    def _materializeTorch(self) -> torch.Tensor:
+        return self._native._materializeTorch()
+
+    def save(self, path: str | Path) -> None:
+        self._native.save(str(path))
+
+    def setDecodePolicy(self, decodePolicy: str) -> "RuntimeMatrix":
+        self._native.setDecodePolicy(_checkPolicy(decodePolicy))
+        return self
+
+    @property
+    def rows(self) -> int:
+        return int(self._native.rows)
+
+    @property
+    def cols(self) -> int:
+        return int(self._native.cols)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(int(v) for v in self._native.shape)
+
+    @property
+    def storageBits(self) -> int:
+        return int(self._native.storageBits)
+
+    @property
+    def executionWidth(self) -> int:
+        return int(self._native.executionWidth)
+
+    @property
+    def executionPlanner(self) -> str:
+        return str(self._native.executionPlanner)
+
+    @property
+    def decodePolicy(self) -> str:
+        return str(self._native.decodePolicy)
+
+    @property
+    def activateDType(self) -> str:
+        return str(self._native.activateDType)
+
+    @property
+    def storageBytes(self) -> int:
+        return int(self._native.storageBytes)
+
+    @property
+    def executionBytes(self) -> int:
+        return int(self._native.executionBytes)
+
+    @property
+    def originalBytes(self) -> int:
+        return int(self._native.originalBytes)
+
+    @property
+    def memoryReduction(self) -> float:
+        return float(self._native.memoryReduction)
+
+    @property
+    def threshold(self) -> float:
+        return float(self._native.threshold)
+
+    @property
+    def error(self) -> float:
+        return float(self._native.error)
+
+
+class _ElasticLinear(nn.Module):
+    """Internal model wrapper. Not part of the public import surface."""
+
+    def __init__(
+        self,
+        matrix: RuntimeMatrix,
+        inFeatures: int,
+        outFeatures: int,
+        bias: torch.Tensor | None,
+    ) -> None:
+        super().__init__()
+        self.matrix = matrix
+        self.inFeatures = int(inFeatures)
+        self.outFeatures = int(outFeatures)
+        if bias is None:
+            self.register_parameter("bias", None)
         else:
-            raise ValueError(f"Unknown ElasticBit module kind: {kind!r}")
+            self.bias = nn.Parameter(bias.detach().clone(), requires_grad=False)
 
-        group = str(entry.get("shared_group", ""))
-        if group and group in shared:
-            _share_packed(replacement, shared[group])
-        elif group:
-            shared[group] = replacement
-        _replace_named_module(module, str(entry["name"]), replacement)
-    return module
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-1] != self.inFeatures:
+            raise ValueError(
+                f"ElasticBit Linear expected last dimension {self.inFeatures}, got {x.shape[-1]}"
+            )
+        rows = x.numel() // self.inFeatures
+        if rows == 1 and x.is_cuda and x.dtype == torch.float16:
+            y = self.matrix.forward(x)
+            if self.bias is not None:
+                y = y + self.bias.to(device=y.device, dtype=y.dtype)
+            return y
+
+        # Prefill stays on the framework/vendor GEMM path. ElasticBit expands
+        # the compressed weight directly on the current GPU, avoiding a CPU
+        # dequantize + host-to-device round trip. The FP16 weight is transient.
+        weight = self.matrix._materializeTorch()
+        if weight.dtype != x.dtype:
+            weight = weight.to(dtype=x.dtype)
+        bias = self.bias
+        if bias is not None and (bias.device != x.device or bias.dtype != x.dtype):
+            bias = bias.to(device=x.device, dtype=x.dtype)
+        return F.linear(x, weight, bias)
+
+
+class _ModelElasticBit:
+    def __init__(
+        self,
+        model: nn.Module,
+        threshold: float,
+        decodePolicy: str,
+        compressedNames: Sequence[str],
+        skippedNames: Sequence[str],
+    ) -> None:
+        self._model = model
+        self.threshold = float(threshold)
+        self.decodePolicy = _checkPolicy(decodePolicy)
+        self.compressedNames = tuple(compressedNames)
+        self.skippedNames = tuple(skippedNames)
+
+    def _layers(self) -> list[tuple[str, _ElasticLinear]]:
+        modules = dict(self._model.named_modules())
+        return [
+            (name, modules[name])
+            for name in self.compressedNames
+            if isinstance(modules.get(name), _ElasticLinear)
+        ]
+
+    def setDecodePolicy(self, decodePolicy: str) -> "_ModelElasticBit":
+        policy = _checkPolicy(decodePolicy)
+        seen: set[int] = set()
+        for _, layer in self._layers():
+            ident = id(layer.matrix)
+            if ident in seen:
+                continue
+            layer.matrix.setDecodePolicy(policy)
+            seen.add(ident)
+        self.decodePolicy = policy
+        return self
+
+    def summary(self) -> str:
+        backend = ElasticBit.backend()
+        lines = [
+            "ElasticBit Summary",
+            "────────────────────────────────────────────────────────────",
+            f"Threshold       : {self.threshold}",
+            f"Decode Policy   : {self.decodePolicy}",
+            f"Backend         : {backend.architecture or 'unavailable'}",
+            f"Prefill         : {backend.prefill or 'unknown'}",
+            f"Decode Planner  : {backend.decodePlanner or 'unknown'}",
+            f"Activate DType  : {backend.activateDType or 'unknown'}",
+            "",
+            f"{'Layer':36s} {'Stored':>8s} {'Execute':>10s} {'Planner':>14s} {'Error':>10s}",
+        ]
+        for name, layer in self._layers():
+            matrix = layer.matrix
+            lines.append(
+                f"{name[:36]:36s} {str(matrix.storageBits) + '-bit':>8s} "
+                f"{'W' + str(matrix.executionWidth) + 'A16':>10s} "
+                f"{matrix.executionPlanner:>14s} {matrix.error:10.6f}"
+            )
+        if self.skippedNames:
+            lines.extend(["", "Uncompressed (no safe calibration path):"])
+            lines.extend(f"  {name}" for name in self.skippedNames)
+        text = "\n".join(lines)
+        print(text)
+        return text
+
+
+class ElasticBit:
+    """Clean ElasticBit public namespace."""
+
+    RuntimeMatrix = RuntimeMatrix
+
+    @staticmethod
+    def analyze(weights: Any, calibrationData: Any, threshold: float) -> BitAnalysis:
+        native = _requireNative()
+        w = _toNumpy2D(weights, name="weights")
+        c = _toNumpy2D(calibrationData, name="calibrationData")
+        raw = native.analyze(w, c, float(threshold))
+        candidates = tuple(
+            BitCandidate(
+                bits=int(item["bits"]),
+                hardwareNativeError=float(item["hardwareNativeError"]),
+                fullPrecisionError=float(item["fullPrecisionError"]),
+                error=float(item["error"]),
+                storageBytes=int(item["storageBytes"]),
+                memoryReduction=float(item["memoryReduction"]),
+                passes=bool(item["passes"]),
+            )
+            for item in raw["candidates"]
+        )
+        return BitAnalysis(
+            threshold=float(raw["threshold"]),
+            selectedBits=int(raw["selectedBits"]),
+            selectedError=float(raw["selectedError"]),
+            candidates=candidates,
+        )
+
+    @staticmethod
+    def compressMatrix(
+        weights: Any,
+        calibrationData: Any,
+        threshold: float,
+        decodePolicy: str = "hardwareNative",
+    ) -> RuntimeMatrix:
+        return RuntimeMatrix.compress(
+            weights,
+            calibrationData,
+            threshold,
+            decodePolicy=decodePolicy,
+        )
+
+    @staticmethod
+    def loadMatrix(
+        path: str | Path,
+        decodePolicy: str = "hardwareNative",
+    ) -> RuntimeMatrix:
+        return RuntimeMatrix.load(path, decodePolicy=decodePolicy)
+
+    @staticmethod
+    def backend() -> BackendInfo:
+        if not _nativeAvailable():
+            error = _nativeImportError()
+            return BackendInfo(
+                available=False,
+                device=None,
+                deviceIndex=None,
+                architecture=None,
+                weightWidths=(),
+                activateDType=None,
+                prefill=None,
+                decodePlanner=None,
+                validated=False,
+                error=None if error is None else str(error),
+            )
+        raw = _requireNative().backendInfo()
+        return BackendInfo(
+            available=True,
+            device=str(raw["device"]),
+            deviceIndex=int(raw["deviceIndex"]),
+            architecture=str(raw["architecture"]),
+            weightWidths=tuple(int(v) for v in raw["weightWidths"]),
+            activateDType=str(raw["activateDType"]),
+            prefill=str(raw["prefill"]),
+            decodePlanner=str(raw["decodePlanner"]),
+            validated=bool(raw["validated"]),
+        )
+
+    @staticmethod
+    def compress(
+        model: nn.Module,
+        calibrationData: Any,
+        threshold: float,
+        decodePolicy: str = "hardwareNative",
+    ) -> nn.Module:
+        if not isinstance(model, nn.Module):
+            raise TypeError("ElasticBit.compress() expects a torch.nn.Module")
+        _requireNative()
+        policy = _checkPolicy(decodePolicy)
+        batches = _toCalibrationBatches(calibrationData)
+        device = _moduleDevice(model)
+        if device.type != "cuda":
+            raise RuntimeError("ElasticBit model compression currently requires a CUDA model")
+
+        # The validated runtime is weight-only FP16 activation execution.
+        for module in model.modules():
+            if isinstance(module, nn.Linear) and module.weight.dtype != torch.float16:
+                raise RuntimeError(
+                    "ElasticBit.compress() currently requires FP16 Linear weights. "
+                    "Convert the model to float16 before compression."
+                )
+
+        embeddingWeightIds = {
+            id(module.weight)
+            for module in model.modules()
+            if isinstance(module, nn.Embedding)
+        }
+
+        collected: dict[str, list[np.ndarray]] = {}
+        handles = []
+        maxRows = 32
+
+        def makeHook(name: str):
+            def hook(_module: nn.Module, inputs: tuple[Any, ...]) -> None:
+                if not inputs or not torch.is_tensor(inputs[0]):
+                    return
+                tensor = inputs[0]
+                rows = tensor.detach().float().reshape(-1, tensor.shape[-1])
+                have = sum(item.shape[0] for item in collected.get(name, []))
+                remaining = maxRows - have
+                if remaining <= 0:
+                    return
+                sample = rows[:remaining].cpu().numpy().astype(np.float32, copy=True)
+                collected.setdefault(name, []).append(sample)
+            return hook
+
+        originalLinears: list[tuple[str, nn.Linear]] = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                originalLinears.append((name, module))
+                if id(module.weight) not in embeddingWeightIds:
+                    handles.append(module.register_forward_pre_hook(makeHook(name)))
+
+        model.eval()
+        try:
+            with torch.inference_mode():
+                for rawBatch in batches:
+                    _callModel(model, _moveBatch(rawBatch, device))
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        # Combine calibration from every use of a shared Linear weight before
+        # selecting its precision, so one shared RuntimeMatrix satisfies all uses.
+        namesByWeight: dict[int, list[str]] = {}
+        moduleByName = {name: module for name, module in originalLinears}
+        for name, module in originalLinears:
+            namesByWeight.setdefault(id(module.weight), []).append(name)
+
+        matrixByWeight: dict[int, RuntimeMatrix] = {}
+        compressedNames: list[str] = []
+        skippedNames: list[str] = []
+
+        for weightId, names in namesByWeight.items():
+            module = moduleByName[names[0]]
+            if weightId in embeddingWeightIds:
+                skippedNames.extend(names)
+                continue
+            samples = [
+                item
+                for name in names
+                for item in collected.get(name, [])
+            ]
+            if not samples:
+                skippedNames.extend(names)
+                continue
+            calibration = np.ascontiguousarray(np.concatenate(samples, axis=0), dtype=np.float32)
+            weights = np.ascontiguousarray(
+                module.weight.detach().float().cpu().numpy(), dtype=np.float32
+            )
+            matrixByWeight[weightId] = RuntimeMatrix.compress(
+                weights,
+                calibration,
+                float(threshold),
+                decodePolicy=policy,
+            )
+
+        for name, module in originalLinears:
+            matrix = matrixByWeight.get(id(module.weight))
+            if matrix is None:
+                continue
+            replacement = _ElasticLinear(
+                matrix=matrix,
+                inFeatures=module.in_features,
+                outFeatures=module.out_features,
+                bias=module.bias,
+            ).to(device=device)
+            _replaceNamedModule(model, name, replacement)
+            compressedNames.append(name)
+
+        model.elasticbit = _ModelElasticBit(
+            model,
+            threshold=float(threshold),
+            decodePolicy=policy,
+            compressedNames=compressedNames,
+            skippedNames=skippedNames,
+        )
+        return model
+
+    @staticmethod
+    def save(model: nn.Module, path: str | Path) -> Path:
+        controller = getattr(model, "elasticbit", None)
+        if not isinstance(controller, _ModelElasticBit):
+            raise ValueError("ElasticBit.save() expects a model produced by ElasticBit.compress()")
+
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        modules = dict(model.named_modules())
+
+        with tempfile.TemporaryDirectory(prefix="elasticbit-save-") as tempDir:
+            root = Path(tempDir)
+            matricesDir = root / "matrices"
+            matricesDir.mkdir(parents=True, exist_ok=True)
+            layerEntries = []
+            savedMatrices: dict[int, str] = {}
+
+            for index, name in enumerate(controller.compressedNames):
+                layer = modules.get(name)
+                if not isinstance(layer, _ElasticLinear):
+                    raise RuntimeError(f"ElasticBit layer disappeared before save: {name}")
+                matrixId = id(layer.matrix)
+                matrixFile = savedMatrices.get(matrixId)
+                if matrixFile is None:
+                    matrixFile = f"matrix_{len(savedMatrices):05d}.mlb"
+                    layer.matrix.save(matricesDir / matrixFile)
+                    savedMatrices[matrixId] = matrixFile
+                layerEntries.append({
+                    "name": name,
+                    "matrix": matrixFile,
+                    "inFeatures": layer.inFeatures,
+                    "outFeatures": layer.outFeatures,
+                    "hasBias": layer.bias is not None,
+                })
+
+            manifest = {
+                "format": _MODEL_FORMAT,
+                "version": _MODEL_FORMAT_VERSION,
+                "threshold": controller.threshold,
+                "decodePolicy": controller.decodePolicy,
+                "compressedNames": list(controller.compressedNames),
+                "skippedNames": list(controller.skippedNames),
+                "layers": layerEntries,
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            torch.save(model.state_dict(), root / "state.pt")
+
+            with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for file in root.rglob("*"):
+                    if file.is_file():
+                        archive.write(file, file.relative_to(root).as_posix())
+
+        return destination
+
+    @staticmethod
+    def load(
+        model: nn.Module,
+        path: str | Path,
+        decodePolicy: str | None = None,
+    ) -> nn.Module:
+        if not isinstance(model, nn.Module):
+            raise TypeError("ElasticBit.load() requires the model architecture as its first argument")
+        _requireNative()
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(source)
+
+        with tempfile.TemporaryDirectory(prefix="elasticbit-load-") as tempDir:
+            root = Path(tempDir)
+            with zipfile.ZipFile(source, "r") as archive:
+                archive.extractall(root)
+            manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            if manifest.get("format") != _MODEL_FORMAT or manifest.get("version") != _MODEL_FORMAT_VERSION:
+                raise ValueError("Unsupported ElasticBit model artifact")
+
+            policy = _checkPolicy(decodePolicy or manifest["decodePolicy"])
+            modules = dict(model.named_modules())
+            matrixCache: dict[str, RuntimeMatrix] = {}
+            compressedNames: list[str] = []
+
+            for entry in manifest["layers"]:
+                name = str(entry["name"])
+                target = modules.get(name)
+                if not isinstance(target, nn.Linear):
+                    raise ValueError(f"Model architecture does not contain expected Linear layer: {name}")
+                device = target.weight.device
+                if device.type != "cuda":
+                    raise RuntimeError("ElasticBit.load() requires the target model on CUDA")
+                matrixName = str(entry["matrix"])
+                matrix = matrixCache.get(matrixName)
+                if matrix is None:
+                    with torch.cuda.device(device):
+                        matrix = RuntimeMatrix.load(root / "matrices" / matrixName, decodePolicy=policy)
+                    matrixCache[matrixName] = matrix
+                replacement = _ElasticLinear(
+                    matrix=matrix,
+                    inFeatures=int(entry["inFeatures"]),
+                    outFeatures=int(entry["outFeatures"]),
+                    bias=target.bias if bool(entry["hasBias"]) else None,
+                ).to(device=device)
+                _replaceNamedModule(model, name, replacement)
+                compressedNames.append(name)
+                modules[name] = replacement
+
+            state = torch.load(root / "state.pt", map_location=_moduleDevice(model), weights_only=True)
+            model.load_state_dict(state, strict=True)
+            model.elasticbit = _ModelElasticBit(
+                model,
+                threshold=float(manifest["threshold"]),
+                decodePolicy=policy,
+                compressedNames=compressedNames,
+                skippedNames=tuple(manifest.get("skippedNames", ())),
+            )
+            return model
 
 
 __all__ = [
     "ElasticBit",
-    "ElasticBitConfig",
-    "PackedElasticBit",
-    "ElasticLinear",
-    "ElasticEmbedding",
-    "quantize_tensor",
-    "dequantize_tensor",
-    "quantize_module",
-    "elasticbit_manifest",
-    "restore_elasticbit_modules",
+    "RuntimeMatrix",
+    "BitAnalysis",
+    "BitCandidate",
+    "BackendInfo",
 ]

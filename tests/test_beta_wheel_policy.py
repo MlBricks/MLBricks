@@ -124,17 +124,22 @@ def test_artifact_actions_use_node24_generation() -> None:
 
 
 
-def test_release_workflow_does_not_run_or_publish_on_branch_pushes() -> None:
+def test_release_workflow_is_manual_only_and_requires_explicit_pypi_confirmation() -> None:
     workflow = (
         ROOT / ".github" / "workflows" / "native-wheels-beta.yml"
     ).read_text(encoding="utf-8")
 
-    assert 'branches:' not in workflow
-    assert '- "release/**"' not in workflow
+    # No branch/tag push can start the release workflow.
     assert "workflow_dispatch:" in workflow
-    assert 'tags:' in workflow
-    assert '- "v*"' in workflow
-    assert (
-        "if: github.event_name == 'push' && "
-        "startsWith(github.ref, 'refs/tags/v')"
-    ) in workflow
+    assert "\n  push:" not in workflow
+    assert "\n  release:" not in workflow
+    assert 'branches:' not in workflow
+    assert 'tags:' not in workflow
+
+    # Even a manual run builds only unless the user explicitly enables PyPI.
+    assert "publishToPyPI:" in workflow
+    assert 'default: false' in workflow
+    assert 'type: boolean' in workflow
+    assert 'if: ${{ inputs.publishToPyPI == true }}' in workflow
+    assert 'test "${{ inputs.publishToPyPI }}" = "true"' in workflow
+    assert "gh-action-pypi-publish" in workflow

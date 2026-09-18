@@ -1,247 +1,90 @@
 # ElasticBit
 
-ElasticBit is a CUDA runtime for **adaptive 4–32-bit matrix weight storage**. It analyzes each matrix against calibration inputs, selects the smallest storage width that satisfies an error threshold, and executes the matrix through a compute path appropriate to the selected precision.
+ElasticBit is threshold-driven adaptive weight compression for CUDA inference.
 
-## API
+The public API has no fixed 4-bit or 8-bit mode. The user supplies representative calibration data and an allowed relative error threshold. ElasticBit tests storage widths from 3 through 15 bits and chooses the smallest width that satisfies the threshold under both supported decode policies. If none pass, ElasticBit stores FP16 instead of violating the threshold.
 
-ElasticBit exposes one public namespace:
+Activations remain FP16 throughout execution.
 
-```python
-from elasticbit import ElasticBit
-```
+## Execution policies
 
-The primary API is:
+- `hardwareNative`: hardware-aware decode. On the validated Tesla T4 path, stored 3–4 bit -> W4A16, 5–8 bit -> W8A16, and 9–16 bit -> W16A16. On other CUDA GPUs, ElasticBit benchmarks the legal built-in W4A16/W8A16/W16A16 candidates for each matrix shape and keeps the fastest available execution width.
+- `fullPrecision`: all stored widths execute as W16A16.
 
-```python
-ElasticBit.bitsAnaliser(...)
-ElasticBit.RuntimeMatrix(...)
-ElasticBit.NativeFP16Matrix(...)
-```
+The compressed storage does not change when switching policies. Execution width is a runtime decision, not a property of the stored file.
 
-When integrated into MLBricks, the same API is intended to be available as:
+## Whole-model API
 
 ```python
 from mlbricks import ElasticBit
+
+model = model.cuda().half().eval()
+model = ElasticBit.compress(
+    model,
+    calibrationData=calibrationData,
+    threshold=0.01,
+)
+
+model.elasticbit.summary()
+model.elasticbit.setDecodePolicy("fullPrecision")
+model.elasticbit.setDecodePolicy("hardwareNative")
 ```
 
-## Precision range
+Prefill expands the compressed weight directly on the current GPU to a transient FP16 tensor, then uses the framework/vendor `Linear` GEMM path. M=1 decode uses the ElasticBit weight-only native runtime. No activation quantization is used.
 
-ElasticBit supports storage widths from **4 through 32 bits**.
-
-| Storage width | Runtime compute |
-|---|---|
-| 4-bit | INT4 |
-| 5–8-bit | INT8 |
-| 9–16-bit | FP16 |
-| 17–32-bit | FP32 |
-
-- 16-bit uses native FP16 storage.
-- 32-bit uses native FP32 storage.
-- Intermediate widths use exact packed integer storage with row-wise symmetric scales.
-- Widths above 16 bits are higher-precision fallback options and can use more storage than an FP16 baseline.
-
-## Quick start
+## Matrix API
 
 ```python
-import numpy as np
-from elasticbit import ElasticBit
+analysis = ElasticBit.analyze(weights, calibrationData, threshold=0.01)
+print(analysis.selectedBits, analysis.selectedError)
 
-rng = np.random.default_rng(42)
-weights = np.ascontiguousarray(
-    rng.standard_normal((4096, 1024), dtype=np.float32) * 0.08
-)
-calibration = np.ascontiguousarray(
-    rng.standard_normal((32, 1024), dtype=np.float32)
-)
-x = np.ascontiguousarray(
-    rng.standard_normal(1024, dtype=np.float32)
-)
-
-analysis = ElasticBit.bitsAnaliser(
-    weights,
-    calibration,
-    threshold=0.01,
-    min_bits=4,
-    max_bits=32,
-)
-
-bits = int(analysis["selected_bits"])
-matrix = ElasticBit.RuntimeMatrix(weights, bits, "compact")
+matrix = ElasticBit.compressMatrix(weights, calibrationData, threshold=0.01)
 y = matrix.forward(x)
-```
 
-## `ElasticBit.bitsAnaliser`
+matrix.setDecodePolicy("fullPrecision")
+matrix.setDecodePolicy("hardwareNative")
 
-Analyzes a matrix against calibration inputs and selects the smallest bit width whose measured error satisfies the requested threshold.
-
-```python
-analysis = ElasticBit.bitsAnaliser(
-    weights,
-    calibration,
-    threshold=0.01,
-    min_bits=4,
-    max_bits=32,
-)
-```
-
-Inputs:
-
-- `weights`: contiguous `float32` NumPy array with shape `[rows, cols]`
-- `calibration`: contiguous `float32` NumPy array with shape `[samples, cols]`
-- `threshold`: maximum accepted calibration error
-- `min_bits`: lowest width to test, default `4`
-- `max_bits`: highest width to test, default `32`
-
-The returned dictionary contains:
-
-- `selected_bits`
-- `selected_error`
-- `selected_compute_type`
-- `analyses`
-
-Each item in `analyses` reports the tested width, compute type, measured error, payload bytes, scale bytes, runtime bytes, and storage reduction relative to FP16.
-
-## `ElasticBit.RuntimeMatrix`
-
-Creates and executes an ElasticBit matrix.
-
-```python
-matrix = ElasticBit.RuntimeMatrix(
-    weights,
-    storage_bits=bits,
-    runtime_mode="compact",
-)
-```
-
-Runtime modes:
-
-- `compact` — keeps the exact packed representation on the GPU.
-- `fast` — widens the representation to the selected compute bucket for execution.
-
-### Automatic construction
-
-```python
-matrix = ElasticBit.RuntimeMatrix.from_auto(
-    weights,
-    calibration,
-    threshold=0.01,
-    runtime_mode="compact",
-    min_bits=4,
-    max_bits=32,
-)
-```
-
-### Inference
-
-```python
-y = matrix.forward(x)
-```
-
-### Reference output
-
-```python
-reference = matrix.forward_reference(x)
-```
-
-### Benchmark
-
-```python
-milliseconds = matrix.benchmark(x, iterations=500)
-```
-
-### Reconstruct weights
-
-```python
-weights_fp32 = matrix.dequantize()
-```
-
-### Save and load
-
-```python
 matrix.save("projection.mlb")
-loaded = ElasticBit.RuntimeMatrix.load("projection.mlb", "fast")
+matrix = ElasticBit.loadMatrix("projection.mlb")
 ```
 
-### Matrix properties
+Useful matrix properties:
 
 ```python
-matrix.rows
-matrix.cols
-matrix.storage_bits
-matrix.compute_type
-matrix.runtime_mode
-matrix.file_payload_bytes
-matrix.file_scale_bytes
-matrix.file_weight_bytes
-matrix.gpu_weight_bytes
-matrix.fp16_weight_bytes
-matrix.file_reduction_vs_fp16
-matrix.gpu_reduction_vs_fp16
+matrix.storageBits
+matrix.executionWidth
+matrix.executionPlanner
+matrix.decodePolicy
+matrix.activateDType
+matrix.storageBytes
+matrix.executionBytes
+matrix.originalBytes
+matrix.memoryReduction
+matrix.error
+matrix.threshold
 ```
 
-## `ElasticBit.NativeFP16Matrix`
-
-Native FP16 CUDA baseline for speed and memory comparison.
+## Model artifacts
 
 ```python
-baseline = ElasticBit.NativeFP16Matrix(weights)
-y = baseline.forward(x)
-ms = baseline.benchmark(x, 500)
-print(baseline.gpu_weight_bytes)
+ElasticBit.save(model, "model.elasticbit")
+model = ElasticBit.load(modelArchitecture, "model.elasticbit")
 ```
 
-## Real-model export
+The architecture instance is required when loading because ElasticBit stores model state and compressed matrices, not arbitrary executable Python class code.
+
+## Backend
 
 ```python
-from elasticbit.real_model import export_and_benchmark_model
-
-report = export_and_benchmark_model(
-    model=model,
-    calibration_batches=calibration_batches,
-    validation_batches=validation_batches,
-    output_dir="./elasticbit_export",
-    device=next(model.parameters()).device,
-    threshold=0.01,
-    min_bits=4,
-    max_bits=32,
-    calibration_rows_per_layer=32,
-    benchmark_iterations=500,
-)
+print(ElasticBit.backend())
 ```
 
-The exporter analyzes each `torch.nn.Linear` matrix independently, saves ElasticBit matrices, reconstructs weights for quality evaluation, and compares compact/fast ElasticBit execution against native FP16.
+The backend reports the detected CUDA architecture, native prefill policy, and decode planner. T4 reports `t4Validated`; other CUDA devices report `cudaAutoTune`. Auto-tuning selects the fastest legal built-in ElasticBit decode width for the actual matrix shape. This optimizes among ElasticBit's available kernels; architecture-specific kernels can still be added later without changing the compressed format.
 
-## Smoke test
+## File format
 
-```python
-from elasticbit.smoke import run_smoke_test
-
-report = run_smoke_test(iterations=2000)
-print(report)
-```
-
-## Installation
-
-ElasticBit currently targets **Linux + NVIDIA CUDA** and requires `nvcc` when building from source.
-
-```bash
-git clone https://github.com/MlBricks/ElasticBit.git
-cd ElasticBit
-pip install --no-cache-dir .
-```
-
-For a specific GPU architecture:
-
-```bash
-ELASTICBIT_CUDA_ARCHS="75" pip install .
-```
-
-Multiple architectures can be supplied:
-
-```bash
-ELASTICBIT_CUDA_ARCHS="75;80;86;89;90" pip install .
-```
+The clean runtime writes MLB4 matrix files. MLB4 records exact adaptive storage, threshold/error metadata, checksums, and dimensions. Decode policy is deliberately not persisted as storage semantics; it can be selected again at load time.
 
 ## License
 
-ElasticBit is licensed under the **PolyForm Noncommercial License 1.0.0**. Commercial use requires a separate written commercial license. See `LICENSE` for the complete required notices and ownership terms.
+ElasticBit is licensed under the PolyForm Noncommercial License 1.0.0. Commercial use requires a separate written commercial license.

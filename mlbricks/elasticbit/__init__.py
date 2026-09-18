@@ -1,13 +1,11 @@
-"""ElasticBit quantization component package."""
+"""ElasticBit adaptive threshold-driven weight compression."""
 
-from . import core as _core
+from .core import ElasticBit, RuntimeMatrix, BitAnalysis, BitCandidate, BackendInfo
 
-# Re-export the complete compatibility surface, including private helpers used
-# by existing tests/tools such as _pack_unsigned and _unpack_unsigned.
-globals().update({
-    name: value
-    for name, value in vars(_core).items()
-    if not name.startswith("__")
-})
-
-__all__ = getattr(_core, "__all__", [])
+__all__ = [
+    "ElasticBit",
+    "RuntimeMatrix",
+    "BitAnalysis",
+    "BitCandidate",
+    "BackendInfo",
+]

@@ -12,7 +12,7 @@ It provides unified `auto`, `native`, and `pytorch` backend dispatch together wi
 - **FFNBricks** — `StateAwareFFN`, `VirtualStateAwareFFN`, and `MicroVirtualFFN`.
 - **ResController** — adaptive residual control.
 - **SOUP** — state-oriented sequence processing with layerwise ESA/Bolt mixer selection.
-- **ElasticBit** — adaptive 4–32-bit CUDA runtime plus PyTorch-compatible quantization helpers.
+- **ElasticBit** — threshold-driven adaptive weight compression with FP16 activations and hardware-native decode.
 - **VESA** — ESA-based vision models.
 - **VisualBolt** — Bolt-based vision models through `VisionBolt`.
 - **Bricks / Brick** — heterogeneous model construction from MLBricks components.
@@ -70,7 +70,7 @@ residual = ResController(update_ratio=0.18)
 
 MLBricks components use `backend="auto"` by default. The public backend choices are:
 
-- `auto` — qualify **each element independently** (for example ESA, Bolt, SAFFN, a vision scan, or ElasticLinear). PyTorch is used as the one-time correctness reference; native must match it before both routes are benchmarked. The fastest valid route is then frozen for that element. Composite models can mix routes.
+- `auto` — qualify **each element independently** (for example ESA, Bolt, SAFFN, or a vision scan). PyTorch is used as the one-time correctness reference; native must match it before both routes are benchmarked. The fastest valid route is then frozen for that element. Composite models can mix routes.
 - `native` — require a supported MLBricks native implementation.
 - `pytorch` — force the PyTorch/reference path.
 
@@ -140,7 +140,11 @@ Unified inference and optimization helpers are also available:
 y = mlb.predict(model, x)
 text_or_tokens = mlb.generate(model, prompt, max_new_tokens=128)
 model = mlb.compile(model)
-model = mlb.quantize(model, method="elasticbit", bits=4)
+model = mlb.ElasticBit.compress(
+    model,
+    calibrationData=calibrationData,
+    threshold=0.01,
+)
 ```
 
 `ESAModel.save()`, `ESAModel.load()`, and `mlbricks.esa.Trainer` are no longer public APIs.
@@ -251,28 +255,34 @@ Per-layer mixer and FFN choices remain supported.
 
 ## ElasticBit
 
-```python
-from mlbricks import (
-    ElasticBit,
-    ElasticBitConfig,
-    ElasticLinear,
-    ElasticEmbedding,
-    quantize_tensor,
-    dequantize_tensor,
-)
-```
-
-ElasticBit now also exposes the standalone 0.2 adaptive 4–32-bit CUDA API through the MLBricks namespace:
+ElasticBit has one compression model: representative calibration data plus an error threshold.
+There is no fixed 4-bit/8-bit public API. ElasticBit searches 3–15-bit storage automatically and falls back to FP16 when required to preserve the threshold. Activations stay FP16. Prefill uses native framework/vendor GEMM after on-device FP16 materialization; `hardwareNative` decode keeps the validated T4 mapping and auto-tunes legal execution widths on other CUDA GPUs.
 
 ```python
 from mlbricks import ElasticBit
 
-analysis = ElasticBit.bitsAnaliser(weights, calibration, threshold=0.01)
-matrix = ElasticBit.RuntimeMatrix(weights, analysis["selected_bits"], "compact")
-y = matrix.forward(x)
+model = ElasticBit.compress(
+    model,
+    calibrationData=calibrationData,
+    threshold=0.01,
+)
+
+model.elasticbit.summary()
+model.elasticbit.setDecodePolicy("fullPrecision")
+model.elasticbit.setDecodePolicy("hardwareNative")
+ElasticBit.save(model, "model.elasticbit")
 ```
 
-The existing `ElasticLinear`, tensor quantization, and module-conversion helpers remain available as a PyTorch-compatible fallback surface.
+For a single matrix:
+
+```python
+matrix = ElasticBit.compressMatrix(
+    weights,
+    calibrationData,
+    threshold=0.01,
+)
+y = matrix.forward(x)
+```
 
 ## VESA
 

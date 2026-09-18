@@ -1,3 +1,15 @@
+
+## ElasticBit clean adaptive API
+
+- Removed the fixed-bit `ElasticBit(bits=...)` / `ElasticBitConfig` quantization surface and all compatibility aliases.
+- Compression is now threshold-driven only: 3–15-bit adaptive storage with FP16 fallback when required to preserve the threshold.
+- Added `ElasticBit.compress`, `compressMatrix`, `analyze`, `save`, `load`, `loadMatrix`, and `backend`.
+- Added camelCase runtime inspection and `setDecodePolicy`.
+- Decode policies are `hardwareNative` and `fullPrecision`; both preserve FP16 activations.
+- Replaced low-bit activation quantization with weight-only W4A16/W8A16 execution and W16A16 for higher widths.
+- Added hardware-aware decode planning: exact T4 detection preserves the validated mapping, while other CUDA GPUs auto-tune legal built-in execution widths per matrix shape.
+- Prefill now expands compressed weights directly on-device and delegates FP16 GEMM to the framework/vendor path instead of round-tripping weights through CPU memory.
+- Matrix serialization moved to MLB4 with threshold/error metadata and checksums.
 ## 1.0.0b1
 
 - Rebuilt `API.md` from the current package-root API, corrected beta/package naming in docs, and audited component license packaging including SOUP.

@@ -1,13 +1,16 @@
 name: Native wheels beta
 
 on:
-  # Manual qualification/build run when explicitly requested.
+  # This workflow never runs from a Git push or tag.
+  # Run it manually from GitHub Actions. Building is the default; PyPI
+  # publishing requires the explicit publishToPyPI confirmation below.
   workflow_dispatch:
-
-  # Automatic release/publish pipeline runs only for version tags.
-  push:
-    tags:
-      - "v*"
+    inputs:
+      publishToPyPI:
+        description: "Explicitly publish the assembled artifacts to PyPI"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -393,7 +396,9 @@ jobs:
 
   publish-pypi:
     name: Publish beta to PyPI
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Manual publishing only. Normal Git pushes, tag pushes, and manual build
+    # runs with publishToPyPI=false can never reach this job.
+    if: ${{ inputs.publishToPyPI == true }}
     runs-on: ubuntu-latest
     needs: release-check
     permissions:
@@ -407,10 +412,11 @@ jobs:
         with:
           name: pypi-release-artifacts
           path: dist
-      - name: Require version-matching tag
+      - name: Confirm explicit PyPI publish request
         shell: bash
         run: |
-          test "${GITHUB_REF_NAME}" = "v${MLBRICKS_VERSION}"
+          test "${{ inputs.publishToPyPI }}" = "true"
+          echo "Explicit PyPI publication confirmed for mlbricks-kit ${MLBRICKS_VERSION}."
       - name: Publish with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

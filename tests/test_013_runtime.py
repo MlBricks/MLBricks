@@ -3,20 +3,7 @@ import time
 import torch
 import pytest
 
-from mlbricks.elasticbit import ElasticBitConfig
 from mlbricks.benchmark import TrainingIntervalTimer
-
-
-def test_elasticbit_runtime_manifest_roundtrip():
-    cfg = ElasticBitConfig(bits=4, group_size=32, runtime="packed", cache_dequantized=False)
-    restored = ElasticBitConfig.from_manifest(cfg.to_manifest())
-    assert restored.runtime == "packed"
-    assert restored.cache_dequantized is False
-
-
-def test_elasticbit_runtime_validation():
-    with pytest.raises(ValueError, match="runtime"):
-        ElasticBitConfig(runtime="unknown")
 
 
 def test_training_timer_excludes_paused_time():

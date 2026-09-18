@@ -9,7 +9,6 @@ from mlbricks import (
     Brick,
     Bricks,
     ESA,
-    ElasticBit,
     FFN,
     Bolt,
     Gaussian,
@@ -26,7 +25,6 @@ def test_default_backend_is_auto_everywhere_relevant():
     assert inspect.signature(StateAwareFFN).parameters["backend"].default == "auto"
     assert inspect.signature(ResController).parameters["backend"].default == "auto"
     assert VesaConfig().backend == "auto"
-    assert ElasticBit().backend == "auto"
 
 
 def test_set_backend_override():

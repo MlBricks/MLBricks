@@ -42,7 +42,7 @@ from .esa import (
     ESAModel,
     ESAModelConfig,
 )
-from .lifecycle import save, load, inspect, predict, generate, compile, quantize
+from .lifecycle import save, load, inspect, predict, generate, compile
 from .trainer import Trainer, TrainerState, train
 from .optim import Adam, AdamW, FP16_ADAM_MIN_EPS, stabilize_optimizer
 from .esa import GenerationResult, GenerationStats
@@ -79,13 +79,10 @@ from .components import (
 )
 from .elasticbit import (
     ElasticBit,
-    ElasticBitConfig,
-    PackedElasticBit,
-    ElasticLinear,
-    ElasticEmbedding,
-    quantize_tensor,
-    dequantize_tensor,
-    quantize_module,
+    RuntimeMatrix,
+    BitAnalysis,
+    BitCandidate,
+    BackendInfo,
 )
 
 # Friendly lowercase constructor alias.
@@ -150,7 +147,6 @@ __all__ = [
     "predict",
     "generate",
     "compile",
-    "quantize",
     "train",
     "Adam",
     "AdamW",
@@ -178,13 +174,10 @@ __all__ = [
     "rmsnorm",
     "residual",
     "ElasticBit",
-    "ElasticBitConfig",
-    "PackedElasticBit",
-    "ElasticLinear",
-    "ElasticEmbedding",
-    "quantize_tensor",
-    "dequantize_tensor",
-    "quantize_module",
+    "RuntimeMatrix",
+    "BitAnalysis",
+    "BitCandidate",
+    "BackendInfo",
     "ESABenchmarkConfig",
     "DEFAULT_BENCHMARK_CONFIG",
     "FAST_BENCHMARK_CONFIG",

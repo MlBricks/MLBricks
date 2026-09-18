@@ -108,9 +108,9 @@ def _extension(
 
 
 def enabled(name: str) -> bool:
-    # Source installs default to the portable PyTorch implementation so users
-    # never spend minutes compiling unexpectedly. Official release CI sets the
-    # native build flags to 1 and publishes prebuilt platform wheels.
+    # Optional native extensions are opt-in for source installs so users do not
+    # spend minutes compiling unexpectedly. Official release CI sets the native
+    # build flags and publishes prebuilt platform wheels.
     return os.getenv(name, "0") == "1"
 
 
@@ -190,8 +190,9 @@ if enabled("MLBRICKS_BUILD_RESIDUALBRICK_NATIVE"):
         )
     )
 
-# ElasticBit 0.2 is a CUDA-only 4-32 bit runtime. Keep it optional so
-# CPU/source installs still expose the PyTorch compatibility implementation.
+# ElasticBit is a CUDA-native threshold-driven adaptive runtime. Keep the
+# extension optional so CPU/source installs can still import the package and
+# inspect backend availability, while compression/execution require CUDA.
 if enabled("MLBRICKS_BUILD_ELASTICBIT_NATIVE") and has_cuda_toolkit:
     csrc = ROOT / "mlbricks" / "elasticbit" / "csrc"
     extensions.append(

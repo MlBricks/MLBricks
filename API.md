@@ -24,7 +24,7 @@ from mlbricks import (
     Bricks, Brick,
     StateAwareFFN, VirtualStateAwareFFN, MicroVirtualFFN,
     ResController,
-    ElasticBit, ElasticBitConfig,
+    ElasticBit, RuntimeMatrix, BitAnalysis, BackendInfo,
     FFN, Embedding, LMHead, Linear, LayerNorm, RMSNorm, Residual,
     Trainer,
 )
@@ -90,7 +90,6 @@ inspect(model_or_path) -> dict
 predict(model, *args, **kwargs)
 generate(model, *args, **kwargs)
 compile(model, *, mode="default", dynamic=None, fullgraph=False, strict=False)
-quantize(model, *, method="elasticbit", bits=4, include_embeddings=False, **kwargs)
 ```
 
 Example:
@@ -645,62 +644,56 @@ vision_native_cuda_built() -> bool
 
 ## ElasticBit
 
-### PyTorch-compatible quantization surface
+ElasticBit is threshold-driven and adaptive. There is no fixed-bit public quantization API.
+
+### Whole-model compression
 
 ```python
-ElasticBit(
-    bits=4,
-    group_size=128,
-    *,
-    scale_dtype=torch.float16,
-    compute_dtype=None,
-    cache_dequantized=True,
-    runtime="auto",
-    backend="auto",
-)
-
-ElasticBitConfig(
-    bits=4,
-    group_size=128,
-    scale_dtype=torch.float16,
-    compute_dtype=None,
-    cache_dequantized=True,
-    runtime="auto",
-    backend="auto",
+model = ElasticBit.compress(
+    model,
+    calibrationData=calibrationData,
+    threshold=0.01,
+    decodePolicy="hardwareNative",
 )
 ```
 
-Main methods:
+`decodePolicy` accepts only `"hardwareNative"` or `"fullPrecision"`. Both keep FP16 activations. Prefill always uses native framework/vendor GEMM after on-device FP16 materialization. `hardwareNative` preserves the validated T4 execution map and auto-tunes legal W4A16/W8A16/W16A16 candidates per matrix shape on other CUDA GPUs.
 
 ```python
-packed = elastic.quantize(tensor)
-tensor = elastic.dequantize(packed, device=None, dtype=torch.float32)
-elastic_linear = elastic.linear(torch_linear)
-elastic_embedding = elastic.embedding(torch_embedding)
-elastic.quantize_module(model, include_embeddings=False, skip_names=())
+model.elasticbit.summary()
+model.elasticbit.setDecodePolicy("fullPrecision")
+model.elasticbit.setDecodePolicy("hardwareNative")
 ```
 
-Package-level helpers:
+### Analysis and matrix API
 
 ```python
-quantize_tensor(tensor, config=None) -> PackedElasticBit
-dequantize_tensor(packed, *, device=None, dtype=torch.float32) -> torch.Tensor
-quantize_module(module, config=None, *, include_embeddings=False, skip_names=())
+analysis = ElasticBit.analyze(weights, calibrationData, threshold=0.01)
+analysis.selectedBits
+analysis.selectedError
+analysis.candidates
+
+matrix = ElasticBit.compressMatrix(weights, calibrationData, threshold=0.01)
+matrix.storageBits
+matrix.executionWidth
+matrix.executionPlanner
+matrix.decodePolicy
+matrix.activateDType
+matrix.memoryReduction
+matrix.forward(x)
+matrix.setDecodePolicy("fullPrecision")
+matrix.save("projection.mlb")
+loaded = ElasticBit.loadMatrix("projection.mlb")
 ```
 
-`ElasticLinear` and `ElasticEmbedding` are the packed module wrappers.
-
-### Optional native 4–32-bit runtime
-
-When the ElasticBit native CUDA extension is packaged and available:
+### Model artifacts
 
 ```python
-analysis = ElasticBit.bitsAnaliser(weights, calibration, threshold=0.01)
-matrix = ElasticBit.RuntimeMatrix(weights, analysis["selected_bits"], "compact")
-y = matrix.forward(x)
+ElasticBit.save(model, "model.elasticbit")
+model = ElasticBit.load(modelArchitecture, "model.elasticbit")
 ```
 
-`ElasticBit.RuntimeMatrix`, `ElasticBit.NativeFP16Matrix`, and `ElasticBit.bitsAnaliser` require the native ElasticBit runtime; the portable wheel can still use the PyTorch-compatible ElasticBit surface above.
+`ElasticBit.load()` receives a model architecture instance because generic PyTorch module classes cannot be safely reconstructed from a weight artifact alone.
 
 ## Benchmark exports
 
@@ -731,9 +724,9 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b2`:
 | FFNBrick | `ffnbrick`, `MicroVirtualFFN`, `StateAwareFFN`, `VirtualStateAwareFFN`, `ffnbrick_native_backend_available`, `ffnbrick_native_backend_name` |
 | ResidualBrick | `residualbrick`, `ResController`, `residualbrick_native_backend_available`, `residualbrick_native_backend_name` |
 | ESA | `ESA`, `esa`, `ESAConfig`, `ESAModel`, `ESAModelConfig`, `GenerationResult`, `GenerationStats`, `compass`, `CompassResult`, `ThunderESA`, `thunderBoost` |
-| Lifecycle / training | `Trainer`, `TrainerState`, `save`, `load`, `inspect`, `predict`, `generate`, `compile`, `quantize`, `train`, `Adam`, `AdamW`, `FP16_ADAM_MIN_EPS`, `stabilize_optimizer` |
+| Lifecycle / training | `Trainer`, `TrainerState`, `save`, `load`, `inspect`, `predict`, `generate`, `compile`, `train`, `Adam`, `AdamW`, `FP16_ADAM_MIN_EPS`, `stabilize_optimizer` |
 | Basic blocks | `FFN`, `Embedding`, `LMHead`, `Linear`, `LayerNorm`, `RMSNorm`, `Residual`, `ffn`, `embedding`, `embeddings`, `lmhead`, `linear`, `layernorm`, `rmsnorm`, `residual` |
-| ElasticBit | `ElasticBit`, `ElasticBitConfig`, `PackedElasticBit`, `ElasticLinear`, `ElasticEmbedding`, `quantize_tensor`, `dequantize_tensor`, `quantize_module` |
+| ElasticBit | `ElasticBit`, `RuntimeMatrix`, `BitAnalysis`, `BitCandidate`, `BackendInfo` |
 | ESA benchmark | `ESABenchmarkConfig`, `DEFAULT_BENCHMARK_CONFIG`, `FAST_BENCHMARK_CONFIG`, `PAPER_BENCHMARK_CONFIG`, `BENCHMARK_DEFAULTS`, `FAST_BENCHMARK_DEFAULTS`, `PAPER_BENCHMARK_DEFAULTS`, `TrainingIntervalTimer`, `cuda_telemetry` |
 
 ## Licensing
