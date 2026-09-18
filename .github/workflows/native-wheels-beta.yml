@@ -1,26 +1,34 @@
 name: Native wheels beta
 
 on:
-  # This workflow never runs from a Git push or tag.
-  # Run it manually from GitHub Actions. Building is the default; PyPI
-  # publishing requires the explicit publishToPyPI confirmation below.
+  # Every push to main prepares the complete wheel/sdist set as downloadable
+  # GitHub Actions artifacts. PyPI publication is never triggered by a push.
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       publishToPyPI:
-        description: "Explicitly publish the assembled artifacts to PyPI"
+        description: "Publish a previously prepared artifact set to PyPI"
         required: true
         default: false
         type: boolean
+      artifactRunId:
+        description: "Successful Native wheels beta run ID containing pypi-release-artifacts (required only when publishing)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: native-wheels-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  MLBRICKS_VERSION: "1.0.0b2"
+  MLBRICKS_VERSION: "1.0.0b3"
   TORCH_VERSION: "2.10.0"
   CUDA_VERSION: "12.8.1"
   PYTORCH_CUDA_INDEX: "https://download.pytorch.org/whl/cu128"
@@ -31,6 +39,9 @@ env:
 
 jobs:
   portable:
+    # Pushes and manual build-only runs prepare artifacts. A manual publish
+    # run reuses an already tested artifact set instead of rebuilding it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publishToPyPI != true }}
     name: Portable wheel + sdist
     runs-on: ubuntu-latest
     steps:
@@ -73,6 +84,9 @@ jobs:
           if-no-files-found: error
 
   linux-cuda:
+    # Pushes and manual build-only runs prepare artifacts. A manual publish
+    # run reuses an already tested artifact set instead of rebuilding it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publishToPyPI != true }}
     name: Linux CUDA / ${{ matrix.python_abi }}
     runs-on: ubuntu-latest
     container:
@@ -186,6 +200,9 @@ jobs:
           if-no-files-found: error
 
   windows-cuda:
+    # Pushes and manual build-only runs prepare artifacts. A manual publish
+    # run reuses an already tested artifact set instead of rebuilding it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publishToPyPI != true }}
     name: Windows CUDA / Python ${{ matrix.python }}
     runs-on: windows-2022
     strategy:
@@ -259,6 +276,9 @@ jobs:
           if-no-files-found: error
 
   macos-native:
+    # Pushes and manual build-only runs prepare artifacts. A manual publish
+    # run reuses an already tested artifact set instead of rebuilding it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publishToPyPI != true }}
     name: macOS ARM64 native / Python ${{ matrix.python }}
     runs-on: macos-14
     strategy:
@@ -344,6 +364,9 @@ jobs:
           if-no-files-found: error
 
   release-check:
+    # Pushes and manual build-only runs prepare artifacts. A manual publish
+    # run reuses an already tested artifact set instead of rebuilding it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publishToPyPI != true }}
     name: Assemble release artifacts
     runs-on: ubuntu-latest
     needs: [portable, linux-cuda, windows-cuda, macos-native]
@@ -393,31 +416,89 @@ jobs:
           name: pypi-release-artifacts
           path: dist/*
           if-no-files-found: error
+          retention-days: 30
+      - name: Show prepared-release instructions
+        shell: bash
+        run: |
+          {
+            echo "## Prepared PyPI artifacts"
+            echo
+            echo "Version: ${MLBRICKS_VERSION}"
+            echo "Run ID: ${GITHUB_RUN_ID}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo
+            echo "Test the downloaded \`pypi-release-artifacts\` bundle. When ready, manually run this workflow with:"
+            echo "- \`publishToPyPI = true\`"
+            echo "- \`artifactRunId = ${GITHUB_RUN_ID}\`"
+            echo
+            echo "PyPI will receive these exact prepared artifacts; they will not be rebuilt."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish-pypi:
-    name: Publish beta to PyPI
-    # Manual publishing only. Normal Git pushes, tag pushes, and manual build
-    # runs with publishToPyPI=false can never reach this job.
-    if: ${{ inputs.publishToPyPI == true }}
+    name: Publish prepared artifacts to PyPI
+    # Only an explicit manual run can publish. It downloads the exact artifact
+    # bundle produced by the selected successful build run.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publishToPyPI == true }}
     runs-on: ubuntu-latest
-    needs: release-check
     permissions:
       id-token: write
       contents: read
+      actions: read
     environment:
       name: pypi
       url: https://pypi.org/p/mlbricks-kit
     steps:
-      - uses: actions/download-artifact@v7
+      - name: Require prepared artifact run ID
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -n "${{ inputs.artifactRunId }}"
+          case "${{ inputs.artifactRunId }}" in
+            *[!0-9]*) echo "artifactRunId must be the numeric GitHub Actions run ID"; exit 1 ;;
+          esac
+          echo "Publishing prepared artifacts from run ${{ inputs.artifactRunId }}"
+
+      - name: Download exact prepared release artifacts
+        uses: actions/download-artifact@v7
         with:
           name: pypi-release-artifacts
           path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifactRunId }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate prepared artifacts before publishing
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -U twine
+          python -m twine check dist/*
+          ls -lh dist/
+          python - <<'PY'
+          from pathlib import Path
+
+          version = "${{ env.MLBRICKS_VERSION }}"
+          files = sorted(p.name for p in Path("dist").iterdir() if p.is_file())
+          assert files, "prepared artifact set is empty"
+          assert all(name.startswith(f"mlbricks_kit-{version}") for name in files), files
+          assert any(name.endswith(".tar.gz") for name in files), files
+          wheels = [name for name in files if name.endswith(".whl")]
+          assert len(wheels) == 13, (len(wheels), wheels)
+          print("Prepared artifact version/matrix validation: PASS")
+          PY
+
       - name: Confirm explicit PyPI publish request
         shell: bash
         run: |
           test "${{ inputs.publishToPyPI }}" = "true"
           echo "Explicit PyPI publication confirmed for mlbricks-kit ${MLBRICKS_VERSION}."
-      - name: Publish with PyPI Trusted Publishing
+          echo "Source build run: ${{ inputs.artifactRunId }}"
+
+      - name: Publish exact prepared artifacts with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/

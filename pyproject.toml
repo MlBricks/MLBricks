@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlbricks-kit"
-version = "1.0.0b2"
+version = "1.0.0b3"
 description = "Modular neural-network toolkit with unified auto/native/pytorch dispatch, ESA, Bolt, Gaussian/BoltModel, VESA, VisionBolt, Bricks, SOUP, ElasticBit, and adaptive runtime planning."
 readme = "README.md"
 requires-python = ">=3.10"

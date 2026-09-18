@@ -1,5 +1,8 @@
+# MLBricks Changelog
 
-## ElasticBit clean adaptive API
+## 1.0.0b3
+
+### ElasticBit clean adaptive API
 
 - Removed the fixed-bit `ElasticBit(bits=...)` / `ElasticBitConfig` quantization surface and all compatibility aliases.
 - Compression is now threshold-driven only: 3–15-bit adaptive storage with FP16 fallback when required to preserve the threshold.
@@ -10,6 +13,7 @@
 - Added hardware-aware decode planning: exact T4 detection preserves the validated mapping, while other CUDA GPUs auto-tune legal built-in execution widths per matrix shape.
 - Prefill now expands compressed weights directly on-device and delegates FP16 GEMM to the framework/vendor path instead of round-tripping weights through CPU memory.
 - Matrix serialization moved to MLB4 with threshold/error metadata and checksums.
+- GitHub pushes to `main` now prepare the full wheel/sdist matrix as downloadable Actions artifacts; PyPI publication remains manual and publishes the exact artifact bundle from a selected successful build run.
 ## 1.0.0b1
 
 - Rebuilt `API.md` from the current package-root API, corrected beta/package naming in docs, and audited component license packaging including SOUP.
@@ -22,8 +26,6 @@
 - Upgraded artifact upload/download actions to Node 24-capable releases.
 - Forced macOS beta native builds to emit ARM64-only wheel tags and verify every packaged native binary with `lipo` before upload.
 - Fixed Windows CUDA extension compilation with PyTorch 2.10 by defining `USE_CUDA` for CUDA builds and enabling the conforming MSVC preprocessor, activating PyTorch's built-in Windows CUDA header workaround.
-
-# MLBricks Changelog
 
 ## 1.0.0b2
 

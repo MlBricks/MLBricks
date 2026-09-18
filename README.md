@@ -26,7 +26,7 @@ The PyPI distribution is `mlbricks-kit`; the public Python import package remain
 ```python
 import mlbricks
 print(mlbricks.__version__)
-# 1.0.0b2
+# 1.0.0b3
 ```
 
 ## Installation
@@ -168,9 +168,9 @@ from mlbricks import ESAModel, ESAModelConfig
 
 ## Bolt
 
-`Bolt` and `BoltAttention` are the public attention names in MLBricks Kit 1.0.0b2.
+`Bolt` and `BoltAttention` are the public attention names in MLBricks Kit 1.0.0b3.
 
-**1.0.0b2:** native FP16 AMP training now supports FP32 master Parameters in the compound Stage-1 backward path; model equations, checkpoints and cache format are unchanged.
+**1.0.0b3:** native FP16 AMP training now supports FP32 master Parameters in the compound Stage-1 backward path; model equations, checkpoints and cache format are unchanged.
 
 CUDA FP16 Bolt now uses a compound Stage-1 execution path when the native extension is available: one packed Q/U/G GEMM followed by one fused gate/RMS postprocess emits only `Q`, `C`, and FP32 `rho`. Training keeps the same parameters/equations and uses normalized-key PyTorch SDPA; `use_sdpa=False` remains the explicit reference route.
 
@@ -395,7 +395,7 @@ See [`API.md`](API.md) for the public API reference and [`examples/`](examples/)
 
 ## Component licenses
 
-MLBricks Kit 1.0.0b2 contains component-specific license notices in addition to the repository-level licensing documents:
+MLBricks Kit 1.0.0b3 contains component-specific license notices in addition to the repository-level licensing documents:
 
 - ESA — `mlbricks/esa/LICENSE_ESA.txt`
 - Bolt — `mlbricks/bolt/LICENSE_BOLT.txt`
@@ -410,7 +410,7 @@ Also see the repository-level [`LICENSE.md`](LICENSE.md), [`LICENSING_NOTICE.md`
 
 ## Licensing
 
-MLBricks Kit 1.0.0b2 is source-available software distributed under the **PolyForm Noncommercial License 1.0.0**.
+MLBricks Kit 1.0.0b3 is source-available software distributed under the **PolyForm Noncommercial License 1.0.0**.
 
 The public license permits noncommercial use, including personal use, education, academic study, noncommercial research, experimentation, benchmarking, and hobby projects, subject to the complete PolyForm license terms.
 
@@ -422,7 +422,7 @@ See [`LICENSE.md`](LICENSE.md), [`LICENSING_NOTICE.md`](LICENSING_NOTICE.md), an
 
 ## Release
 
-**MLBricks Kit 1.0.0b2** is the beta release line for the package and its current component APIs.
+**MLBricks Kit 1.0.0b3** is the beta release line for the package and its current component APIs.
 
 
 ## Training compilation
@@ -443,11 +443,11 @@ The bundled SOUP component license is shipped at `mlbricks/soup/LICENSE_SOUP.txt
 
 ### Versioning note
 
-MLBricks Kit is released as `1.0.0b2`. Experimental SOUP retains its independent component version `0.1.0a3`.
+MLBricks Kit is released as `1.0.0b3`. Experimental SOUP retains its independent component version `0.1.0a3`.
 
 ## Beta native wheel distribution
 
-MLBricks `1.0.0b2` is distributed with prebuilt native wheels for supported Linux, Windows, and macOS targets plus a `py3-none-any` fallback wheel. On a matching platform, pip selects the platform-specific native wheel; otherwise it installs the portable PyTorch fallback instead of compiling C++/CUDA locally.
+MLBricks `1.0.0b3` is distributed with prebuilt native wheels for supported Linux, Windows, and macOS targets plus a `py3-none-any` fallback wheel. On a matching platform, pip selects the platform-specific native wheel; otherwise it installs the portable PyTorch fallback instead of compiling C++/CUDA locally.
 
 For release builds, GitHub CI compiles CUDA wheels with a fat architecture list covering NVIDIA compute capabilities 7.0, 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, and 12.0+PTX. The beta native ABI is validated against PyTorch `2.10.x`; the package therefore requires `torch>=2.10,<2.11` until the native bindings migrate to the PyTorch stable ABI.
 
@@ -455,7 +455,7 @@ Source installations default native compilation **off**. Developers who intentio
 
 ### Beta native platform support
 
-For `1.0.0b2`, official prebuilt native wheels target Linux x86_64 with CUDA 12.8, Windows x86_64 with CUDA 12.8, and macOS Apple Silicon (`arm64`) for CPU-native acceleration. Intel macOS is not included because the PyTorch 2.10 binary line used by this beta does not provide the required current x86_64 macOS wheels.
+For `1.0.0b3`, official prebuilt native wheels target Linux x86_64 with CUDA 12.8, Windows x86_64 with CUDA 12.8, and macOS Apple Silicon (`arm64`) for CPU-native acceleration. Intel macOS is not included because the PyTorch 2.10 binary line used by this beta does not provide the required current x86_64 macOS wheels.
 
 Windows CUDA-native users must use the CUDA 12.8 PyTorch build from the official PyTorch `cu128` index. The MLBricks wheel itself remains precompiled, so MLBricks does not compile native code on the user's machine. If CUDA-native prerequisites are unavailable, MLBricks' PyTorch implementation remains the portable fallback.
 

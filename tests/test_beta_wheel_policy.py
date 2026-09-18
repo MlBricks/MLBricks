@@ -20,7 +20,7 @@ def _workflow() -> str:
 def test_beta_version_and_torch_abi_line_are_pinned() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["name"] == "mlbricks-kit"
-    assert project["version"] == "1.0.0b2"
+    assert project["version"] == "1.0.0b3"
     assert "torch>=2.10,<2.11" in project["dependencies"]
 
 
@@ -124,22 +124,31 @@ def test_artifact_actions_use_node24_generation() -> None:
 
 
 
-def test_release_workflow_is_manual_only_and_requires_explicit_pypi_confirmation() -> None:
+def test_release_workflow_builds_on_main_push_but_pypi_is_explicit_and_reuses_prepared_artifacts() -> None:
     workflow = (
         ROOT / ".github" / "workflows" / "native-wheels-beta.yml"
     ).read_text(encoding="utf-8")
 
-    # No branch/tag push can start the release workflow.
+    # Every main push prepares wheels/artifacts, but tags/releases do not publish.
     assert "workflow_dispatch:" in workflow
-    assert "\n  push:" not in workflow
+    assert "\n  push:" in workflow
+    assert "branches:" in workflow
+    assert "- main" in workflow
     assert "\n  release:" not in workflow
-    assert 'branches:' not in workflow
-    assert 'tags:' not in workflow
+    assert "tags:" not in workflow
 
-    # Even a manual run builds only unless the user explicitly enables PyPI.
+    # Publishing remains an explicit manual action.
     assert "publishToPyPI:" in workflow
+    assert "artifactRunId:" in workflow
     assert 'default: false' in workflow
     assert 'type: boolean' in workflow
-    assert 'if: ${{ inputs.publishToPyPI == true }}' in workflow
+    assert "if: ${{ github.event_name == 'workflow_dispatch' && inputs.publishToPyPI == true }}" in workflow
     assert 'test "${{ inputs.publishToPyPI }}" = "true"' in workflow
+
+    # Publishing downloads the exact release bundle built by the selected run.
+    assert "name: pypi-release-artifacts" in workflow
+    assert "retention-days: 30" in workflow
+    assert 'run-id: ${{ inputs.artifactRunId }}' in workflow
+    assert 'github-token: ${{ github.token }}' in workflow
+    assert "PyPI will receive these exact prepared artifacts; they will not be rebuilt." in workflow
     assert "gh-action-pypi-publish" in workflow
