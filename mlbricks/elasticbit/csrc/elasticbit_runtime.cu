@@ -2,6 +2,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
+#include <ATen/ops/mm.h>
 #include <c10/cuda/CUDAStream.h>
 
 #include <cuda_runtime.h>
@@ -441,22 +442,24 @@ static py::dict analyze_py(
 // CUDA execution kernels. Activations are always FP16.
 // -----------------------------------------------------------------------------
 
-__device__ __forceinline__ float block_sum(float value) {
-    __shared__ float shared[256];
-    shared[threadIdx.x] = value;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-        __syncthreads();
-    }
-    return shared[0];
+__device__ __forceinline__ float warp_sum(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+    return value;
 }
 
-__device__ __forceinline__ int sign4(uint8_t nibble) {
+__device__ __forceinline__ int sign4(uint32_t nibble) {
     const int value = static_cast<int>(nibble & 0x0fu);
     return (value ^ 8) - 8;
 }
 
+// Validated T4-style W4A16 decode kernel.  The hot Granite shapes are all
+// multiples of 8, so each thread consumes eight packed 4-bit weights from one
+// 32-bit load and four FP16 half2 activation loads.  A scalar tail path keeps
+// the RuntimeMatrix API correct for arbitrary matrix widths.
 __global__ void w4a16_gemv_kernel(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ scales,
@@ -466,22 +469,62 @@ __global__ void w4a16_gemv_kernel(
     int cols,
     int row_bytes
 ) {
-    const int row = blockIdx.x;
+    constexpr int kWarps = 8;  // launch_width uses 256 threads.
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     if (row >= rows) return;
-    const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+
+    const uint8_t* row_bytes_ptr = weights + static_cast<size_t>(row) * row_bytes;
     float partial = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        const uint8_t packed = row_ptr[col >> 1];
-        const uint8_t nibble = (col & 1) ? (packed >> 4) : (packed & 0x0f);
-        const int q = sign4(nibble);
-        partial += __half2float(input[col]) * static_cast<float>(q);
+
+    if ((cols & 7) == 0) {
+        const uint32_t* row4 = reinterpret_cast<const uint32_t*>(row_bytes_ptr);
+        const int groups8 = cols >> 3;
+        for (int group = tid; group < groups8; group += blockDim.x) {
+            const uint32_t packed = row4[group];
+            const int col = group << 3;
+            const __half2* x2 = reinterpret_cast<const __half2*>(input + col);
+            const float2 x0 = __half22float2(x2[0]);
+            const float2 x1 = __half22float2(x2[1]);
+            const float2 x2v = __half22float2(x2[2]);
+            const float2 x3 = __half22float2(x2[3]);
+
+            partial = fmaf(x0.x, static_cast<float>(sign4(packed >> 0)), partial);
+            partial = fmaf(x0.y, static_cast<float>(sign4(packed >> 4)), partial);
+            partial = fmaf(x1.x, static_cast<float>(sign4(packed >> 8)), partial);
+            partial = fmaf(x1.y, static_cast<float>(sign4(packed >> 12)), partial);
+            partial = fmaf(x2v.x, static_cast<float>(sign4(packed >> 16)), partial);
+            partial = fmaf(x2v.y, static_cast<float>(sign4(packed >> 20)), partial);
+            partial = fmaf(x3.x, static_cast<float>(sign4(packed >> 24)), partial);
+            partial = fmaf(x3.y, static_cast<float>(sign4(packed >> 28)), partial);
+        }
+    } else {
+        for (int col = tid; col < cols; col += blockDim.x) {
+            const uint8_t packed = row_bytes_ptr[col >> 1];
+            const uint8_t nibble = (col & 1) ? (packed >> 4) : (packed & 0x0f);
+            partial = fmaf(
+                __half2float(input[col]), static_cast<float>(sign4(nibble)), partial
+            );
+        }
     }
-    const float sum = block_sum(partial);
-    if (threadIdx.x == 0) {
-        output[row] = __float2half_rn(sum * scales[row]);
+
+    partial = warp_sum(partial);
+    __shared__ float warp_sums[kWarps];
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+
+    if (warp == 0) {
+        float total = lane < kWarps ? warp_sums[lane] : 0.0f;
+        total = warp_sum(total);
+        if (lane == 0) output[row] = __float2half_rn(total * scales[row]);
     }
 }
 
+// Validated T4-style W8A16 decode kernel.  Granite's hot shapes are multiples
+// of 4: one 32-bit weight load supplies four INT8 values and activations are
+// consumed as two half2 values.  The scalar fallback preserves generic shapes.
 __global__ void w8a16_gemv_kernel(
     const int8_t* __restrict__ weights,
     const float* __restrict__ scales,
@@ -490,19 +533,56 @@ __global__ void w8a16_gemv_kernel(
     int rows,
     int cols
 ) {
-    const int row = blockIdx.x;
+    constexpr int kWarps = 8;
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     if (row >= rows) return;
+
     const int8_t* row_ptr = weights + static_cast<size_t>(row) * cols;
     float partial = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        partial += __half2float(input[col]) * static_cast<float>(row_ptr[col]);
+
+    if ((cols & 3) == 0) {
+        const uint32_t* row4 = reinterpret_cast<const uint32_t*>(row_ptr);
+        const int groups4 = cols >> 2;
+        for (int group = tid; group < groups4; group += blockDim.x) {
+            const uint32_t packed = row4[group];
+            const int col = group << 2;
+            const int q0 = static_cast<int>(static_cast<int8_t>((packed >> 0) & 0xffu));
+            const int q1 = static_cast<int>(static_cast<int8_t>((packed >> 8) & 0xffu));
+            const int q2 = static_cast<int>(static_cast<int8_t>((packed >> 16) & 0xffu));
+            const int q3 = static_cast<int>(static_cast<int8_t>((packed >> 24) & 0xffu));
+            const __half2* x2 = reinterpret_cast<const __half2*>(input + col);
+            const float2 a = __half22float2(x2[0]);
+            const float2 b = __half22float2(x2[1]);
+            partial = fmaf(a.x, static_cast<float>(q0), partial);
+            partial = fmaf(a.y, static_cast<float>(q1), partial);
+            partial = fmaf(b.x, static_cast<float>(q2), partial);
+            partial = fmaf(b.y, static_cast<float>(q3), partial);
+        }
+    } else {
+        for (int col = tid; col < cols; col += blockDim.x) {
+            partial = fmaf(
+                __half2float(input[col]), static_cast<float>(row_ptr[col]), partial
+            );
+        }
     }
-    const float sum = block_sum(partial);
-    if (threadIdx.x == 0) {
-        output[row] = __float2half_rn(sum * scales[row]);
+
+    partial = warp_sum(partial);
+    __shared__ float warp_sums[kWarps];
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+
+    if (warp == 0) {
+        float total = lane < kWarps ? warp_sums[lane] : 0.0f;
+        total = warp_sum(total);
+        if (lane == 0) output[row] = __float2half_rn(total * scales[row]);
     }
 }
 
+// Kept for the low-level RuntimeMatrix host/benchmark API.  Model-level W16A16
+// execution bypasses this kernel and uses the framework/vendor GEMM path.
 __global__ void w16a16_gemv_kernel(
     const __half* __restrict__ weights,
     const __half* __restrict__ input,
@@ -510,15 +590,27 @@ __global__ void w16a16_gemv_kernel(
     int rows,
     int cols
 ) {
-    const int row = blockIdx.x;
+    constexpr int kWarps = 8;
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     if (row >= rows) return;
+
     const __half* row_ptr = weights + static_cast<size_t>(row) * cols;
     float partial = 0.0f;
-    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        partial += __half2float(row_ptr[col]) * __half2float(input[col]);
+    for (int col = tid; col < cols; col += blockDim.x) {
+        partial = fmaf(__half2float(row_ptr[col]), __half2float(input[col]), partial);
     }
-    const float sum = block_sum(partial);
-    if (threadIdx.x == 0) output[row] = __float2half_rn(sum);
+    partial = warp_sum(partial);
+    __shared__ float warp_sums[kWarps];
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+    if (warp == 0) {
+        float total = lane < kWarps ? warp_sums[lane] : 0.0f;
+        total = warp_sum(total);
+        if (lane == 0) output[row] = __float2half_rn(total);
+    }
 }
 
 __global__ void w4_to_fp16_kernel(
@@ -756,6 +848,17 @@ public:
 
         std::vector<int64_t> shape(input.sizes().begin(), input.sizes().end());
         shape.back() = rows_;
+
+        if (planned_execution_width_ == 16) {
+            // Match the validated direct experiment: W16A16 stays on the
+            // framework/vendor FP16 path rather than a hand-written scalar
+            // GEMV. materialize_torch() is zero-copy when d_w16_ exists.
+            auto weight = materialize_torch();
+            auto flat = input.reshape({1, cols_});
+            auto output = at::mm(flat, weight.transpose(0, 1));
+            return output.reshape(shape);
+        }
+
         auto output = torch::empty(shape, input.options());
         auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
         launch(
@@ -820,17 +923,24 @@ public:
         auto options = torch::TensorOptions()
             .dtype(torch::kFloat16)
             .device(torch::Device(torch::kCUDA, device_id_));
-        auto output = torch::empty({rows_, cols_}, options);
-        auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
-        __half* out = reinterpret_cast<__half*>(output.data_ptr<at::Half>());
         const size_t count = static_cast<size_t>(rows_) * cols_;
 
         if (d_w16_) {
-            CUDA_CHECK(cudaMemcpyAsync(
-                out, d_w16_, count * sizeof(__half), cudaMemcpyDeviceToDevice, stream.stream()
-            ));
-            return output;
+            // Zero-copy view over RuntimeMatrix-owned execution memory.  The
+            // no-op deleter is intentional: RuntimeMatrix releases d_w16_.
+            // This lets PyTorch dispatch W16A16 through cuBLAS without making
+            // a second full-size FP16 execution copy.
+            return torch::from_blob(
+                static_cast<void*>(d_w16_),
+                {static_cast<int64_t>(rows_), static_cast<int64_t>(cols_)},
+                [](void*) {},
+                options
+            );
         }
+
+        auto output = torch::empty({rows_, cols_}, options);
+        auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
+        __half* out = reinterpret_cast<__half*>(output.data_ptr<at::Half>());
 
         constexpr int threads = 256;
         const int blocks = static_cast<int>((count + threads - 1) / threads);
@@ -1044,22 +1154,67 @@ private:
             d_host_input_, host_input.data(), static_cast<size_t>(cols_) * sizeof(__half),
             cudaMemcpyHostToDevice
         ));
+        auto current_stream = c10::cuda::getCurrentCUDAStream(device_id_);
+
+        if (width == 16) {
+            // Auto-tune W16 against the same ATen/cuBLAS path used by model
+            // decode, not against ElasticBit's compatibility GEMV kernel.
+            auto options = torch::TensorOptions()
+                .dtype(torch::kFloat16)
+                .device(torch::Device(torch::kCUDA, device_id_));
+            auto input_view = torch::from_blob(
+                static_cast<void*>(d_host_input_), {1, static_cast<int64_t>(cols_)},
+                [](void*) {}, options
+            );
+            auto output_view = torch::from_blob(
+                static_cast<void*>(d_host_output_), {1, static_cast<int64_t>(rows_)},
+                [](void*) {}, options
+            );
+            auto weight_view = torch::from_blob(
+                static_cast<void*>(d_w16_),
+                {static_cast<int64_t>(rows_), static_cast<int64_t>(cols_)},
+                [](void*) {}, options
+            );
+            auto weight_t = weight_view.transpose(0, 1);
+
+            constexpr int warmups = 6;
+            constexpr int iterations = 24;
+            for (int i = 0; i < warmups; ++i) {
+                at::mm_out(output_view, input_view, weight_t);
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            cudaEvent_t start, stop;
+            CUDA_CHECK(cudaEventCreate(&start));
+            CUDA_CHECK(cudaEventCreate(&stop));
+            CUDA_CHECK(cudaEventRecord(start, current_stream.stream()));
+            for (int i = 0; i < iterations; ++i) {
+                at::mm_out(output_view, input_view, weight_t);
+            }
+            CUDA_CHECK(cudaEventRecord(stop, current_stream.stream()));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            float milliseconds = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+            CUDA_CHECK(cudaEventDestroy(start));
+            CUDA_CHECK(cudaEventDestroy(stop));
+            return static_cast<double>(milliseconds) / iterations;
+        }
 
         constexpr int warmups = 6;
         constexpr int iterations = 24;
         for (int i = 0; i < warmups; ++i) {
-            launch_width(width, d_host_input_, d_host_output_, nullptr);
+            launch_width(width, d_host_input_, d_host_output_, current_stream.stream());
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
-        CUDA_CHECK(cudaEventRecord(start));
+        CUDA_CHECK(cudaEventRecord(start, current_stream.stream()));
         for (int i = 0; i < iterations; ++i) {
-            launch_width(width, d_host_input_, d_host_output_, nullptr);
+            launch_width(width, d_host_input_, d_host_output_, current_stream.stream());
         }
-        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventRecord(stop, current_stream.stream()));
         CUDA_CHECK(cudaEventSynchronize(stop));
         float milliseconds = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));

@@ -40,6 +40,8 @@ No low-bit activation quantization is used.
 
 Prefill is phase-separated from decode. ElasticBit materializes the compressed weight directly on-device as transient FP16 and delegates the matrix multiplication to PyTorch/vendor GEMM. This avoids the previous CPU dequantization + host-to-device round trip.
 
+T4 low-bit decode uses the validated vectorized W4A16/W8A16 kernels (packed 32-bit weight loads, half2 activation loads, warp-shuffle reduction). W16A16 model execution is delegated to ATen/cuBLAS over a zero-copy view of RuntimeMatrix-owned FP16 execution memory instead of the compatibility scalar GEMV kernel.
+
 ## Public API
 
 ```python

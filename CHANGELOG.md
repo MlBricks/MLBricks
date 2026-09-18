@@ -12,6 +12,7 @@
 - Replaced low-bit activation quantization with weight-only W4A16/W8A16 execution and W16A16 for higher widths.
 - Added hardware-aware decode planning: exact T4 detection preserves the validated mapping, while other CUDA GPUs auto-tune legal built-in execution widths per matrix shape.
 - Prefill now expands compressed weights directly on-device and delegates FP16 GEMM to the framework/vendor path instead of round-tripping weights through CPU memory.
+- Restored the validated vectorized T4 W4A16/W8A16 decode kernels and routed W16A16 through ATen/cuBLAS using a zero-copy view of the existing FP16 execution allocation.
 - Matrix serialization moved to MLB4 with threshold/error metadata and checksums.
 - GitHub pushes to `main` now prepare the full wheel/sdist matrix as downloadable Actions artifacts; PyPI publication remains manual and publishes the exact artifact bundle from a selected successful build run.
 ## 1.0.0b1

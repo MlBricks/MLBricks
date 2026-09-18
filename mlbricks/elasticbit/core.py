@@ -403,15 +403,19 @@ class _ElasticLinear(nn.Module):
                 f"ElasticBit Linear expected last dimension {self.inFeatures}, got {x.shape[-1]}"
             )
         rows = x.numel() // self.inFeatures
+
+        # M=1 decode enters RuntimeMatrix directly. W4A16/W8A16 use the
+        # vectorized ElasticBit CUDA kernels; W16A16 is delegated inside the
+        # native extension to ATen/cuBLAS over a zero-copy FP16 weight view.
         if rows == 1 and x.is_cuda and x.dtype == torch.float16:
             y = self.matrix.forward(x)
             if self.bias is not None:
                 y = y + self.bias.to(device=y.device, dtype=y.dtype)
             return y
 
-        # Prefill stays on the framework/vendor GEMM path. ElasticBit expands
-        # the compressed weight directly on the current GPU, avoiding a CPU
-        # dequantize + host-to-device round trip. The FP16 weight is transient.
+        # Prefill stays on the framework/vendor GEMM path. Low-bit execution
+        # weights expand transiently on-device; W16A16 returns a zero-copy view
+        # of its existing persistent FP16 execution allocation.
         weight = self.matrix._materializeTorch()
         if weight.dtype != x.dtype:
             weight = weight.to(dtype=x.dtype)
