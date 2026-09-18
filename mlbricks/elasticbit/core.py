@@ -860,7 +860,7 @@ class ElasticBit:
     def load(
         model: nn.Module,
         path: str | Path,
-        decodePolicy: str | None = None,
+        decodePolicy: str = "hardwareNative",
     ) -> nn.Module:
         if not isinstance(model, nn.Module):
             raise TypeError("ElasticBit.load() requires the model architecture as its first argument")
@@ -877,7 +877,7 @@ class ElasticBit:
             if manifest.get("format") != _MODEL_FORMAT or manifest.get("version") != _MODEL_FORMAT_VERSION:
                 raise ValueError("Unsupported ElasticBit model artifact")
 
-            policy = _checkPolicy(decodePolicy or manifest["decodePolicy"])
+            policy = _checkPolicy(decodePolicy)
             modules = dict(model.named_modules())
             matrixCache: dict[str, RuntimeMatrix] = {}
             compressedNames: list[str] = []
