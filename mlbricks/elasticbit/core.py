@@ -26,6 +26,7 @@ requires recalibration or recompression.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gc
 import io
 import os
 import json
@@ -630,12 +631,14 @@ class ElasticBit:
 
         # Combine calibration from every use of a shared Linear weight before
         # selecting its precision, so one shared RuntimeMatrix satisfies all uses.
+        # Keep only names/ids here: retaining every original Linear object would
+        # keep its FP16 weight alive after replacement and defeat streaming compression.
         namesByWeight: dict[int, list[str]] = {}
-        moduleByName = {name: module for name, module in originalLinears}
         for name, module in originalLinears:
             namesByWeight.setdefault(id(module.weight), []).append(name)
+        del originalLinears
+        handles.clear()
 
-        matrixByWeight: dict[int, RuntimeMatrix] = {}
         compressedNames: list[str] = []
         skippedNames: list[str] = []
         progress = os.environ.get("MLBRICKS_ELASTICBIT_PROGRESS", "").strip().lower() in {
@@ -648,7 +651,10 @@ class ElasticBit:
         ]
 
         for matrixIndex, (weightId, names) in enumerate(compressible, start=1):
-            module = moduleByName[names[0]]
+            module = model.get_submodule(names[0])
+            if not isinstance(module, nn.Linear):
+                raise RuntimeError(f"ElasticBit expected Linear module at {names[0]}")
+
             samples = [
                 item
                 for name in names
@@ -660,15 +666,23 @@ class ElasticBit:
             calibration = np.ascontiguousarray(np.concatenate(samples, axis=0), dtype=np.float32)
 
             if progress:
+                freeBytes, totalBytes = torch.cuda.mem_get_info(device)
                 print(
                     f"[ElasticBit] {matrixIndex}/{len(compressible)} analyzing {names[0]} "
-                    f"shape={tuple(module.weight.shape)} rows={calibration.shape[0]}",
+                    f"shape={tuple(module.weight.shape)} rows={calibration.shape[0]} "
+                    f"free={freeBytes / (1024**3):.2f}/{totalBytes / (1024**3):.2f} GiB",
                     flush=True,
                 )
 
             selectedBits, selectedError = _selectBitsTorch(
                 module.weight, calibration, float(threshold)
             )
+
+            # _selectBitsTorch uses PyTorch CUDA tensors while the native RuntimeMatrix
+            # owns its execution buffers via raw cudaMalloc. Return cached analysis
+            # blocks to CUDA before the native allocation so the two allocators do not
+            # artificially compete for the same free VRAM.
+            torch.cuda.empty_cache()
 
             if progress:
                 print(
@@ -677,13 +691,12 @@ class ElasticBit:
                     flush=True,
                 )
 
-            # Packing is performed once, after the GPU analyzer has selected the
-            # smallest threshold-safe width.  The selected-bit constructor is
-            # private; fixed-bit selection is not part of the public API.
+            # Move FP16 weights to CPU first, then widen to FP32 on CPU.  Calling
+            # .float() before .cpu() creates a full temporary FP32 copy on the GPU.
             weights = np.ascontiguousarray(
-                module.weight.detach().float().cpu().numpy(), dtype=np.float32
+                module.weight.detach().cpu().float().numpy(), dtype=np.float32
             )
-            matrixByWeight[weightId] = RuntimeMatrix._compressSelected(
+            matrix = RuntimeMatrix._compressSelected(
                 weights,
                 selectedBits,
                 float(threshold),
@@ -691,18 +704,36 @@ class ElasticBit:
                 decodePolicy=policy,
             )
 
-        for name, module in originalLinears:
-            matrix = matrixByWeight.get(id(module.weight))
-            if matrix is None:
-                continue
-            replacement = _ElasticLinear(
-                matrix=matrix,
-                inFeatures=module.in_features,
-                outFeatures=module.out_features,
-                bias=module.bias,
-            ).to(device=device)
-            _replaceNamedModule(model, name, replacement)
-            compressedNames.append(name)
+            # Replace every Linear sharing this weight immediately.  This releases
+            # the original FP16 parameter group before the next compressed matrix is
+            # created, keeping peak VRAM close to the final compressed model instead
+            # of full-model + compressed-model memory.
+            for name in names:
+                current = model.get_submodule(name)
+                if not isinstance(current, nn.Linear):
+                    raise RuntimeError(f"ElasticBit expected Linear module at {name}")
+                replacement = _ElasticLinear(
+                    matrix=matrix,
+                    inFeatures=current.in_features,
+                    outFeatures=current.out_features,
+                    bias=current.bias,
+                ).to(device=device)
+                _replaceNamedModule(model, name, replacement)
+                compressedNames.append(name)
+                collected.pop(name, None)
+                del current, replacement
+
+            del module, weights, calibration, samples, matrix
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            if progress:
+                freeBytes, totalBytes = torch.cuda.mem_get_info(device)
+                print(
+                    f"[ElasticBit] {matrixIndex}/{len(compressible)} packed/replaced "
+                    f"free={freeBytes / (1024**3):.2f}/{totalBytes / (1024**3):.2f} GiB",
+                    flush=True,
+                )
 
         model.elasticbit = _ModelElasticBit(
             model,
