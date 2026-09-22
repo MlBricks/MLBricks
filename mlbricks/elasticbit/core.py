@@ -610,6 +610,16 @@ class ElasticBit:
         )
 
     @staticmethod
+    def reduce(
+        model: nn.Module,
+        sample: Any = None,
+    ) -> nn.Module:
+        """Apply the exact notebook-validated Stage-2G Universal Core reduction."""
+        from .stage2g import _stage2g_public_reduce
+
+        return _stage2g_public_reduce(model, sample)
+
+    @staticmethod
     def compress(
         model: nn.Module,
         calibrationData: Any,
