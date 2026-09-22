@@ -96,6 +96,7 @@ ElasticBit.loadMatrix(...)
 ElasticBit.save(...)
 ElasticBit.load(...)
 ElasticBit.backend()
+ElasticBit.optimize(...)
 ```
 
 Compressed models also expose:
@@ -138,6 +139,20 @@ Change decode policy without changing the compressed storage:
 model.elasticbit.setDecodePolicy("fullPrecision")
 model.elasticbit.setDecodePolicy("hardwareNative")
 ```
+
+Run the validated Stage-2F T4 planner explicitly when desired:
+
+```python
+model = ElasticBit.optimize(model)
+
+# Ignore a matching cached profile and benchmark again.
+model = ElasticBit.optimize(model, force=True)
+```
+
+Stage-2F v1 intentionally matches the validated one-layer Granite 4.2 8B /
+Tesla T4 research notebook. It does not silently generalize its candidate set,
+sequence lengths, safety margins, model shape, or GPU support. A matching profile
+can be saved inside the model artifact and reused without benchmarking again.
 
 Whole-model compression captures representative activations from the supplied calibration data, selects a safe width for each eligible Linear weight, and directly packs the analyzer-selected integer codes and row scales into canonical ElasticBit storage.
 

@@ -473,12 +473,19 @@ class _ModelElasticBit:
         decodePolicy: str,
         compressedNames: Sequence[str],
         skippedNames: Sequence[str],
+        optimizationProfiles: Mapping[str, Any] | None = None,
     ) -> None:
         self._model = model
         self.threshold = float(threshold)
         self.decodePolicy = _checkPolicy(decodePolicy)
         self.compressedNames = tuple(compressedNames)
         self.skippedNames = tuple(skippedNames)
+        # Hardware-specific optimize() profiles are optional metadata.  They do
+        # not change canonical ElasticBit storage and are only applied after an
+        # explicit ElasticBit.optimize(model) call.
+        self.optimizationProfiles = dict(optimizationProfiles or {})
+        self.activeOptimization: dict[str, Any] | None = None
+        self._stage2fRuntime: Any | None = None
 
     def _layers(self) -> list[tuple[str, _ElasticLinear]]:
         modules = dict(self._model.named_modules())
@@ -511,6 +518,8 @@ class _ModelElasticBit:
             f"Prefill         : {backend.prefill or 'unknown'}",
             f"Decode Planner  : {backend.decodePlanner or 'unknown'}",
             f"Activate DType  : {backend.activateDType or 'unknown'}",
+            f"Optimize Cache  : {len(self.optimizationProfiles)} profile(s)",
+            f"Optimize Active : {('none' if self.activeOptimization is None else self.activeOptimization.get('planner', 'unknown'))}",
             "",
             f"{'Layer':36s} {'Stored':>8s} {'Execute':>10s} {'Planner':>14s} {'Error':>10s}",
         ]
@@ -607,6 +616,34 @@ class ElasticBit:
             prefill=str(raw["prefill"]),
             decodePlanner=str(raw["decodePlanner"]),
             validated=bool(raw["validated"]),
+        )
+
+    @staticmethod
+    def optimize(
+        model: nn.Module,
+        force: bool = False,
+    ) -> nn.Module:
+        """Explicitly tune the validated Stage-2F runtime for this hardware.
+
+        Stage-2F v1 is intentionally an exact port of the validated Tesla T4
+        Granite notebook.  It is not silently generalized to other models,
+        shapes, or GPUs.  A cached profile is reused unless ``force=True``.
+        """
+        if not isinstance(model, nn.Module):
+            raise TypeError("ElasticBit.optimize() expects a torch.nn.Module")
+        controller = getattr(model, "elasticbit", None)
+        if not isinstance(controller, _ModelElasticBit):
+            raise ValueError(
+                "ElasticBit.optimize() expects a model produced by "
+                "ElasticBit.compress() or ElasticBit.load()"
+            )
+        from .stage2f import optimizeModelStage2F
+
+        return optimizeModelStage2F(
+            model,
+            controller,
+            ElasticBit.backend(),
+            force=bool(force),
         )
 
     @staticmethod
@@ -854,6 +891,9 @@ class ElasticBit:
                 "decodePolicy": controller.decodePolicy,
                 "compressedNames": list(controller.compressedNames),
                 "skippedNames": list(controller.skippedNames),
+                # Optional hardware profiles from explicit optimize().  Old v1
+                # readers ignore this field; storage/matrix files are unchanged.
+                "optimizationProfiles": controller.optimizationProfiles,
                 "layers": layerEntries,
             }
             (root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -924,6 +964,7 @@ class ElasticBit:
                 decodePolicy=policy,
                 compressedNames=compressedNames,
                 skippedNames=tuple(manifest.get("skippedNames", ())),
+                optimizationProfiles=manifest.get("optimizationProfiles", {}),
             )
             return model
 

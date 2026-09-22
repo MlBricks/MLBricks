@@ -665,6 +665,21 @@ model.elasticbit.setDecodePolicy("fullPrecision")
 model.elasticbit.setDecodePolicy("hardwareNative")
 ```
 
+### Explicit Stage-2F hardware optimization
+
+```python
+model = ElasticBit.optimize(model)
+# Re-run the benchmark even when this hardware profile is cached:
+model = ElasticBit.optimize(model, force=True)
+```
+
+`ElasticBit.optimize()` is explicit: normal inference does not benchmark candidate paths.
+This first Stage-2F library port is deliberately frozen to the validated one-layer
+Granite 4.2 8B / Tesla T4 notebook. It reuses a matching saved hardware profile
+and otherwise executes the notebook candidate search once. Unsupported models,
+shapes, or GPUs are rejected rather than silently generalized. Saving the model
+after optimization persists the profile metadata in the `.elasticbit` artifact.
+
 ### Analysis and matrix API
 
 ```python

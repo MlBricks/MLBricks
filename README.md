@@ -270,6 +270,11 @@ model = ElasticBit.compress(
 model.elasticbit.summary()
 model.elasticbit.setDecodePolicy("fullPrecision")
 model.elasticbit.setDecodePolicy("hardwareNative")
+
+# Explicit hardware optimization. Stage-2F v1 is the validated
+# Granite 4.2 8B / Tesla T4 notebook planner, not a generalized planner.
+model = ElasticBit.optimize(model)
+
 ElasticBit.save(model, "model.elasticbit")
 ```
 
