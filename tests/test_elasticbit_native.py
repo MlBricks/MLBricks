@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from mlbricks import ElasticBit
+from mlbricks import ElasticBit, RuntimeMatrix
 
 
 pytestmark = pytest.mark.skipif(
@@ -138,3 +138,60 @@ def test_model_analyzer_result_reuse_and_fastwarp_policy(tmp_path):
     artifact = tmp_path / "fastwarp.elasticbit"
     ElasticBit.save(model, artifact)
     assert artifact.exists()
+
+def test_t4_fastwarp_production_backend_contract():
+    """Exact Tesla T4 / SM75 reports the frozen production FastWarp contract."""
+    backend = ElasticBit.backend()
+    if not backend.validated:
+        pytest.skip("production FastWarp contract is specific to the validated Tesla T4")
+
+    assert "T4" in backend.device.upper()
+    assert backend.architecture == "sm75"
+    assert backend.decodePlanner == "t4Validated"
+    assert backend.decodeEngine == "FastWarp"
+    assert backend.decodeStatus == "production"
+    assert backend.decodeValidation == "granite42-8b_t4_40x7_20260923"
+    assert backend.prefill == "native"
+
+
+@pytest.mark.parametrize(
+    ("storage_bits", "expected_width"),
+    [
+        (3, 4),
+        (4, 4),
+        (5, 8),
+        (6, 8),
+        (7, 8),
+        (8, 8),
+        (9, 16),
+        (10, 16),
+        (15, 16),
+    ],
+)
+def test_t4_fastwarp_production_family_mapping(storage_bits, expected_width):
+    """The validated T4 path must never widen outside the frozen storage family map."""
+    backend = ElasticBit.backend()
+    if not backend.validated:
+        pytest.skip("production FastWarp family mapping is specific to the validated Tesla T4")
+
+    rows, cols = 8, 32
+    codes = np.zeros((rows, cols), dtype=np.int16)
+    scales = np.ones((rows,), dtype=np.float32)
+    matrix = RuntimeMatrix._compressSelectedCodes(
+        codes,
+        scales,
+        storage_bits,
+        threshold=0.01,
+        selectedError=0.0,
+        decodePolicy="hardwareNative",
+    )
+
+    assert matrix.executionPlanner == "t4Validated"
+    assert matrix.executionWidth == expected_width
+    assert matrix.decodePolicy == "hardwareNative"
+
+    x = torch.randn(1, cols, device="cuda", dtype=torch.float16)
+    y = matrix.forward(x)
+    assert y.shape == (1, rows)
+    assert torch.isfinite(y).all()
+

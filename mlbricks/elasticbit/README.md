@@ -67,6 +67,51 @@ For `M=1`, `fullPrecision` uses the FP16 FastWarp kernel so policy comparisons u
 
 Switching policy does **not** require recalibration or recompression.
 
+## Tesla T4 FastWarp production status
+
+The exact Tesla T4 / CUDA `sm75` `hardwareNative` decode route is a
+**production-validated FastWarp path**.
+
+The production validation used Granite 4.2 8B and exercised all 40 decoder
+layers, covering all 280 ElasticBit projection matrices (`q`, `k`, `v`, `o`,
+`gate`, `up`, and `down`) with `M=1` decode.
+
+Measured summed projection latency on the physical Tesla T4:
+
+| Route | 280-projection latency |
+| --- | ---: |
+| `hardwareNative` FastWarp | 70.163 ms |
+| `fullPrecision` W16 FastWarp | 96.004 ms |
+| resident FP16 `F.linear` | 195.182 ms |
+| generic materialize + `F.linear` | 381.871 ms |
+
+This corresponds to:
+
+- **5.443x** FastWarp speedup versus the generic materialize + `F.linear` fallback;
+- **2.782x** versus resident FP16 `F.linear`;
+- **1.368x** versus forced W16 FastWarp.
+
+Numerical agreement in the same sweep remained tight:
+
+- minimum `hardwareNative` vs `fullPrecision` cosine: **0.999999821**;
+- maximum `hardwareNative` vs `fullPrecision` relative L2: **0.0003664**.
+
+These are **projection-level decode measurements**, not end-to-end model
+tokens/second. Prefill, attention-cache work, normalization, embeddings, and
+the LM head are outside this specific FastWarp confirmation.
+
+`ElasticBit.backend()` reports this route as:
+
+```text
+decodeEngine     = FastWarp
+decodeStatus     = production
+decodePlanner    = t4Validated
+decodeValidation = granite42-8b_t4_40x7_20260923
+```
+
+Other CUDA GPUs keep the existing auto-tuned decode planner and are reported
+as `experimental` until separately validated.
+
 ## Prefill and decode
 
 ElasticBit intentionally uses different paths for prefill and single-token decode:
@@ -300,10 +345,13 @@ backend.weightWidths
 backend.activateDType
 backend.prefill
 backend.decodePlanner
+backend.decodeEngine
+backend.decodeStatus
+backend.decodeValidation
 backend.validated
 ```
 
-For the validated Tesla T4 path the architecture is CUDA `sm75`, while the decode planner reports the validated T4 hardware policy.
+For the validated Tesla T4 path the architecture is CUDA `sm75`; the decode engine reports `FastWarp`, the status reports `production`, and the planner remains `t4Validated`.
 
 ## Native CUDA build
 

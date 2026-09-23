@@ -1,3 +1,59 @@
+# ElasticBit FastWarp T4 production verification — 2026-09-23
+
+The frozen Tesla T4 / SM75 `M=1` FastWarp decode route is now marked
+**production** in backend metadata.
+
+Full physical-T4 confirmation:
+
+```text
+Model/artifact              : Granite 4.2 8B ElasticBit
+Decoder layers              : 40
+Projection matrices         : 280
+Storage distribution        : 6b=1, 7b=12, 8b=189, 9b=76, 10b=2
+
+hardwareNative FastWarp     : 70.1628 ms summed projection latency
+fullPrecision W16 FastWarp  : 96.0036 ms
+resident FP16 F.linear      : 195.1822 ms
+generic materialize+Linear  : 381.8709 ms
+
+FastWarp vs generic         : 5.4426x
+FastWarp vs resident FP16   : 2.7818x
+FastWarp vs W16 FastWarp    : 1.3683x
+```
+
+Quality checks over the same sweep:
+
+```text
+min hardware/full cosine    : 0.999999821
+max hardware/full rel L2    : 0.000366399
+max W16/materialized rel L2 : 0.0000473073
+```
+
+Production scope:
+
+- exact NVIDIA Tesla T4 / CUDA SM75;
+- `M=1` decode only;
+- `hardwareNative` remains the default decode policy;
+- fixed T4 execution-family map remains 3–4 -> W4, 5–8 -> W8, 9–16 -> W16;
+- FastWarp CUDA kernels are frozen by this patch;
+- prefill is deliberately unchanged and remains FP16 materialize + framework/vendor GEMM;
+- other CUDA GPUs remain `experimental` until separately validated.
+
+Backend diagnostics now expose:
+
+```text
+decodeEngine     = FastWarp
+decodeStatus     = production
+decodePlanner    = t4Validated
+decodeValidation = granite42-8b_t4_40x7_20260923
+prefill          = native
+```
+
+The latency figures above are projection-only measurements, not end-to-end
+generation tokens/second.
+
+---
+
 # ElasticBit FastWarp production patch — 2026-09-18
 
 - Keeps prefill unchanged on the existing FP16 framework/vendor GEMM path.

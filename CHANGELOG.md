@@ -2,6 +2,17 @@
 
 ## 1.0.0b3
 
+### ElasticBit Tesla T4 FastWarp production validation
+
+- Marked the exact Tesla T4 / SM75 `M=1` FastWarp route as production-validated.
+- Kept the already-validated FastWarp CUDA kernels frozen; no decode math or MLB4 storage semantics changed.
+- Added explicit backend metadata: `decodeEngine`, `decodeStatus`, and `decodeValidation`.
+- Kept the existing `backend.prefill == "native"` diagnostic unchanged for compatibility; FastGEMM is not part of this production patch.
+- Added T4 regression guards for the fixed execution-family map: 3–4-bit -> W4, 5–8-bit -> W8, 9–15-bit -> W16.
+- Recorded full Granite 4.2 8B physical-T4 validation across 40 decoder layers / 280 projection matrices.
+- FastWarp measured 5.443x faster than the generic materialize + `F.linear` projection fallback and 2.782x faster than resident FP16 `F.linear` in that sweep.
+- Other CUDA GPUs remain on the existing auto-tuned planner and are reported as experimental until separately validated.
+
 ### ElasticBit clean adaptive API
 
 - Removed the fixed-bit `ElasticBit(bits=...)` / `ElasticBitConfig` quantization surface and all compatibility aliases.

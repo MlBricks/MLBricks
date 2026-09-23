@@ -13,12 +13,13 @@ smallest safe storage width automatically.
 Storage and execution are intentionally separate:
 
 * storage search: 3..15 bit, with FP16 as the threshold-preserving fallback;
-* ``hardwareNative`` decode: T4 uses the validated W4A16/W8A16/W16A16 map
-  with one-warp-per-output-row FastWarp GEMV; other CUDA GPUs auto-tune the
-  legal built-in execution widths per matrix shape;
+* ``hardwareNative`` decode: Tesla T4 uses the production-validated
+  W4A16/W8A16/W16A16 one-warp-per-output-row FastWarp GEMV map; other CUDA
+  GPUs continue to use the existing auto-tuned decode planner and are not
+  covered by the T4 production validation;
 * ``fullPrecision`` decode: every stored width executes as W16A16 FastWarp GEMV;
-* prefill materializes FP16 weights on-device and uses framework/vendor GEMM;
-* activations stay FP16 in every execution path.
+* prefill remains the framework FP16 materialize + vendor GEMM path;
+* activations stay FP16 in every shipped execution path.
 
 The analyzer validates both low-bit and full-precision arithmetic before
 accepting a storage width, so policy switching or hardware widening never
@@ -243,6 +244,9 @@ class BackendInfo:
     decodePlanner: str | None
     validated: bool
     error: str | None = None
+    decodeEngine: str | None = None
+    decodeStatus: str | None = None
+    decodeValidation: str | None = None
 
     def __str__(self) -> str:
         if not self.available:
@@ -252,7 +256,8 @@ class BackendInfo:
             f"device={self.device!r}, architecture={self.architecture!r}, "
             f"weightWidths={self.weightWidths}, activateDType={self.activateDType!r}, "
             f"prefill={self.prefill!r}, decodePlanner={self.decodePlanner!r}, "
-            f"validated={self.validated})"
+            f"decodeEngine={self.decodeEngine!r}, decodeStatus={self.decodeStatus!r}, "
+            f"decodeValidation={self.decodeValidation!r}, validated={self.validated})"
         )
 
 
@@ -445,8 +450,9 @@ class _ElasticLinear(nn.Module):
             )
         rows = x.numel() // self.inFeatures
 
-        # M=1 decode enters RuntimeMatrix directly. W4A16/W8A16/W16A16 all
-        # use the validated one-warp-per-output-row FastWarp CUDA topology.
+        # Production T4 M=1 decode enters RuntimeMatrix directly. The frozen
+        # W4A16/W8A16/W16A16 one-warp-per-output-row FastWarp topology was
+        # validated across all 40 Granite 4.2 8B decoder layers (280 matrices).
         if rows == 1 and x.is_cuda and x.dtype == torch.float16:
             y = self.matrix.forward(x)
             if self.bias is not None:
@@ -516,7 +522,10 @@ class _ModelElasticBit:
             f"Decode Policy   : {self.decodePolicy}",
             f"Backend         : {backend.architecture or 'unavailable'}",
             f"Prefill         : {backend.prefill or 'unknown'}",
+            f"Decode Engine   : {backend.decodeEngine or 'unknown'}",
+            f"Decode Status   : {backend.decodeStatus or 'unknown'}",
             f"Decode Planner  : {backend.decodePlanner or 'unknown'}",
+            f"Decode Validate : {backend.decodeValidation or 'unknown'}",
             f"Activate DType  : {backend.activateDType or 'unknown'}",
             f"Optimize Cache  : {len(self.optimizationProfiles)} profile(s)",
             f"Optimize Active : {('none' if self.activeOptimization is None else self.activeOptimization.get('planner', 'unknown'))}",
@@ -602,6 +611,9 @@ class ElasticBit:
                 activateDType=None,
                 prefill=None,
                 decodePlanner=None,
+                decodeEngine=None,
+                decodeStatus=None,
+                decodeValidation=None,
                 validated=False,
                 error=None if error is None else str(error),
             )
@@ -615,6 +627,9 @@ class ElasticBit:
             activateDType=str(raw["activateDType"]),
             prefill=str(raw["prefill"]),
             decodePlanner=str(raw["decodePlanner"]),
+            decodeEngine=str(raw["decodeEngine"]),
+            decodeStatus=str(raw["decodeStatus"]),
+            decodeValidation=str(raw["decodeValidation"]),
             validated=bool(raw["validated"]),
         )
 

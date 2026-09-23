@@ -19,6 +19,10 @@ def test_public_api_uses_camel_case_names():
     sig = inspect.signature(ElasticBit.compressMatrix)
     assert "calibrationData" in sig.parameters
     assert "decodePolicy" in sig.parameters
+    assert sig.parameters["decodePolicy"].default == "hardwareNative"
+    assert inspect.signature(ElasticBit.loadMatrix).parameters["decodePolicy"].default == "hardwareNative"
+    assert inspect.signature(RuntimeMatrix.compress).parameters["decodePolicy"].default == "hardwareNative"
+    assert inspect.signature(RuntimeMatrix.load).parameters["decodePolicy"].default == "hardwareNative"
     assert "calibration_data" not in sig.parameters
     assert "decode_policy" not in sig.parameters
     assert hasattr(RuntimeMatrix, "setDecodePolicy")
@@ -32,6 +36,16 @@ def test_backend_api_is_safe_without_native_extension():
     if info.available:
         assert info.prefill == "native"
         assert info.decodePlanner in {"t4Validated", "cudaAutoTune"}
+        assert info.decodeEngine == "FastWarp"
+        assert info.decodeStatus in {"production", "experimental"}
+        assert isinstance(info.decodeValidation, str)
+        if info.validated:
+            assert info.decodePlanner == "t4Validated"
+            assert info.decodeStatus == "production"
+            assert info.decodeValidation == "granite42-8b_t4_40x7_20260923"
+        else:
+            assert info.decodeStatus == "experimental"
+            assert info.decodeValidation == "unvalidated"
 
 
 def test_native_only_calls_fail_cleanly_when_extension_missing():

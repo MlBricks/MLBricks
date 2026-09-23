@@ -243,6 +243,13 @@ static int execution_width_for_bits(int storage_bits) {
     return 16;
 }
 
+// Exact production-validation identity for the frozen Tesla T4 FastWarp
+// M=1 decode route. Keep this identifier stable so backend diagnostics and
+// regression tests can distinguish the validated T4 contract from generic
+// CUDA auto-tuned execution.
+static constexpr const char* kT4FastWarpValidation =
+    "granite42-8b_t4_40x7_20260923";
+
 enum class DecodePolicy : uint8_t {
     HardwareNative = 1,
     FullPrecision = 2,
@@ -909,8 +916,10 @@ public:
         shape.back() = rows_;
 
         // M=1 decode uses the same one-warp-per-output-row FastWarp topology
-        // for W4A16, W8A16, and W16A16. Prefill remains in materialize_torch()
-        // + framework/vendor GEMM and is deliberately unchanged.
+        // for W4A16, W8A16, and W16A16. On exact Tesla T4 / SM75 this is the
+        // production-validated decode route. Prefill remains in
+        // materialize_torch() + framework/vendor GEMM and is deliberately
+        // unchanged by the FastWarp production patch.
         auto output = torch::empty(shape, input.options());
         auto stream = c10::cuda::getCurrentCUDAStream(device_id_);
         launch(
@@ -1385,10 +1394,16 @@ static py::dict backend_info_py() {
     result["architecture"] = "sm" + std::to_string(prop.major) + std::to_string(prop.minor);
     result["weightWidths"] = py::make_tuple(4, 8, 16);
     result["activateDType"] = "float16";
+    // Prefill is intentionally unchanged by the FastWarp production patch.
+    // Keep the established public diagnostic value for compatibility; the
+    // implementation remains materialize_torch() + framework/vendor GEMM.
     result["prefill"] = "native";
     const std::string name(prop.name);
     const bool validated_t4 = prop.major == 7 && prop.minor == 5 && name.find("T4") != std::string::npos;
     result["decodePlanner"] = validated_t4 ? "t4Validated" : "cudaAutoTune";
+    result["decodeEngine"] = "FastWarp";
+    result["decodeStatus"] = validated_t4 ? "production" : "experimental";
+    result["decodeValidation"] = validated_t4 ? kT4FastWarpValidation : "unvalidated";
     result["validated"] = validated_t4;
     return result;
 }
