@@ -243,12 +243,12 @@ static int execution_width_for_bits(int storage_bits) {
     return 16;
 }
 
-// Exact production-validation identity for the frozen Tesla T4 FastWarp
-// M=1 decode route. Keep this identifier stable so backend diagnostics and
-// regression tests can distinguish the validated T4 contract from generic
-// CUDA auto-tuned execution.
+// Production-validation identity for the Tesla T4 / SM75 FastWarp M=1
+// algorithm contract.  This is intentionally model-agnostic: dispatch depends
+// on hardware, M=1 shape, and stored precision family, never model identity.
+// Granite 8B/3B runs are validation evidence, not runtime routing inputs.
 static constexpr const char* kT4FastWarpValidation =
-    "granite42-8b_t4_40x7_20260923";
+    "fastwarp_t4_sm75_m1_w4w8w16_v1";
 
 enum class DecodePolicy : uint8_t {
     HardwareNative = 1,

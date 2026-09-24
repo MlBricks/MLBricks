@@ -45,7 +45,7 @@ Backend diagnostics now expose:
 decodeEngine     = FastWarp
 decodeStatus     = production
 decodePlanner    = t4Validated
-decodeValidation = granite42-8b_t4_40x7_20260923
+decodeValidation = fastwarp_t4_sm75_m1_w4w8w16_v1
 prefill          = native
 ```
 

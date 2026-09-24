@@ -67,6 +67,18 @@ For `M=1`, `fullPrecision` uses the FP16 FastWarp kernel so policy comparisons u
 
 Switching policy does **not** require recalibration or recompression.
 
+
+### Model-agnostic compression boundary
+
+FastWarp routing does **not** inspect model names or architectures. For M=1 CUDA
+decode it is selected from the hardware and each matrix's stored precision family.
+
+`ElasticBit.compress()` also preserves a model's semantic output projection by
+default when the model exposes it through `get_output_embeddings()`. This avoids
+using architecture-specific names such as `lm_head` and prevents vocabulary/logit
+heads from being quantized accidentally across Hugging Face decoder models. Set
+`preserveOutputHead=False` only when you intentionally want that projection included.
+
 ## Tesla T4 FastWarp production status
 
 The exact Tesla T4 / CUDA `sm75` `hardwareNative` decode route is a
@@ -106,7 +118,7 @@ the LM head are outside this specific FastWarp confirmation.
 decodeEngine     = FastWarp
 decodeStatus     = production
 decodePlanner    = t4Validated
-decodeValidation = granite42-8b_t4_40x7_20260923
+decodeValidation = fastwarp_t4_sm75_m1_w4w8w16_v1
 ```
 
 Other CUDA GPUs keep the existing auto-tuned decode planner and are reported

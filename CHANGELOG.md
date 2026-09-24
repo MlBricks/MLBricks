@@ -79,3 +79,5 @@
 - Fused native readout/full-forward kernels remain inference-only and are explicitly blocked while gradients are enabled.
 
 - Release consistency: MLBricks package version is `1.0.0`; experimental SOUP retains its independent component version `0.1.0a3`.
+
+- FastWarp validation metadata is model-agnostic; semantic output heads are preserved by default.

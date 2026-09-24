@@ -547,6 +547,27 @@ class _ModelElasticBit:
         return text
 
 
+def _semanticOutputWeightIds(model: nn.Module) -> set[int]:
+    """Return Linear weight ids that represent the model's semantic output head.
+
+    This intentionally uses the model API instead of architecture-specific module
+    names such as ``lm_head``.  Hugging Face causal/seq2seq models expose their
+    token-output projection through ``get_output_embeddings()``; arbitrary
+    ``nn.Module`` implementations that do not expose that semantic API simply
+    return an empty protected set.
+    """
+    getter = getattr(model, "get_output_embeddings", None)
+    if not callable(getter):
+        return set()
+    try:
+        output = getter()
+    except Exception:
+        return set()
+    if isinstance(output, nn.Linear):
+        return {id(output.weight)}
+    return set()
+
+
 class ElasticBit:
     """Clean ElasticBit public namespace."""
 
@@ -677,6 +698,7 @@ class ElasticBit:
         calibrationData: Any,
         threshold: float,
         decodePolicy: str = "hardwareNative",
+        preserveOutputHead: bool = True,
     ) -> nn.Module:
         if not isinstance(model, nn.Module):
             raise TypeError("ElasticBit.compress() expects a torch.nn.Module")
@@ -700,6 +722,12 @@ class ElasticBit:
             for module in model.modules()
             if isinstance(module, nn.Embedding)
         }
+        outputWeightIds = (
+            _semanticOutputWeightIds(model)
+            if bool(preserveOutputHead)
+            else set()
+        )
+        protectedWeightIds = embeddingWeightIds | outputWeightIds
 
         collected: dict[str, list[np.ndarray]] = {}
         handles = []
@@ -723,7 +751,7 @@ class ElasticBit:
         for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
                 originalLinears.append((name, module))
-                if id(module.weight) not in embeddingWeightIds:
+                if id(module.weight) not in protectedWeightIds:
                     handles.append(module.register_forward_pre_hook(makeHook(name)))
 
         model.eval()
@@ -746,14 +774,19 @@ class ElasticBit:
         handles.clear()
 
         compressedNames: list[str] = []
-        skippedNames: list[str] = []
+        skippedNames: list[str] = [
+            name
+            for weightId, names in namesByWeight.items()
+            if weightId in outputWeightIds
+            for name in names
+        ]
         progress = os.environ.get("MLBRICKS_ELASTICBIT_PROGRESS", "").strip().lower() in {
             "1", "true", "yes", "on"
         }
         compressible = [
             (weightId, names)
             for weightId, names in namesByWeight.items()
-            if weightId not in embeddingWeightIds
+            if weightId not in protectedWeightIds
         ]
 
         for matrixIndex, (weightId, names) in enumerate(compressible, start=1):

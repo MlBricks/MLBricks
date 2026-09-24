@@ -150,7 +150,7 @@ def test_t4_fastwarp_production_backend_contract():
     assert backend.decodePlanner == "t4Validated"
     assert backend.decodeEngine == "FastWarp"
     assert backend.decodeStatus == "production"
-    assert backend.decodeValidation == "granite42-8b_t4_40x7_20260923"
+    assert backend.decodeValidation == "fastwarp_t4_sm75_m1_w4w8w16_v1"
     assert backend.prefill == "native"
 
 
@@ -195,3 +195,36 @@ def test_t4_fastwarp_production_family_mapping(storage_bits, expected_width):
     assert y.shape == (1, rows)
     assert torch.isfinite(y).all()
 
+
+
+@pytest.mark.parametrize("storage_bits", [3, 4, 5, 7, 8, 9, 15])
+@pytest.mark.parametrize("rows,cols", [(1, 1), (7, 13), (8, 31), (17, 32), (33, 65)])
+def test_t4_fastwarp_model_agnostic_shape_contract(storage_bits, rows, cols):
+    """FastWarp correctness is a matrix contract, not a model-name contract."""
+    backend = ElasticBit.backend()
+    if not backend.validated:
+        pytest.skip("requires production Tesla T4 / SM75 FastWarp backend")
+
+    # Use valid signed integer codes for each storage width.  The runtime expands
+    # them into the fixed W4/W8/W16 execution family selected by storage bits.
+    qmax = (1 << (storage_bits - 1)) - 1
+    low = -max(qmax, 1)
+    high = max(qmax, 1)
+    rng = np.random.default_rng(rows * 1000 + cols * 10 + storage_bits)
+    codes = rng.integers(low, high + 1, size=(rows, cols), dtype=np.int16)
+    scales = rng.uniform(0.002, 0.05, size=(rows,)).astype(np.float32)
+
+    matrix = RuntimeMatrix._compressSelectedCodes(
+        codes, scales, storage_bits, threshold=0.01, selectedError=0.0,
+        decodePolicy="hardwareNative",
+    )
+    x = torch.randn(1, cols, device="cuda", dtype=torch.float16)
+    y = matrix.forward(x)
+
+    weight = matrix._materializeTorch()
+    reference = torch.nn.functional.linear(x, weight)
+    assert y.shape == (1, rows)
+    assert torch.isfinite(y).all()
+    assert torch.nn.functional.cosine_similarity(
+        y.float(), reference.float(), dim=-1
+    ).item() > 0.999
