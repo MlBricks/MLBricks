@@ -19,6 +19,7 @@ from .runtime import (
     build_execution_plan, compile_module, prepare_module_execution, reset_execution_route, predict_module,
 )
 from .cache import GaussCache
+from .bolt.presets import BoltPresetCache
 
 
 @dataclass
@@ -28,7 +29,10 @@ class GaussianConfig:
     layers: int = 6
     dim: int = 384
     heads: int = 6
-    latent_dim: int = 32
+    latent_dim: int = 32  # legacy-only when bolt_mode='legacy'
+    bolt_mode: str = "quality"  # quality (AVQ-198), fast (BOLT), legacy
+    bolt_cache: str = "normal"  # normal=32, tight=16
+    avq_dim: int = 198
     position: str = "none"
     ffn: str = "standard"
     residual: str = "standard"
@@ -58,6 +62,16 @@ class GaussianConfig:
         if self.dim % self.heads:
             raise ValueError("dim must be divisible by heads")
         self.backend = normalize_backend(self.backend, warn_legacy=True)
+        self.bolt_mode = str(self.bolt_mode).strip().lower()
+        self.bolt_cache = str(self.bolt_cache).strip().lower()
+        if self.bolt_mode not in ("quality", "fast", "legacy"):
+            raise ValueError("bolt_mode must be quality, fast or legacy")
+        if self.bolt_cache not in ("normal", "tight"):
+            raise ValueError("bolt_cache must be normal or tight")
+        if int(self.avq_dim) < 1:
+            raise ValueError("avq_dim must be positive")
+        if self.bolt_mode != "legacy" and self.backend == "native":
+            raise ValueError("native BOLT / AVQ is not yet supported; use auto/pytorch")
         self.ffn = str(self.ffn).strip().lower().replace("-", "_")
         aliases = {
             "default": "standard", "ffn": "standard", "standard": "standard",
@@ -157,17 +171,16 @@ class _GaussianBlock(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.norm1 = _norm(cfg.norm, cfg.dim, cfg.bias)
-        self.attn = Bolt(
-            cfg.dim,
-            cfg.heads,
-            latent_dim=cfg.latent_dim,
-            bias=cfg.bias,
-            dropout=cfg.dropout,
-            causal=True,
-            backend=cfg.backend,
-            eps=cfg.eps,
-            position=rotary,
-        )
+        legacy = cfg.bolt_mode == "legacy" or cfg.latent_dim not in (16, 32)
+        if legacy:
+            self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
+                             bias=cfg.bias, dropout=cfg.dropout, causal=True,
+                             backend=cfg.backend, eps=cfg.eps, position=rotary)
+        else:
+            self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
+                             cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
+                             bias=cfg.bias, dropout=cfg.dropout, causal=True,
+                             backend=cfg.backend, position=rotary)
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
         self.ffn = _ffn(cfg, layer_index)
@@ -240,6 +253,16 @@ class _GaussianBlock(nn.Module):
     @torch.no_grad()
     def step(self, x, cache, previous_mixer=None, previous_state=None, *, position: int):
         normalized = self.norm1(x)
+        if self.attn.is_modern:
+            if isinstance(cache, BoltPresetCache):
+                mixer_update = self.attn._modern.decode_with_cache(
+                    normalized, cache, position=position)
+                next_cache = cache
+            else:
+                mixer_update, next_cache = self.attn.decode_step(normalized, cache)
+            x, mixer_update, next_state = self._finish_decode(
+                x, mixer_update, previous_mixer, previous_state)
+            return x, next_cache, mixer_update, next_state
         q, c_now, rho_now = self.attn.project_decode_state(
             normalized, start_pos=position
         )
@@ -400,13 +423,17 @@ class Gaussian(nn.Module):
         p = next(self.parameters())
         device = p.device if device is None else torch.device(device)
         dtype = p.dtype if dtype is None else dtype
-        caches = [
-            GaussCache.allocate(
-                batch_size, block.attn.num_heads, capacity, block.attn.latent_dim,
-                device=device, dtype=dtype,
-            )
-            for block in self.blocks
-        ]
+        caches = []
+        for block in self.blocks:
+            a=block.attn
+            if a.is_modern:
+                caches.append(BoltPresetCache.allocate(
+                    batch_size,a.num_heads,capacity,a.latent_dim,a.avq_dim,
+                    device=device,dtype=dtype))
+            else:
+                caches.append(GaussCache.allocate(
+                    batch_size,a.num_heads,capacity,a.latent_dim,
+                    device=device,dtype=dtype))
         self._prepared_generation = {
             "batch_size": int(batch_size),
             "capacity": capacity,

@@ -592,10 +592,16 @@ class Bolt(nn.Module):
 
     def __init__(
         self,
-        d_model: int,
-        num_heads: int,
+        d_model: int | None = None,
+        num_heads: int | None = None,
         *,
-        latent_dim: int = 32,
+        embed_dim: int | None = None,
+        latent_dim: int | None = None,
+        # Two independent controls: quality (AVQ-198) / fast (BOLT),
+        # normal (32-feature cache) / tight (16-feature cache).
+        mode: str | None = None,
+        cache: str = "normal",
+        avq_dim: int = 198,
         bias: bool = False,
         dropout: float = 0.0,
         causal: bool = True,
@@ -607,6 +613,50 @@ class Bolt(nn.Module):
         native_full_sequence: bool = False,
     ):
         super().__init__()
+        # PyTorch-like constructor keyword: nn.MultiheadAttention(embed_dim=..., num_heads=...).
+        # Preserve Bolt(384, 12) and Bolt(d_model=384, num_heads=12) unchanged.
+        # Refuse ambiguous duplicate dimension keywords rather than choosing silently.
+        if d_model is not None and embed_dim is not None:
+            raise TypeError("Specify either 'd_model' or 'embed_dim', not both")
+        if d_model is None:
+            d_model = embed_dim
+        if d_model is None or num_heads is None:
+            raise TypeError("Bolt requires 'embed_dim' (or 'd_model') and 'num_heads'")
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model <= 0:
+            raise ValueError('embed_dim/d_model must be a positive integer')
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError('num_heads must be a positive integer')
+        if d_model % num_heads:
+            raise ValueError('embed_dim/d_model must be divisible by num_heads')
+        # Public alias for compatibility with the naming in torch.nn.MultiheadAttention.
+        self.embed_dim = int(d_model)
+        # Historical explicit latent_dim calls keep the original BOLT equation
+        # unless mode is explicitly set. This keeps old parameter/checkpoint
+        # formats stable. Bolt(D,H) defaults to normal+quality as requested.
+        self.is_modern = bool(mode is not None and mode != 'legacy') or (mode is None and latent_dim is None)
+        self._modern = None
+        if self.is_modern:
+            from .presets import BoltPreset
+            target_mode = 'quality' if mode is None else str(mode)
+            if latent_dim is not None and int(latent_dim) != (32 if cache == 'normal' else 16):
+                raise ValueError('Modern BOLT latent_dim must match cache=normal(32) or tight(16)')
+            self._modern = BoltPreset(
+                d_model, num_heads, mode=target_mode, cache=cache, avq_dim=avq_dim,
+                bias=bias, dropout=dropout, causal=causal, backend=backend,
+                position=position,
+            )
+            self.d_model=int(d_model)
+            self.num_heads=int(num_heads)
+            self.head_dim=self.d_model//self.num_heads
+            self.latent_dim=self._modern.latent_dim
+            self.backend=self._modern.backend
+            self.position=self._modern.position
+            self.mode=self._modern.mode
+            self.cache_mode=self._modern.cache_mode
+            self.avq_dim=self._modern.avq_dim
+            return
+        if latent_dim is None:
+            latent_dim=32
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
         if latent_dim < 1:
@@ -642,12 +692,18 @@ class Bolt(nn.Module):
         self._packed_qcg_versions = None
 
     def set_backend(self, backend: str, *, recursive: bool = True):
+        if self.is_modern:
+            self._modern.set_backend(backend, recursive=recursive)
+            self.backend=self._modern.backend
+            return self
         del recursive
         self.backend = _validate_backend(backend)
         EXECUTION_PLANNER.clear_owner_routes(self)
         return self
 
     def resolved_backend(self) -> str:
+        if self.is_modern:
+            return self._modern.resolved_backend()
         if self.backend == "pytorch":
             return "pytorch"
         if self.backend == "native":
@@ -657,11 +713,17 @@ class Bolt(nn.Module):
         return "planner(auto forward) + native-decode"
 
     def set_position(self, position):
+        if self.is_modern:
+            self._modern.set_position(position)
+            self.position=self._modern.position
+            return self
         self.position = _resolve_rope(position, self.latent_dim)
         return self
 
     @property
     def cache_bytes_per_head_token(self) -> int:
+        if self.is_modern:
+            return self._modern.cache_bytes_per_head_token
         return 2 * self.latent_dim + 2
 
     @property
@@ -837,6 +899,8 @@ class Bolt(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_modern:
+            return self._modern(x)
         if x.dim() != 3:
             raise ValueError("x must have shape [B,T,D]")
         B, T, D = x.shape
@@ -1039,7 +1103,9 @@ class Bolt(nn.Module):
 
     @torch.no_grad()
     def prefill_with_cache(self, x: torch.Tensor, *, start_pos: int = 0):
-        """Fast eval prefill: one packed Q/C/G GEMM produces output and cache."""
+        """Fast prefill: output and compact cache. Modern returns C+AVQ state."""
+        if self.is_modern:
+            return self._modern.prefill_with_cache(x, start_pos=start_pos)
         if x.dim() != 3 or x.size(-1) != self.d_model:
             raise ValueError(f"x must have shape [B,T,{self.d_model}]")
         B, T, _ = x.shape
@@ -1093,6 +1159,8 @@ class Bolt(nn.Module):
         ``x`` may be ``[B,D]`` or ``[B,1,D]``. The returned output always
         has shape ``[B,1,D]`` to match ESA/SOUP's recurrent mixer contract.
         """
+        if self.is_modern:
+            return self._modern.decode_step(x, cache)
         if x.dim() == 2:
             x = x[:, None, :]
         if x.dim() != 3 or x.size(1) != 1 or x.size(-1) != self.d_model:
@@ -1130,6 +1198,8 @@ class Bolt(nn.Module):
     @torch.no_grad()
     def project_decode_state(self, x: torch.Tensor, *, start_pos: int):
         """One packed GEMM for current-token Q/C/G plus cache preprocessing."""
+        if self.is_modern:
+            raise RuntimeError('Modern BOLT uses decode_step() or decode_with_cache(); the legacy (q,c,rho) API is incompatible')
         if x.dim() == 3:
             if x.size(1) != 1:
                 raise ValueError("project_decode_state expects one token")
@@ -1597,6 +1667,8 @@ class Bolt(nn.Module):
         return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
 
     def extra_repr(self) -> str:
+        if self.is_modern:
+            return self._modern.extra_repr()
         return (
             f"d_model={self.d_model}, num_heads={self.num_heads}, "
             f"head_dim={self.head_dim}, latent_dim={self.latent_dim}, "

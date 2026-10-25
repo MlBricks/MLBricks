@@ -25,6 +25,13 @@ has_cuda_toolkit = (
     and (torch.version.cuda is not None or force_cuda)
 )
 
+# A requested modern BOLT native build must never silently produce a Python-only wheel.
+if os.getenv("MLBRICKS_BUILD_BOLT_MODERN_NATIVE", "0") == "1" and not has_cuda_toolkit:
+    raise RuntimeError(
+        "MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1 needs the CUDA toolkit and a compatible "
+        "CUDA-enabled PyTorch installation (or MLBRICKS_FORCE_CUDA=1)."
+    )
+
 expect_cuda_native = os.getenv("MLBRICKS_EXPECT_CUDA_NATIVE", "0") == "1"
 expected_cuda_version = os.getenv("MLBRICKS_EXPECT_CUDA_VERSION", "").strip()
 if expect_cuda_native:
@@ -137,6 +144,19 @@ if enabled("MLBRICKS_BUILD_BOLT_NATIVE") and has_cuda_toolkit:
             [csrc / "bolt_attention_bindings.cpp"],
             cuda_source=csrc / "bolt_attention_cuda.cu",
             use_fast_math=True,
+            lineinfo=True,
+        )
+    )
+
+# Optional modern BOLT-32/16 and AVQ-198/other widths CUDA extension.
+# This is a separate implementation from legacy rho-normalized BOLT.
+if enabled("MLBRICKS_BUILD_BOLT_MODERN_NATIVE") and has_cuda_toolkit:
+    csrc = ROOT / "mlbricks" / "bolt" / "native_modern"
+    extensions.append(
+        _extension(
+            "mlbricks._bolt_modern_cuda",
+            [csrc / "bindings.cpp"],
+            cuda_source=csrc / "kernels.cu",
             lineinfo=True,
         )
     )
