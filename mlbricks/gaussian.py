@@ -376,6 +376,22 @@ class Gaussian(nn.Module):
                         setter(value)
         return self
 
+    def enable_bolt_optimized_inference(self, enabled=True):
+        """Enable opt-in inference folding for modern BOLT blocks only.
+
+        Does not change training, default inference or checkpoint contents.
+        Use ``model.eval()`` and ``torch.no_grad()`` for accelerated decoding.
+        """
+        for block in self.blocks:
+            block.attn.enable_optimized_inference(enabled)
+        return self
+
+    def prepare_cuda_graph_generation(self, input_ids, max_new_tokens, *,
+                                      warmup=2):
+        """Create a one-shot greedy CUDA Graph generator (experimental)."""
+        from .bolt.graph_generation import BoltCudaGraphGenerator
+        return BoltCudaGraphGenerator(self, input_ids, max_new_tokens, warmup=warmup)
+
     def backend_report(self):
         return collect_backend_report(self)
 

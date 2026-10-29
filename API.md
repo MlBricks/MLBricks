@@ -747,3 +747,28 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 ## Licensing
 
 MLBricks Kit is distributed under the repository-level PolyForm Noncommercial License 1.0.0 terms plus component-specific notices shipped with the relevant components. Commercial use requires a separate written commercial license. See `LICENSE.md`, `LICENSING_NOTICE.md`, `COMMERCIAL_LICENSE.md`, and the component notices listed in `LICENSE.md`.
+
+## Modern BOLT optional inference acceleration (experimental)
+
+The modern BOLT API exposes `BoltPreset` for the quality/fast and tight/normal
+presets, `BoltPresetCache` for preallocated decode history, and
+`PostSoftmaxAVQ` for the optional recurrent memory.
+
+```python
+from mlbricks import Bolt, BoltModel, BoltPreset, BoltPresetCache, PostSoftmaxAVQ
+
+layer = Bolt(384, 12, mode='quality', cache='tight', backend='pytorch').eval()
+layer.enable_optimized_inference(True)  # packed Q/C/G; Q+P; AVQ output folding
+
+model = BoltModel(vocab_size=2048, dim=384, heads=12, layers=6,
+                  bolt_cache='tight', backend='pytorch', position='none').eval()
+model.enable_bolt_optimized_inference(True)
+# On CUDA with half precision and standard FFN/residual, dropout=0:
+# session = model.prepare_cuda_graph_generation(cuda_tokens, 64)
+# generated_ids = session.generate()  # greedy, experimental one-shot graph
+```
+
+All optimizations are opt-in and preserve checkpoint parameter names. The CUDA
+Graph implementation is a PyTorch-only experimental decode route with no
+`torch.compile` or Triton. For supported configurations and limitations see
+`BOLT_OPTIMIZED_INFERENCE_PATCH.md`.

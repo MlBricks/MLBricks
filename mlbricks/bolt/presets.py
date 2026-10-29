@@ -28,6 +28,7 @@ class BoltPresetCache:
     state: torch.Tensor | None = None  # [batch, avq_dim], float32
     length: int = 0
     scratch: torch.Tensor | None = None  # [batch, heads, capacity] float32, native softmax
+    k: torch.Tensor | None = None  # optional, pre-rotated RoPE keys for accelerated decode
 
     @property
     def capacity(self):
@@ -40,6 +41,7 @@ class BoltPresetCache:
 
     def reset(self):
         self.length = 0
+        self.k = None
         if self.state is not None:
             self.state.zero_()
         return self
@@ -56,6 +58,7 @@ class BoltPresetCache:
                 raise ValueError('BOLT cache AVQ state shape mismatch')
             self.state.copy_(state)
         self.length=n
+        self.k = None  # stale pre-rotated RoPE cache must never survive a new prefill
         return self
 
 
@@ -94,12 +97,40 @@ class PostSoftmaxAVQ(nn.Module):
         self.norm=_RMSNorm(width)
         self.back=nn.Linear(width,input_dim,bias=False)
         self.gamma=nn.Parameter(torch.zeros(()))
+        self.fold_output_inference = False
+        self._folded_back = None
+        self._folded_back_stamp = None
         with torch.no_grad():
             nn.init.normal_(self.project.weight,0.,.01)
             nn.init.zeros_(self.project.bias)
             self.project.bias[:width].fill_(math.log(.98/.02))
             self.project.weight[2*width:].zero_()  # zero read-gate initially
             nn.init.normal_(self.back.weight,0.,.02)
+
+    def _inference_back(self):
+        """AVQ output gain folded once; no extra parameters or checkpoint keys."""
+        tensors = (self.back.weight, self.norm.weight, self.gamma)
+        stamp = tuple((t._version, t.data_ptr(), t.dtype, t.device) for t in tensors)
+        if stamp != self._folded_back_stamp or self._folded_back is None:
+            # Keep master arithmetic in FP32, then cast to the projection dtype.
+            with torch.no_grad():
+                self._folded_back = (
+                    self.back.weight.detach().float()
+                    * self.norm.weight.detach().float().unsqueeze(0)
+                    * self.gamma.detach().float()
+                ).to(self.back.weight.dtype).contiguous()
+            self._folded_back_stamp = stamp
+        return self._folded_back
+
+    def _readout(self, o, s, r):
+        if self.fold_output_inference and not self.training and not torch.is_grad_enabled():
+            sf = s.float()
+            features = (sf * torch.rsqrt(sf.square().mean(-1, keepdim=True)
+                      + self.norm.eps)) * (1. + r.float())
+            return o + F.linear(features.to(o.dtype), self._inference_back()).to(o.dtype)
+        h = self.norm(s) * (1. + r)
+        update = self.back(h).to(o.dtype)
+        return o + self.gamma.to(o.dtype) * update
 
     def components(self,o):
         raw=self.project(o)
@@ -112,20 +143,24 @@ class PostSoftmaxAVQ(nn.Module):
             s=_native.avq_scan(a.contiguous(),v.contiguous())
         else:
             s=_affine_scan(a,v)
-        h=self.norm(s)*(1.+r)
-        update=self.back(h).to(o.dtype)
-        enhanced=o+self.gamma.to(o.dtype)*update
+        enhanced=self._readout(o,s,r)
         return (enhanced,s[:,-1,:].contiguous()) if return_state else enhanced
 
-    def step(self,o,state):
+    def step(self,o,state,*,inplace=False):
         a,v,r=self.components(o)
-        if self.use_native and o.is_cuda:
+        if inplace:
+            # Only used with owned float32 BoltPresetCache state; no autograd.
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError('in-place AVQ state is for eval/no-grad only')
+            if state.dtype != torch.float32:
+                raise TypeError('AVQ cache state must be float32')
+            state.mul_(a[:,0,:]).add_(v[:,0,:])
+            s=state
+        elif self.use_native and o.is_cuda:
             s=_native.avq_step(a[:,0,:],v[:,0,:],state.float())
         else:
             s=a[:,0,:]*state.float()+v[:,0,:]
-        h=(self.norm(s)*(1.+r[:,0,:]))[:,None,:]
-        update=self.back(h).to(o.dtype)
-        return o+self.gamma.to(o.dtype)*update, s
+        return self._readout(o,s[:,None,:],r), s
 
 
 class BoltPreset(nn.Module):
@@ -179,6 +214,9 @@ class BoltPreset(nn.Module):
         self.out_proj=nn.Linear(width,d_model,bias=bias)
         self.avq=PostSoftmaxAVQ(width,self.avq_dim) if mode=='quality' else None
         self.is_modern=True
+        self.optimized_inference = False  # opt in; training always follows the original path
+        self._packed_inference = None
+        self._packed_inference_stamp = None
 
     @property
     def cache_bytes_per_head_token(self):
@@ -220,6 +258,36 @@ class BoltPreset(nn.Module):
             return False
         return True
 
+    def enable_optimized_inference(self, enabled=True):
+        """Enable packed Q/C/G, folded Q+P and folded AVQ output for eval/no-grad.
+
+        The original Parameters and state_dict keys are untouched.
+        """
+        self.optimized_inference = bool(enabled)
+        self._packed_inference = None
+        self._packed_inference_stamp = None
+        if self.avq is not None:
+            self.avq.fold_output_inference = bool(enabled)
+        return self
+
+    def _inference_projection(self, x):
+        weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
+        biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
+        tracked = (*weights, self.p, *(b for b in biases if b is not None))
+        stamp = tuple((t._version, t.data_ptr(), t.dtype, t.device) for t in tracked)
+        if stamp != self._packed_inference_stamp or self._packed_inference is None:
+            with torch.no_grad():
+                wq = weights[0].detach() * self.p.detach().reshape(-1,1)
+                w = torch.cat((wq,weights[1].detach(),weights[2].detach()),dim=0).contiguous()
+                bias = None
+                if biases[0] is not None:
+                    bq = biases[0].detach() * self.p.detach().reshape(-1)
+                    bias = torch.cat((bq,biases[1].detach(),biases[2].detach()),dim=0).contiguous()
+            self._packed_inference = (w, bias)
+            self._packed_inference_stamp = stamp
+        q,u,g = F.linear(x, *self._packed_inference).chunk(3, dim=-1)
+        return q,u,g
+
     def set_position(self,position):
         from ..position import RoPE
         if position is None or position=='none':self.position=None
@@ -230,17 +298,24 @@ class BoltPreset(nn.Module):
 
     def _project(self,x,start_pos=0):
         b,t,_=x.shape
-        q=self.q_proj(x).reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
-        u=self.c_proj(x).reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
-        g=self.g_proj(x).reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
-        if self._native_enabled(x) and _native.supports_features(q,u,g,self.p):
+        native = self._native_enabled(x)
+        folded = self.optimized_inference and not self.training and not torch.is_grad_enabled() and not native
+        if folded:
+            q,u,g = self._inference_projection(x)
+        else:
+            q,u,g = self.q_proj(x),self.c_proj(x),self.g_proj(x)
+        q=q.reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
+        u=u.reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
+        g=g.reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
+        if native and _native.supports_features(q,u,g,self.p):
             q,c=_native.features(q.contiguous(),u.contiguous(),g.contiguous(),self.p)
         else:
             if self.backend=='native':
                 raise RuntimeError('Native BOLT features require CUDA q/u/g with matching FP16/FP32 dtypes and FP32 P')
             c=u*(1.+torch.tanh(g))
             # BOLT learned per-feature query multiplier, not legacy dynamic rho.
-            q=q*self.p[None,:,None,:]
+            if not folded:
+                q=q*self.p[None,:,None,:]
         if self.position is not None:
             q=self.position(q,start_pos=int(start_pos))
             k=self.position(c,start_pos=int(start_pos))
@@ -335,7 +410,15 @@ class BoltPreset(nn.Module):
         if not (native and self.position is None):
             cache.c[:,:,pos:pos+1,:].copy_(c_now)
         c=cache.c[:,:,:pos+1,:]
-        keys=self.position(c,start_pos=0) if self.position is not None else c
+        if self.position is not None and self.optimized_inference:
+            if cache.k is None:
+                cache.k = torch.empty_like(cache.c)
+                if pos:
+                    cache.k[:,:,:pos,:].copy_(self.position(cache.c[:,:,:pos,:],start_pos=0))
+            cache.k[:,:,pos:pos+1,:].copy_(self.position(c_now,start_pos=pos))
+            keys=cache.k[:,:,:pos+1,:]
+        else:
+            keys=self.position(c,start_pos=0) if self.position is not None else c
         if native and self.position is None:
             if cache.scratch is None:
                 cache.scratch=torch.empty((*cache.c.shape[:2],cache.capacity),device=x.device,dtype=torch.float32)
@@ -346,9 +429,39 @@ class BoltPreset(nn.Module):
             o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self.head_dim**-.5)
         o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
         if self.avq is not None:
-            o,s=self.avq.step(o,cache.state)
-            cache.state.copy_(s)
+            if self.optimized_inference and not self.training and not torch.is_grad_enabled() and not native:
+                o,_=self.avq.step(o,cache.state,inplace=True)
+            else:
+                o,s=self.avq.step(o,cache.state)
+                cache.state.copy_(s)
         cache.length=pos+1
+        return self.out_proj(o)
+
+    @torch.no_grad()
+    def graph_decode_with_cache(self, x, cache: BoltPresetCache, *, position, positions):
+        """Opt-in graph-safe PyTorch SDPA decode, without Triton/torch.compile.
+
+        Both position and positions must be device tensors. All cache addresses are
+        stable; caller advances position after each captured graph iteration.
+        RoPE/native kernels are deliberately excluded until validated on CUDA.
+        """
+        if not self.optimized_inference or self.training or self.position is not None:
+            raise RuntimeError('Graph BOLT requires eval, optimized inference, and no RoPE')
+        if self.backend == 'native':
+            raise RuntimeError('Graph BOLT currently supports PyTorch backend only')
+        if x.ndim == 2:x=x[:,None,:]
+        if not isinstance(cache,BoltPresetCache) or x.size(1)!=1:
+            raise ValueError('graph decode expects [B,1,D] and BoltPresetCache')
+        b = x.size(0)
+        q, _, c_now = self._project(x,start_pos=0)
+        idx=position.reshape(1,1,1,1).expand(b,self.num_heads,1,self.latent_dim)
+        cache.c.scatter_(2,idx,c_now)
+        mask=(positions<=position).reshape(1,1,1,-1)
+        o=F.scaled_dot_product_attention(q.to(cache.c.dtype),cache.c,cache.c,
+            attn_mask=mask,is_causal=False,dropout_p=0.,scale=self.head_dim**-.5)
+        o=o.transpose(1,2).contiguous().reshape(b,1,-1)
+        if self.avq is not None:
+            o,_=self.avq.step(o,cache.state,inplace=True)
         return self.out_proj(o)
 
     lightning_prefill=prefill_with_cache

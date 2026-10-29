@@ -691,6 +691,13 @@ class Bolt(nn.Module):
         self._packed_qcg_cache = None
         self._packed_qcg_versions = None
 
+    def enable_optimized_inference(self, enabled=True):
+        """Toggle modern BOLT's opt-in, checkpoint-compatible inference folding."""
+        if not self.is_modern:
+            raise ValueError('Optimized inference is implemented for modern BOLT presets only')
+        self._modern.enable_optimized_inference(enabled)
+        return self
+
     def set_backend(self, backend: str, *, recursive: bool = True):
         if self.is_modern:
             self._modern.set_backend(backend, recursive=recursive)
