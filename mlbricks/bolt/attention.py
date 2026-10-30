@@ -11,6 +11,8 @@ from .._reference import attention_forward_reference, gauss_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
 from ..position import RoPE
+from .tensor_versions import inference_safe_version
+from .auto_device import place_new_module, input_on_module
 
 from .._backend import (
     WORKSPACES,
@@ -186,6 +188,7 @@ class Attention(nn.Module):
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
+        place_new_module(self)
 
     def set_backend(self, backend: str, *, recursive: bool = True):
         del recursive
@@ -205,6 +208,7 @@ class Attention(nn.Module):
         return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = input_on_module(x, self)
         if x.dim() != 3:
             raise ValueError("x must have shape [B,T,D]")
         B, T, D = x.shape
@@ -654,6 +658,7 @@ class Bolt(nn.Module):
             self.mode=self._modern.mode
             self.cache_mode=self._modern.cache_mode
             self.avq_dim=self._modern.avq_dim
+            place_new_module(self)
             return
         if latent_dim is None:
             latent_dim=32
@@ -690,6 +695,28 @@ class Bolt(nn.Module):
         # source Parameter version changes.
         self._packed_qcg_cache = None
         self._packed_qcg_versions = None
+        place_new_module(self)
+
+    def enable_optimized_inference(self, enabled=True):
+        """Toggle modern BOLT's opt-in, checkpoint-compatible inference folding."""
+        if not self.is_modern:
+            raise ValueError('Optimized inference is implemented for modern BOLT presets only')
+        self._modern.enable_optimized_inference(enabled)
+        return self
+
+    def enable_strict_inference(self, enabled=True):
+        """Use stock arithmetic with graph-compatible modern BOLT cache routing."""
+        if not self.is_modern:
+            raise ValueError('strict inference supports modern BOLT presets only')
+        self._modern.enable_strict_inference(enabled)
+        return self
+
+    def enable_v05_native_fusions(self, *, gate=True, avq=True):
+        """Experimental opt-in v0.5 fused CUDA decode operations."""
+        if not self.is_modern:
+            raise ValueError('v0.5 native fusions support modern BOLT only')
+        self._modern.enable_v05_native_fusions(gate=gate, avq=avq)
+        return self
 
     def set_backend(self, backend: str, *, recursive: bool = True):
         if self.is_modern:
@@ -766,8 +793,8 @@ class Bolt(nn.Module):
         weights = (self.q_proj.weight, self.c_proj.weight, self.g_proj.weight)
         biases = (self.q_proj.bias, self.c_proj.bias, self.g_proj.bias)
         stamp = tuple(
-            (int(w._version), str(w.device), str(w.dtype), int(w.data_ptr())) for w in weights
-        ) + tuple(-1 if b is None else int(b._version) for b in biases)
+            (inference_safe_version(w), str(w.device), str(w.dtype), int(w.data_ptr())) for w in weights
+        ) + tuple(-1 if b is None else inference_safe_version(b) for b in biases)
         if self._packed_qcg_cache is None or self._packed_qcg_versions != stamp:
             weight = torch.cat([w.detach() for w in weights], dim=0).contiguous()
             bias = None if biases[0] is None else torch.cat([b.detach() for b in biases], dim=0).contiguous()
@@ -899,6 +926,7 @@ class Bolt(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = input_on_module(x, self)
         if self.is_modern:
             return self._modern(x)
         if x.dim() != 3:

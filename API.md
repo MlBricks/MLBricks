@@ -18,7 +18,7 @@ This reference is generated against the public package surface exported by `mlbr
 ```python
 from mlbricks import (
     ESA, ESAModel, ESAModelConfig,
-    Bolt, BoltAttention, Attention, BoltModel, BoltConfig,
+    Bolt, BoltAttention, Attention, BoltModel, AttentionModel, BoltConfig,
     SOUP, soup,
     Vesa, VesaConfig, VisionBolt, VisionBoltConfig,
     Bricks, Brick,
@@ -29,6 +29,27 @@ from mlbricks import (
     Trainer,
 )
 ```
+
+
+### Automatic CUDA-first BOLT/QKV generation (experimental)
+
+```python
+from mlbricks import BoltModel, AttentionModel
+model = BoltModel(vocab_size=2048, dim=384, heads=12, layers=6,
+                  context=1024, bolt_cache="tight", avq_dim=198)
+tokens = model.generate(prompt, 64)  # defaults to greedy, no .cuda()/.half()
+print(model.inference_info())
+```
+
+Training remains in the model's original parameter dtype (normally FP32).
+Only on validated Tesla T4 / greedy / batch-one / supported configurations,
+`generate` automatically allocates a separate FP16 inference mirror and uses
+Strict CUDA Graph decoding. The FP32 master stays unchanged; the mirror is
+excluded from checkpoints and optimizers. It is invalidated by training,
+parameter-version changes and explicit device/dtype moves. **FP16 inference
+outputs are not guaranteed numerically identical to FP32 inference**, only
+to the corresponding tested FP16 eager reference. Other setups fall back to
+eager. The initial shadow and graph capture consume time and memory.
 
 ## Backend policy and execution planner
 
@@ -747,3 +768,73 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 ## Licensing
 
 MLBricks Kit is distributed under the repository-level PolyForm Noncommercial License 1.0.0 terms plus component-specific notices shipped with the relevant components. Commercial use requires a separate written commercial license. See `LICENSE.md`, `LICENSING_NOTICE.md`, `COMMERCIAL_LICENSE.md`, and the component notices listed in `LICENSE.md`.
+
+## Modern BOLT optional inference acceleration (experimental)
+
+The modern BOLT API exposes `BoltPreset` for the quality/fast and tight/normal
+presets, `BoltPresetCache` for preallocated decode history, and
+`PostSoftmaxAVQ` for the optional recurrent memory.
+
+```python
+from mlbricks import Bolt, BoltModel, BoltPreset, BoltPresetCache, PostSoftmaxAVQ
+
+layer = Bolt(384, 12, mode='quality', cache='tight', backend='pytorch').eval()
+layer.enable_optimized_inference(True)  # packed Q/C/G; Q+P; AVQ output folding
+
+model = BoltModel(vocab_size=2048, dim=384, heads=12, layers=6,
+                  bolt_cache='tight', backend='pytorch', position='none').eval()
+model.enable_bolt_optimized_inference(True)
+# On CUDA with half precision and standard FFN/residual, dropout=0:
+# session = model.prepare_cuda_graph_generation(cuda_tokens, 64)
+# generated_ids = session.generate()  # greedy, experimental one-shot graph
+```
+
+All optimizations are opt-in and preserve checkpoint parameter names. The CUDA
+Graph implementation is a PyTorch-only experimental decode route with no
+`torch.compile` or Triton. For supported configurations and limitations see
+`BOLT_OPTIMIZED_INFERENCE_PATCH.md`.
+
+## Automatic CUDA inference (experimental integration)
+
+The existing public `BoltModel`, `Bolt`, and `Attention` constructors are unchanged.
+On a CUDA-equipped system they select CUDA by default; pass explicit `.to(device)`
+to override. Inputs to the built-in public forward/generate paths are aligned to
+module placement. CUDA-first construction may be disabled with
+`MLBRICKS_AUTO_CUDA=0` when a user intentionally trains on CPU.
+
+`AttentionModel` is a ready-made causal QKV language model for users who want
+model-level generation, rather than only an `Attention` mixer layer. Its
+minimal interface mirrors `BoltModel`:
+
+```python
+from mlbricks import AttentionModel, BoltModel
+
+qkv = AttentionModel(vocab_size=2048, dim=384, heads=12,
+                     layers=6, context=1024)
+bolt = BoltModel(vocab_size=2048, dim=384, heads=12,
+                 layers=6, context=1024, bolt_cache='tight', avq_dim=198)
+
+qkv.train()        # regular autograd model forward
+qkv.eval()
+qkv_tokens = qkv.generate(prompt, max_new_tokens=64, temperature=0)
+
+bolt.eval()
+bolt_tokens = bolt.generate(prompt, max_new_tokens=64, temperature=0)
+print(qkv.inference_info())
+print(bolt.inference_info())
+```
+
+**Precision contract:** Neither `.eval()` nor `.generate()` silently casts FP32
+parameters to FP16; this would change the numerical reference and potentially
+harm subsequent training. On supported FP16 Tesla T4 greedy workloads, both
+models select experimental stock-arithmetic CUDA Graph execution automatically.
+FP32, sampling, and other unvalidated cases fall back to the existing eager
+path with original model dtype preserved. The QKV model-level graph generator
+is newly implemented and requires full Tesla T4 verification before promotion
+to a production default. Inference graphs are one-shot per request and not
+reused across unrelated prompts.
+
+For model-level QKV generation use `AttentionModel`; the standalone `Attention`
+layer remains a mixer that accepts `[B,T,D]` hidden states and has no token
+sampling API. No existing checkpoint parameter names of `BoltModel`, `Bolt`, or
+`Attention` are modified by the new QKV model.

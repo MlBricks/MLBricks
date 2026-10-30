@@ -161,6 +161,24 @@ if enabled("MLBRICKS_BUILD_BOLT_MODERN_NATIVE") and has_cuda_toolkit:
         )
     )
 
+# Experimental BOLT v0.5 inference-only fusions. This is a separate CUDA
+# extension; it does not modify the existing modern/native training kernels.
+if enabled("MLBRICKS_BUILD_BOLT_V05_NATIVE"):
+    if not has_cuda_toolkit:
+        raise RuntimeError(
+            "MLBRICKS_BUILD_BOLT_V05_NATIVE=1 requires a CUDA-enabled PyTorch "
+            "installation and CUDA toolkit."
+        )
+    csrc = ROOT / "mlbricks" / "bolt" / "native_v05"
+    extensions.append(
+        _extension(
+            "mlbricks._bolt_v05_cuda",
+            [csrc / "bindings.cpp"],
+            cuda_source=csrc / "kernels.cu",
+            lineinfo=True,
+        )
+    )
+
 # Legacy pre-1.0 VESA recurrence extension. Unified VESA now uses mlbricks.esa.
 # Keep explicit opt-in for compatibility, but do not build this unused engine by default.
 if os.getenv("MLBRICKS_BUILD_VESA_NATIVE", "0") == "1":

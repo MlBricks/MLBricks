@@ -20,6 +20,8 @@ from .runtime import (
 )
 from .cache import GaussCache
 from .bolt.presets import BoltPresetCache
+from .bolt.auto_device import place_new_module, input_on_module
+from .bolt.inference_mirror import fp16_inference_mirror, drop_fp16_inference_mirror
 
 
 @dataclass
@@ -328,8 +330,25 @@ class Gaussian(nn.Module):
         self._prepared_generation = None
         self._compile_generation_regions = False
         self._generation_compile_mode = "default"
+        # CUDA-first convenience.  This never changes the model dtype or saved keys.
+        # Users can still call .to('cpu') or disable initial placement via
+        # MLBRICKS_AUTO_CUDA=0 for constrained environments.
+        self._mlbricks_last_inference = 'not-run'
+        self._mlbricks_last_precision = 'original'
+        place_new_module(self)
+
+    def train(self, mode: bool = True):
+        if mode:
+            drop_fp16_inference_mirror(self)
+        return super().train(mode)
+
+    def _apply(self, fn):
+        # Explicit model.to()/half()/float() must release a stale GPU mirror.
+        drop_fp16_inference_mirror(self)
+        return super()._apply(fn)
 
     def _embed(self, input_ids: torch.Tensor, *, start_pos: int = 0) -> torch.Tensor:
+        input_ids = input_on_module(input_ids, self)
         if input_ids.ndim != 2:
             raise ValueError("input_ids must be [B,T]")
         if input_ids.size(1) + start_pos > self.config.context:
@@ -351,6 +370,7 @@ class Gaussian(nn.Module):
         logits = self.lm_head(self.final_norm(x))
         if targets is None:
             return logits
+        targets = targets.to(logits.device, non_blocking=True)
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1
         )
@@ -375,6 +395,56 @@ class Gaussian(nn.Module):
                     except TypeError:
                         setter(value)
         return self
+
+    def enable_bolt_optimized_inference(self, enabled=True):
+        """Enable opt-in inference folding for modern BOLT blocks only.
+
+        Does not change training, default inference or checkpoint contents.
+        Use ``model.eval()`` and ``torch.no_grad()`` for accelerated decoding.
+        """
+        for block in self.blocks:
+            block.attn.enable_optimized_inference(enabled)
+        return self
+
+    def enable_bolt_strict_inference(self, enabled=True):
+        """Stock-exact arithmetic with experimental graph-compatible BOLT decoding.
+
+        Keeps model weights and training unchanged; no custom CUDA or Triton.
+        This is an opt-in inference mode, not a global production default.
+        Use a fresh CUDA Graph session for each request.
+        """
+        for block in self.blocks:
+            block.attn.enable_strict_inference(enabled)
+        return self
+
+    def enable_bolt_v05_native(self, *, gate=True, avq=True):
+        """Enable opt-in v0.5 inference CUDA fusions on every modern BOLT block.
+
+        First call enable_bolt_optimized_inference(True). This never modifies
+        trainable parameters, checkpoint keys, or training forward operations.
+        Use avq=False with fast-mode (AVQ-free) models.
+        """
+        for block in self.blocks:
+            block.attn.enable_v05_native_fusions(gate=gate, avq=avq)
+        return self
+
+    def prepare_bolt_v05_native(self):
+        """Load/compile the optional native v0.5 extension before graph capture."""
+        from .bolt import native_v05
+        for block in self.blocks:
+            preset = block.attn._modern
+            if preset is not None and (preset.v05_native_gate or (
+                    preset.avq is not None and preset.avq.v05_native_avq)):
+                if next(self.parameters()).is_cuda:
+                    native_v05.get_extension(required=True)
+                return self
+        return self
+
+    def prepare_cuda_graph_generation(self, input_ids, max_new_tokens, *,
+                                      warmup=2):
+        """Create a one-shot greedy CUDA Graph generator (experimental)."""
+        from .bolt.graph_generation import BoltCudaGraphGenerator
+        return BoltCudaGraphGenerator(self, input_ids, max_new_tokens, warmup=warmup)
 
     def backend_report(self):
         return collect_backend_report(self)
@@ -504,25 +574,125 @@ class Gaussian(nn.Module):
         logits = self.lm_head(self.final_norm(x))
         return logits, new_caches
 
+    def _auto_strict_graph_eligible(self, input_ids, max_new_tokens, temperature, top_k, *, allow_fp32=False):
+        """Select only the CUDA/FP16/greedy configurations verified by BOLT tests.
+
+        Standalone Bolt / Attention module forwards keep their existing SDPA
+        paths. The CUDA Graph is an autoregressive model-level optimization.
+        """
+        p = next(self.parameters())
+        cfg = self.config
+        if not (p.is_cuda and p.dtype in ((torch.float16, torch.float32) if allow_fp32 else (torch.float16,)) and input_ids.is_cuda):
+            return False
+        if not (torch.cuda.get_device_capability(p.device) == (7, 5)):
+            return False  # Current strict numerical validation: Tesla T4.
+        if int(input_ids.size(0)) != 1 or int(max_new_tokens) < 2:
+            return False
+        if temperature > 0 or top_k is not None:
+            return False
+        if cfg.bolt_mode == 'legacy' or cfg.position != 'none':
+            return False
+        if cfg.ffn != 'standard' or cfg.residual != 'standard' or cfg.dropout != 0.0:
+            return False
+        if cfg.backend == 'native':
+            return False
+        return True
+
+    def inference_info(self):
+        """Non-configurational diagnostic: report the actually used execution."""
+        p = next(self.parameters())
+        mirrored = self._mlbricks_last_precision == 'fp32_master_fp16_inference'
+        if self._mlbricks_last_inference == 'strict_cuda_graph':
+            reason = ('validated FP16 T4 graph via an independent inference mirror'
+                      if mirrored else 'validated FP16 T4 greedy generation')
+        elif getattr(self, '_mlbricks_fp16_mirror_oom', False):
+            reason = 'insufficient GPU memory for separate FP16 inference mirror'
+        elif p.dtype != torch.float16:
+            reason = 'FP32 retained; graph path unsupported for this request or device'
+        elif p.device.type != 'cuda':
+            reason = 'CUDA Graph requires a supported CUDA GPU'
+        else:
+            reason = 'configuration not in the validated CUDA Graph matrix'
+        return {'device': str(p.device), 'dtype': str(p.dtype),
+                'precision_policy': ('fp32_master_fp16_inference_mirror' if mirrored
+                                     else 'preserve_model_dtype'),
+                'inference_dtype': 'torch.float16' if mirrored else str(p.dtype),
+                'last_execution': self._mlbricks_last_inference,
+                'reason': reason,
+                'strict_graph': 'auto-for-supported-greedy-cuda-fp16-t4'}
+
     @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
         max_new_tokens: int,
         *,
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_k: int | None = None,
     ) -> torch.Tensor:
+        input_ids = input_on_module(input_ids, self)
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
         if max_new_tokens == 0:
+            self._mlbricks_last_inference = 'no-tokens'
             return input_ids
         total = input_ids.size(1) + max_new_tokens
         if total > self.config.context:
             raise ValueError("generation would exceed configured context")
+        # On tested CUDA configurations, keep FP32 training/master weights
+        # untouched and generate with an internal FP16 inference copy. The
+        # copy is version-guarded and not registered in state_dict/parameters.
+        self._mlbricks_fp16_mirror_oom = False
+        self._mlbricks_last_precision = 'original'
+        if (next(self.parameters()).dtype == torch.float32 and
+                self._auto_strict_graph_eligible(
+                    input_ids, max_new_tokens, temperature, top_k, allow_fp32=True)):
+            try:
+                mirror, _ = fp16_inference_mirror(
+                    self, lambda: type(self)(config=self.config))
+                result = mirror.generate(input_ids, max_new_tokens,
+                                         temperature=temperature, top_k=top_k)
+                self._mlbricks_last_inference = mirror._mlbricks_last_inference
+                self._mlbricks_last_precision = 'fp32_master_fp16_inference'
+                return result
+            except torch.cuda.OutOfMemoryError:
+                # A memory-constrained system can still run the FP32 eager path.
+                drop_fp16_inference_mirror(self)
+                self._mlbricks_fp16_mirror_oom = True
+
         was_training = self.training
         self.eval()
 
+        # Default strict CUDA Graph path for the precisely validated subset.
+        # Do not reconfigure explicit experimental fast/native settings.
+        # Sampling, unsupported GPUs/dtypes/configurations preserve eager behavior.
+        experimental = any(getattr(b.attn._modern, 'optimized_inference', False)
+                           and not getattr(b.attn._modern, 'strict_inference', False)
+                           for b in self.blocks if b.attn.is_modern)
+        if (not experimental and self._auto_strict_graph_eligible(
+                input_ids, max_new_tokens, temperature, top_k)):
+            original_backend = self.backend
+            if original_backend == 'auto':
+                self.set_backend('pytorch')
+            self.enable_bolt_strict_inference(True)
+            try:
+                # In mixed-precision models the AVQ reference readout requires
+                # CUDA autocast for stock arithmetic's matmul dtype contract.
+                with torch.autocast('cuda', dtype=torch.float16):
+                    session = self.prepare_cuda_graph_generation(input_ids, max_new_tokens)
+                    result = session.generate()
+                self._mlbricks_last_inference = 'strict_cuda_graph'
+                return result
+            finally:
+                # Restore routing so the next training forward isn't forced
+                # into a graph-only execution policy.
+                self.enable_bolt_strict_inference(False)
+                if original_backend == 'auto':
+                    self.set_backend('auto')
+                if was_training:
+                    self.train()
+
+        self._mlbricks_last_inference = 'pytorch_eager'
         # Fixed-capacity cache + token storage: no growing torch.cat in the hot
         # autoregressive loop. Cache tensors keep stable addresses as well.
         cache_buffers = self._generation_caches(input_ids, total)
