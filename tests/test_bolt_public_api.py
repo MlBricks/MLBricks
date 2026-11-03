@@ -32,7 +32,7 @@ def test_legacy_gauss_import_constructs_bolt():
 
 def test_bolt_prefill_decode_step_matches_full_causal_forward():
     torch.manual_seed(7)
-    layer = Bolt(16, 4, latent_dim=4, backend="pytorch", dropout=0.0).eval()
+    layer = Bolt(16, 4, latent_dim=4, backend="pytorch", dropout=0.0, device="cpu", precision="fp32").eval()
     prefix = torch.randn(2, 5, 16)
     continuation = torch.randn(2, 3, 16)
 
@@ -59,7 +59,7 @@ def test_bolt_packed_training_matches_explicit_sdpa_and_preserves_parameters():
     import torch.nn.functional as F
 
     torch.manual_seed(19)
-    layer = Bolt(32, 4, latent_dim=8, backend="pytorch", dropout=0.0, use_sdpa=True).train()
+    layer = Bolt(32, 4, latent_dim=8, backend="pytorch", dropout=0.0, use_sdpa=True, device="cpu", precision="fp32").train()
     x1 = torch.randn(2, 7, 32, requires_grad=True)
     x2 = x1.detach().clone().requires_grad_(True)
 

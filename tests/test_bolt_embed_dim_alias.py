@@ -8,8 +8,10 @@ from mlbricks import Bolt
 
 def test_embed_dim_keyword_builds_identical_default_preset_and_checkpoint():
     torch.manual_seed(123)
-    original = Bolt(48, 6)
-    alias = Bolt(embed_dim=48, num_heads=6)
+    # Historical CPU/FP32 parity tests must opt into CPU explicitly now that
+    # the public API defaults to CUDA and mixed precision when available.
+    original = Bolt(48, 6, device="cpu", precision="fp32")
+    alias = Bolt(embed_dim=48, num_heads=6, device="cpu", precision="fp32")
     alias.load_state_dict(original.state_dict(), strict=True)
     assert (alias.embed_dim, alias.d_model, alias.num_heads, alias.latent_dim, alias.avq_dim) == (48, 48, 6, 32, 198)
     x = torch.randn(2, 5, 48)
@@ -41,7 +43,7 @@ def test_invalid_or_ambiguous_arguments_raise(kwargs):
 
 
 def test_modern_preset_never_silently_uses_legacy_native_kernel():
-    modern = Bolt(embed_dim=48, num_heads=6, backend="auto")
+    modern = Bolt(embed_dim=48, num_heads=6, backend="auto", device="cpu", precision="fp32")
     assert modern.resolved_backend().startswith("pytorch")
     modern.set_backend("native")
     with pytest.raises(RuntimeError, match="requires a CUDA tensor"):

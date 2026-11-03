@@ -1162,6 +1162,12 @@ class Bolt(nn.Module):
 
     @torch.no_grad()
     def prefill_with_cache(self, x: torch.Tensor, *, start_pos: int = 0):
+        """Prefill under the same execution precision used by forward()."""
+        with self._precision_context():
+            return self._prefill_with_cache_impl(x, start_pos=start_pos)
+
+    @torch.no_grad()
+    def _prefill_with_cache_impl(self, x: torch.Tensor, *, start_pos: int = 0):
         """Fast prefill: output and compact cache. Modern returns C+AVQ state."""
         if x.device != next(self.parameters()).device:
             x = x.to(next(self.parameters()).device, non_blocking=True)
@@ -1211,6 +1217,16 @@ class Bolt(nn.Module):
 
     @torch.no_grad()
     def decode_step(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Decode under the same execution precision as forward()."""
+        with self._precision_context():
+            return self._decode_step_impl(x, cache)
+
+    @torch.no_grad()
+    def _decode_step_impl(
         self,
         x: torch.Tensor,
         cache: tuple[torch.Tensor, torch.Tensor],
