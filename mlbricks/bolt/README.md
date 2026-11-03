@@ -1,3 +1,79 @@
+# MLBricks BOLT
+
+BOLT provides compact causal attention and learned recurrent state memory.
+Its canonical public API uses architecture-oriented names and automatic
+hardware dispatch. No kernel implementation names are required in user code.
+
+```python
+import torch
+from mlbricks import Bolt, BoltConfig, BoltModel, BoltStateMemory, BoltCache
+
+config = BoltConfig(
+    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
+    profile="standard", state_dim=198,  # state_memory=True by default
+    device="auto", precision="auto", backend="auto",
+)
+model = BoltModel(config)  # CUDA by default when available; otherwise CPU
+logits = model(torch.randint(0, 50257, (1, 32)))
+
+compact_layer = Bolt(embed_dim=384, num_heads=12, profile="compact")
+
+# Attention-only BOLT-32 (no AVQ allocation or recurrent state)
+attention_only = BoltModel(BoltConfig(
+    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
+    profile="standard", state_memory=False,
+))
+standalone_attention_only = Bolt(embed_dim=384, num_heads=12,
+                                 profile="standard", state_memory=False)
+standalone_memory = BoltStateMemory(input_dim=384, width=198)
+```
+
+## Components
+
+| Public name | Role |
+| --- | --- |
+| `BoltConfig` | Causal-model architecture and execution policy |
+| `BoltModel` | Complete trainable autoregressive language model |
+| `Bolt` | Standalone compact attention + recurrent state layer |
+| `BoltStateMemory` | Standalone learnable recurrent memory |
+| `BoltCache` | Preallocated compact context and memory state |
+
+`profile="standard"` uses 32 compact dimensions per head;
+`profile="compact"` uses 16. Both use 198-dimensional recurrent state by
+default. The new model profile uses latent-width attention scaling and
+balanced state-memory initialization (`gamma=0.25`). **`state_memory=True` is
+always the default for new BOLT models.** Set `state_memory=False` on `BoltConfig`
+or `Bolt` to disable AVQ; this does not instantiate AVQ projection, recurrence,
+readout, or recurrent-cache tensors. The attention core stays the same, but the
+result is a different model architecture with different checkpoint keys.
+Existing weights remain loadable with their original `attention_scale` / profile
+settings. Historical `mode="fast"` continues to request attention-only BOLT.
+
+`device="auto"` chooses CUDA if available; explicit `device="cuda:1"` chooses
+a particular GPU. CPU input tokens are moved automatically to the model device,
+but placing inputs directly on the accelerator minimizes transfer overhead.
+`precision="auto"` activates CUDA mixed precision while keeping FP32 weights.
+
+Native recurrent kernels are optional at source-build time:
+
+```bash
+MLBRICKS_BUILD_BOLT_ACCEL=1 pip install -v .
+```
+
+If unavailable, automatic execution uses the original compatible reference.
+No runtime JIT or Triton is needed. The legacy separate-projection checkpoint
+keys are preserved, even though the default new layer trains one packed
+projection parameter. Build the optimizer **after** model construction; do not
+assume optimizer states are interchangeable between the layouts.
+
+## Compatibility reference
+
+The historical `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`, `Gaussian`,
+and `GaussianConfig` imports are maintained for existing code. Their older
+construction options are described below; use profiles for new applications.
+
+---
+
 # BOLT presets in MLBricks
 
 The primary BOLT constructor uses two independent controls:

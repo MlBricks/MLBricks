@@ -17,8 +17,10 @@ def test_bolt_is_canonical_and_legacy_alias_is_identical():
 
 
 def test_bolt_model_aliases_preserve_ready_made_model_api():
-    assert BoltModel is Gaussian
-    assert BoltConfig is GaussianConfig
+    assert BoltModel is not Gaussian
+    assert BoltConfig is not GaussianConfig
+    assert issubclass(BoltModel, Gaussian)
+    assert issubclass(BoltConfig, GaussianConfig)
     model = BoltModel(vocab_size=31, context=16, layers=1, dim=32, heads=4, latent_dim=8)
     ids = torch.randint(0, 31, (1, 4))
     assert model(ids).shape == (1, 4, 31)

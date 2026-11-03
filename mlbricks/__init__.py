@@ -4,12 +4,12 @@
 
 from __future__ import annotations
 
-from .bolt import Attention, Bolt, BoltAttention, BoltPreset, BoltPresetCache, PostSoftmaxAVQ
+from .bolt import (Attention, Bolt, BoltAttention, BoltConfig, BoltModel,
+                   BoltStateMemory, BoltCache, BoltPreset, BoltPresetCache,
+                   PostSoftmaxAVQ)
 from .soup import SOUP, soup
 from .gaussian import Gaussian, GaussianConfig
-# Canonical ready-made Bolt model names; Gaussian names remain compatibility aliases.
-BoltModel = Gaussian
-BoltConfig = GaussianConfig
+# Gaussian remains a legacy-compatible independent implementation.
 from .bricks import Bricks, Brick
 from .visionbolt import VisionBolt, VisionBoltConfig
 from .vision_native import available as vision_native_available, cuda_built as vision_native_cuda_built
@@ -101,6 +101,8 @@ __all__ = [
     "soup",
     "BoltModel",
     "BoltConfig",
+    "BoltStateMemory",
+    "BoltCache",
     "Gaussian",
     "GaussianConfig",
     "Bricks",

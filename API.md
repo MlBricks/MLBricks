@@ -79,6 +79,37 @@ print(backend_report(layer))
 print(build_execution_plan(layer))
 ```
 
+## BOLT model configuration and optional state memory
+
+`BoltConfig` and `BoltModel` are the production BOLT language-model API.
+`device="auto"` selects CUDA when available. BOLT enables AVQ memory by default;
+set `state_memory=False` to construct compact attention without AVQ modules or
+recurrent-state cache. The optional memory state is recorded in the configuration
+and changes checkpoint compatibility.
+
+```python
+from mlbricks import Bolt, BoltConfig, BoltModel
+
+config = BoltConfig(
+    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
+    profile="standard",  # latent width 32
+    # state_memory=True is the default
+    device="auto", backend="auto", precision="auto",
+)
+model = BoltModel(config)  # CUDA automatically if available
+
+attention_only = BoltModel(BoltConfig(
+    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
+    profile="standard", state_memory=False,
+))
+standalone = Bolt(embed_dim=384, num_heads=12,
+                  profile="compact", state_memory=False)
+```
+
+Older `bolt_mode="fast"` and `mode="fast"` calls still select attention-only
+BOLT for compatibility. Switching a checkpoint's AVQ option is not an implicit
+state-dict conversion; save its matching configuration.
+
 ## Unified lifecycle API
 
 Lifecycle operations are package-level and architecture-agnostic.
@@ -360,24 +391,59 @@ Attention(
 )
 ```
 
-### Ready-made Bolt language model
+### Professional BOLT model and components
 
-`BoltModel` is the canonical ready-made Bolt LM name. `Gaussian` is retained as the compatibility name; `BoltConfig` is an alias of `GaussianConfig`.
+The canonical language-model classes are **`BoltModel`** and **`BoltConfig`**.
+They are distinct from historical **`Gaussian`** / **`GaussianConfig`**, which
+remain available for existing models and checkpoints.
+
+`BoltStateMemory` implements the learnable recurrent state; `BoltCache` holds
+compact attention features and state for cached generation. Historical
+`BoltPreset`, `BoltPresetCache`, and `PostSoftmaxAVQ` imports remain supported.
 
 ```python
-BoltModel(
-    vocab_size=50257,
-    context=2048,
-    layers=6,
-    dim=384,
-    heads=6,
-    latent_dim=32,
-    position="rope",
-    backend="auto",
+import torch
+from mlbricks import BoltConfig, BoltModel
+
+config = BoltConfig(
+    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
+    profile="standard", state_memory=True, state_dim=198,
+    backend="auto", device="auto", precision="auto",
 )
+model = BoltModel(config)  # automatically uses CUDA when available
+ids = torch.randint(0, config.vocab_size, (1, 64))  # CPU tensor accepted
+logits = model(ids)
 ```
 
-The full configuration also supports FFN, residual, normalization, dropout, embedding tying, and FFNBrick/ResController tuning fields.
+`profile="standard"` selects latent 32; `profile="compact"` selects latent
+16. New models use attention scaling by latent width and balanced state
+initialization. These were the leading TinyStories quality settings in the
+10K-step model comparisons. Execution and mathematical configuration remain
+independent: `backend="auto"` routes available CUDA state kernels when built,
+with a safe PyTorch fallback; it never changes the mathematical settings.
+
+`device="auto"` prefers CUDA then CPU. Explicit `device="cuda:1"` works, and
+requesting unavailable CUDA raises a clear error. `precision="auto"` selects
+CUDA mixed precision (BF16 where supported, otherwise FP16); model weights
+remain FP32. Explicit `precision="fp32"` disables autocast. Auto-transferring
+CPU inputs incurs a copy; feed tensors already on the GPU for best throughput.
+
+The new model supports `model(input_ids)`, `model(input_ids, targets=targets)`,
+`model.prefill`, `model.decode_step`, and `model.generate` as before. The
+recurrent state is computed by native CUDA when available, or by the canonical
+reference scan. There is no public kernel-version or compiler-specific mode.
+
+Native BOLT state kernels are separately opt-in for source builds:
+
+```bash
+MLBRICKS_BUILD_BOLT_ACCEL=1 pip install -v .
+```
+
+On CPU or when these extensions are absent, the library uses its reference
+implementation. Existing pretrained checkpoint files must use their original
+mathematical configuration (`attention_scale="head"`, and matching state
+parameters); changing the profile is a separate model-design decision.
+
 
 ## SOUP
 
@@ -747,3 +813,7 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 ## Licensing
 
 MLBricks Kit is distributed under the repository-level PolyForm Noncommercial License 1.0.0 terms plus component-specific notices shipped with the relevant components. Commercial use requires a separate written commercial license. See `LICENSE.md`, `LICENSING_NOTICE.md`, `COMMERCIAL_LICENSE.md`, and the component notices listed in `LICENSE.md`.
+
+### Compatibility and complete BOLT exports
+
+`Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `BoltStateMemory`, `BoltCache`, `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`, `Gaussian`, `GaussianConfig`

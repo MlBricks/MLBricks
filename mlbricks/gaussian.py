@@ -70,8 +70,8 @@ class GaussianConfig:
             raise ValueError("bolt_cache must be normal or tight")
         if int(self.avq_dim) < 1:
             raise ValueError("avq_dim must be positive")
-        if self.bolt_mode != "legacy" and self.backend == "native":
-            raise ValueError("native BOLT / AVQ is not yet supported; use auto/pytorch")
+        if self.bolt_mode != "legacy" and self.backend == "native" and type(self) is GaussianConfig:
+            raise ValueError("native BOLT / AVQ is not yet supported for legacy GaussianConfig")
         self.ffn = str(self.ffn).strip().lower().replace("-", "_")
         aliases = {
             "default": "standard", "ffn": "standard", "standard": "standard",
@@ -166,7 +166,7 @@ def _ffn(cfg: GaussianConfig, layer_index: int):
     )
 
 
-class _GaussianBlock(nn.Module):
+class BoltBlock(nn.Module):
     def __init__(self, cfg: GaussianConfig, layer_index: int, rotary=None) -> None:
         super().__init__()
         self.cfg = cfg
@@ -175,12 +175,19 @@ class _GaussianBlock(nn.Module):
         if legacy:
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, eps=cfg.eps, position=rotary)
+                             backend=cfg.backend, eps=cfg.eps, position=rotary,
+                             device='cpu')
         else:
+            is_bolt_config = hasattr(cfg,'profile')
             self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
                              cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, position=rotary)
+                             backend=cfg.backend, position=rotary,
+                             profile=cfg.profile if is_bolt_config else None,
+                             attention_scale=getattr(cfg,'attention_scale',None),
+                             memory_init=getattr(cfg,'memory_init',None),
+                             projection=getattr(cfg,'projection',None),
+                             device='cpu')
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
         self.ffn = _ffn(cfg, layer_index)
@@ -316,7 +323,7 @@ class Gaussian(nn.Module):
         self.token_embedding = Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
-            [_GaussianBlock(config, i, rotary=rotary) for i in range(config.layers)]
+            [BoltBlock(config, i, rotary=rotary) for i in range(config.layers)]
         )
         self.final_norm = _norm(config.norm, config.dim, config.bias)
         self.lm_head = LMHead(
@@ -456,15 +463,22 @@ class Gaussian(nn.Module):
 
     def _generation_caches(self, input_ids: torch.Tensor, capacity: int):
         p = next(self.parameters())
+        cache_dtype = p.dtype
+        policy = getattr(self.config, 'precision', 'fp32')
+        if p.device.type == 'cuda' and policy != 'fp32':
+            if policy == 'bf16' or (policy == 'auto' and torch.cuda.is_bf16_supported()):
+                cache_dtype = torch.bfloat16
+            else:
+                cache_dtype = torch.float16
         prepared = self._prepared_generation
         if (prepared is None
             or prepared["batch_size"] != input_ids.size(0)
             or prepared["capacity"] < capacity
             or prepared["device"] != str(input_ids.device)
-            or prepared["dtype"] != p.dtype):
+            or prepared["dtype"] != cache_dtype):
             self.prepare_generation(
                 batch_size=input_ids.size(0), max_context=capacity,
-                device=input_ids.device, dtype=p.dtype, warmup_native=True,
+                device=input_ids.device, dtype=cache_dtype, warmup_native=True,
             )
             prepared = self._prepared_generation
         return prepared["caches"]
@@ -560,3 +574,6 @@ class Gaussian(nn.Module):
             f"dim={c.dim}, heads={c.heads}, latent_dim={c.latent_dim}, "
             f"position={c.position!r}, backend={self.backend!r}"
         )
+
+# Historical private symbol retained for deserializing older model objects.
+_GaussianBlock = BoltBlock
