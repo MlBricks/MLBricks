@@ -365,6 +365,54 @@ class BoltPreset(nn.Module):
         else:k=c
         return q,k,c
 
+    def _optimized_training_available(self, x):
+        """Use the validated persistent-QUG/AVQ training route when supported.
+
+        This is the exact functional decomposition from the matched 10K-step
+        TinyStories experiment: one QUG GEMM, elementwise gated features,
+        causal SDPA, and the 8-/16-warp AVQ short scan (segmented for long
+        contexts).  It is deliberately restricted to the qualified CUDA
+        training shapes and never modifies cached inference or state keys.
+        """
+        return (
+            self.training and torch.is_grad_enabled() and x.is_cuda
+            and self.backend == 'auto'
+            and self.projection == 'packed'
+            and self.position is None and self.dropout == 0.0
+            and self.causal and (self.avq is None or _accelerated.available())
+            and x.dtype in (torch.float16, torch.float32)
+        )
+
+    def _optimized_train_forward(self, x):
+        """Matched optimized-BOLT math without legacy feature-kernel dispatch."""
+        batch, length, _ = x.shape
+        width = self.num_heads * self.latent_dim
+        # Persistent trainable packed projection: no cat on every forward.
+        q_raw, u_raw, g_raw = F.linear(
+            x, self.packed_qug_weight, self.packed_qug_bias
+        ).split(width, dim=-1)
+        shape = (batch, length, self.num_heads, self.latent_dim)
+        q = q_raw.reshape(shape).transpose(1, 2)
+        u = u_raw.reshape(shape).transpose(1, 2)
+        g = g_raw.reshape(shape).transpose(1, 2)
+        c = u * (1.0 + torch.tanh(g))
+        q = q * self.p[None, :, None, :]
+        # Match BoltPreset._attend and the validated notebook: learned P is
+        # FP32, while Q/U/G activations can be FP16 under AMP. SDPA requires
+        # Query and shared Key/Value feature tensors to use the same dtype.
+        if q.dtype != c.dtype:
+            q = q.to(c.dtype)
+        o = F.scaled_dot_product_attention(
+            q, c, c, is_causal=True, dropout_p=0.0, scale=self._scale()
+        )
+        o = o.transpose(1, 2).contiguous().reshape(batch, length, width)
+        if self.avq is not None:
+            # The shipped CUDA source is byte-identical to the notebook's
+            # short/segmented recurrence and backward kernels.
+            self.avq.use_native = True
+            o = self.avq(o)
+        return self.out_proj(o)
+
     def _attend(self,x,start_pos=0):
         b,t,_=x.shape
         native = self._native_enabled(x)
@@ -377,6 +425,8 @@ class BoltPreset(nn.Module):
     def forward(self,x):
         if x.ndim!=3 or x.size(-1)!=self.d_model:
             raise ValueError(f'x must be [B,T,{self.d_model}]')
+        if self._optimized_training_available(x):
+            return self._optimized_train_forward(x)
         o,_=self._attend(x)
         if self.avq is not None:o=self.avq(o)
         return self.out_proj(o)

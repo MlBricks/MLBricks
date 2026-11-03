@@ -66,6 +66,26 @@ keys are preserved, even though the default new layer trains one packed
 projection parameter. Build the optimizer **after** model construction; do not
 assume optimizer states are interchangeable between the layouts.
 
+### Optimized training execution
+
+New BOLT models with `backend="auto"` and packed projections select the
+notebook-validated training route when the model is on supported CUDA hardware,
+training uses causal compact attention with zero attention dropout and no
+positional transformation, and the corresponding recurrence extension is
+installed. The training path performs one persistent Q/U/G projection,
+learned gated-feature formation and causal attention, then uses the exact
+short-sequence or segmented state-memory kernels and their custom backward.
+The supported short-context kernels automatically choose the appropriate
+configuration for the model profile; users do not select a kernel version.
+
+`state_memory=False` skips recurrent memory entirely while retaining the same
+optimized attention computation. CPU, unsupported precision and other
+architectural settings continue to use the compatible reference route.
+Cached generation and checkpoint parameter names are unchanged. The historical
+10K TinyStories results validate the underlying implementation; benchmark the
+**installed library** on your target GPU before claiming its throughput or
+long-run quality is identical.
+
 ## Compatibility reference
 
 The historical `BoltPreset`, `BoltPresetCache`, and `PostSoftmaxAVQ` imports
@@ -93,11 +113,11 @@ tight = Bolt(384, 12, cache='tight')          # BOLT-16 + AVQ-198
 model = BoltModel(vocab_size=50257, dim=384, heads=12) # quality+normal
 ```
 
-**Native status:** MLBricks ships C++/CUDA kernels for *legacy* BOLT. The modern BOLT (fast or quality) presets run PyTorch SDPA; AVQ-198 recurrence runs PyTorch. `backend="auto"` uses PyTorch for modern presets, while `backend="native"` raises an explicit unsupported-kernel error at execution. The legacy kernels are **not** mathematically interchangeable with BOLT and must not be used for these new presets.
+**Native status:** MLBricks has separate CUDA acceleration for modern compact attention/state memory and for the historical legacy BOLT formulation. The modern recurrence extensions are optional; `backend="auto"` uses them when present and compatible, otherwise it safely falls back to PyTorch. The legacy kernels are mathematically different and cannot be substituted for modern BOLT.
 
 **What the presets mean:** `quality` selects the post-softmax AVQ recurrence, not a measured guarantee of superior perplexity. `fast` removes the AVQ overhead; `tight` reduces the historical attention cache, not necessarily overall model memory. The historical cache stores *C only*; AVQ recurrent state contributes `batch * 198 * 4` bytes per layer. Unlike the old BOLT equation, BOLT uses learned scale `P` applied to the Query, and values/keys come from `C=U*(1+tanh(G))`.
 
-The new architecture uses PyTorch SDPA and an autograd-safe O(log T) affine scan; **optimized fused AVQ-198 and BOLT-32 kernels have not been validated yet**. `mode='legacy'` (with explicit `latent_dim`) retains the original rho-normalized BOLT and native paths. Previously trained 16D/AVQ-192 models are *not checkpoint-compatible* with 32D/AVQ-198; changing either dimension requires conversion/retraining. Checkpoints from the old original BOLT equation require explicit `mode='legacy'` and matching dimensions.
+Modern BOLT uses causal attention and a differentiable affine recurrence. On supported GPUs, the optional short-context and segmented CUDA recurrence kernels implement the same mathematical state update and backward gradients. `mode='legacy'` (with explicit `latent_dim`) retains the historical rho-normalized BOLT and its separate native paths. Previously trained 16D/AVQ-192 models are *not checkpoint-compatible* with 32D/AVQ-198; changing either dimension requires conversion/retraining. Historical BOLT checkpoints require `mode='legacy'` and matching dimensions.
 
 ## Save/Load
 

@@ -942,6 +942,11 @@ class Bolt(nn.Module):
 
     def _precision_context(self):
         current_device = next(self.parameters()).device
+        # BoltModel already provides a model-wide autocast scope. Creating
+        # one more autocast manager per BOLT layer is redundant and adds
+        # Python dispatcher overhead to every training iteration.
+        if current_device.type == 'cuda' and torch.is_autocast_enabled('cuda'):
+            return contextlib.nullcontext()
         if current_device.type != 'cuda' or self.precision == 'fp32':
             return contextlib.nullcontext()
         if self.precision == 'bf16' and not torch.cuda.is_bf16_supported():
