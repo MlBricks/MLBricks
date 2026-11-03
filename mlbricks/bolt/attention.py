@@ -12,6 +12,7 @@ from .._reference import attention_forward_reference, gauss_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
 from ..position import RoPE
+from .precision import native_bf16_supported
 
 from .._backend import (
     WORKSPACES,
@@ -952,7 +953,7 @@ class Bolt(nn.Module):
         if self.precision == 'bf16' and not torch.cuda.is_bf16_supported():
             raise RuntimeError('BF16 is not supported on this GPU')
         dtype = (torch.bfloat16 if self.precision == 'bf16' else
-                 (torch.bfloat16 if self.precision == 'auto' and torch.cuda.is_bf16_supported()
+                 (torch.bfloat16 if self.precision == 'auto' and native_bf16_supported(current_device)
                   else torch.float16))
         return torch.autocast('cuda', dtype=dtype)
 

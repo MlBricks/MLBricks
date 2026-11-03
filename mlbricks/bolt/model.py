@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from .attention import Bolt
 from .presets import BoltPresetCache
 from .config import BoltConfig, BoltModelSettings
+from .precision import native_bf16_supported
 from ..cache import BoltLegacyCache
 from ..components import Embedding, FFN, LayerNorm, LMHead, RMSNorm, Residual
 from ..ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
@@ -383,7 +384,7 @@ class BoltModelCore(nn.Module):
         cache_dtype = p.dtype
         policy = getattr(self.config, 'precision', 'fp32')
         if p.device.type == 'cuda' and policy != 'fp32':
-            if policy == 'bf16' or (policy == 'auto' and torch.cuda.is_bf16_supported()):
+            if policy == 'bf16' or (policy == 'auto' and native_bf16_supported(p.device)):
                 cache_dtype = torch.bfloat16
             else:
                 cache_dtype = torch.float16
@@ -533,7 +534,7 @@ class BoltModel(BoltModelCore):
         if self.device.type != 'cuda' or precision == 'fp32':
             return contextlib.nullcontext()
         if precision == 'auto':
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            dtype = torch.bfloat16 if native_bf16_supported(self.device) else torch.float16
         elif precision == 'bf16':
             if not torch.cuda.is_bf16_supported():
                 raise RuntimeError('Requested BF16 precision is unsupported by this CUDA GPU')
