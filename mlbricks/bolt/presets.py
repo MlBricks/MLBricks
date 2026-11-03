@@ -308,6 +308,11 @@ class BoltPreset(nn.Module):
     def resolved_backend(self):
         if self.backend == 'pytorch':
             return 'pytorch BOLT reference'
+        layer_device = next(self.parameters()).device
+        if layer_device.type != 'cuda':
+            return ('native unavailable: BOLT layer is on CPU'
+                    if self.backend == 'native'
+                    else 'pytorch BOLT CPU fallback')
         if _accelerated.available():
             return 'optimized CUDA state memory / compact attention'
         if _native.get_extension() is not None:
