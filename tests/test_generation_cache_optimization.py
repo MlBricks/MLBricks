@@ -26,7 +26,7 @@ def _legacy_bolt_model_generate(model, input_ids, steps):
 
 def test_bolt_model_fixed_cache_matches_legacy_cat_path():
     torch.manual_seed(1)
-    model = BoltModel(vocab_size=43, context=32, layers=2, dim=32, heads=4, latent_dim=8)
+    model = BoltModel(vocab_size=43, context=32, layers=2, dim=32, heads=4, latent_dim=8, device="cpu", precision="fp32")
     ids = torch.randint(0, 43, (2, 5))
     expected = _legacy_bolt_model_generate(model, ids, 4)
     actual = model.generate(ids, 4, temperature=0)
@@ -51,7 +51,7 @@ def test_attention_and_gauss_used_length_ignore_unwritten_capacity():
     got = attn.decode(x, kc, vc, used_length=5)
     torch.testing.assert_close(got, ref)
 
-    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch").eval()
+    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", device="cpu", precision="fp32").eval()
     c, rho = gauss.project_cache_state(xhist)
     cc = torch.randn(1, 4, 16, 8)
     rr = torch.randn(1, 4, 16)
@@ -91,7 +91,7 @@ def test_execution_plan_reports_zero_device_transfers():
 
 def test_bolt_model_prefill_logits_match_eval_forward():
     torch.manual_seed(3)
-    model = BoltModel(vocab_size=47, context=24, layers=2, dim=32, heads=4, latent_dim=8).eval()
+    model = BoltModel(vocab_size=47, context=24, layers=2, dim=32, heads=4, latent_dim=8, device="cpu", precision="fp32").eval()
     ids = torch.randint(0, 47, (2, 7))
     with torch.no_grad():
         direct = model(ids)
@@ -101,7 +101,7 @@ def test_bolt_model_prefill_logits_match_eval_forward():
 
 def test_packed_gauss_projection_refreshes_after_weight_change():
     torch.manual_seed(4)
-    g = Bolt(32, 4, latent_dim=8, backend="pytorch").eval()
+    g = Bolt(32, 4, latent_dim=8, backend="pytorch", device="cpu", precision="fp32").eval()
     x = torch.randn(2, 32)
     q1, c1, r1 = g.project_decode_state(x, start_pos=0)
     with torch.no_grad():

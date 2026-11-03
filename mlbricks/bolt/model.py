@@ -91,6 +91,7 @@ class BoltBlock(nn.Module):
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
                              backend=cfg.backend, eps=cfg.eps, position=rotary,
+                             precision=getattr(cfg, 'precision', 'fp32'),
                              device='cpu')
         else:
             is_bolt_config = hasattr(cfg,'profile')

@@ -317,6 +317,13 @@ class Bricks(nn.Module):
         self._prepared_generation = None
         self._compile_generation_regions = False
         self._generation_compile_mode = "default"
+        # A standalone Bolt defaults to CUDA if available, but when supplied
+        # as a mixer its placement is controlled by this composite model.
+        # Keep all supplied mixers, embeddings, FFNs and caches coherent.
+        embedding_parameter = next(self.embedding.parameters(), None)
+        parent_device = (embedding_parameter.device if embedding_parameter is not None
+                         else next(self.final_norm.parameters(), torch.empty(0)).device)
+        self.layers.to(parent_device)
 
     def _embed(self, input_ids, *, start_pos: int = 0):
         if input_ids.ndim != 2:

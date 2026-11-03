@@ -66,6 +66,10 @@ class VisionBoltBlock(nn.Module):
             position=None,
             backend=config.backend,
             native_full_sequence=True,
+            # Child modules inherit their enclosing model's placement/precision.
+            # Standalone Bolt keeps its CUDA-first default.
+            device="cpu",
+            precision="fp32",
         )
         self.mlp_norm = PerspectiveNorm(config.dim, config.perspective_groups, backend=config.backend)
 

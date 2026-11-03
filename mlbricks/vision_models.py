@@ -41,6 +41,9 @@ def _make_mixer(family: str, config: VisionConfig, *, causal: bool):
             position=None,
             backend=config.backend,
             native_full_sequence=True,
+            # Vision engines own device placement for the whole model.
+            device="cpu",
+            precision="fp32",
         )
     raise ValueError("family must be 'esa' or 'bolt'")
 

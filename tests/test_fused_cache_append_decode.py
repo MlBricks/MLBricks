@@ -35,7 +35,7 @@ def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
 
 def test_bolt_decode_append_projected_matches_append_then_decode_pytorch_rope():
     torch.manual_seed(102)
-    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", position="rope").eval()
+    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", position="rope", device="cpu", precision="fp32").eval()
     hist = torch.randn(2, 5, 32)
     x = torch.randn(2, 32)
     c, rho = gauss.project_cache_state(hist)
