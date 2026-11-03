@@ -4,12 +4,10 @@ from dataclasses import replace
 import pytest
 import torch
 from mlbricks import (Bolt, BoltConfig, BoltModel, BoltStateMemory, BoltCache,
-                      Gaussian, GaussianConfig, PostSoftmaxAVQ, BoltPresetCache)
+                      PostSoftmaxAVQ, BoltPresetCache)
 
 
 def test_api_names_devices_and_profiles():
-    assert BoltModel is not Gaussian
-    assert BoltConfig is not GaussianConfig
     assert BoltStateMemory is not PostSoftmaxAVQ
     assert issubclass(PostSoftmaxAVQ, BoltStateMemory)
     assert BoltCache is BoltPresetCache
@@ -29,9 +27,11 @@ def test_api_names_devices_and_profiles():
         assert model.blocks[0].attn._modern.packed_qug_weight.grad is not None
 
 
-def test_old_model_math_preserved():
-    model = Gaussian(GaussianConfig(vocab_size=71, dim=32, heads=4, layers=1,
-                                    context=12, backend='pytorch'))
+def test_legacy_math_settings_remain_selectable():
+    model = BoltModel(BoltConfig(vocab_size=71, dim=32, heads=4, layers=1,
+                                 context=12, backend='pytorch', device='cpu',
+                                 attention_scale='head', memory_init='legacy',
+                                 projection='separate'))
     assert model.blocks[0].attn._modern.projection == 'separate'
     assert model.blocks[0].attn._modern.attention_scale == 'head'
     assert model.blocks[0].attn._modern.avq.gamma.item() == 0.

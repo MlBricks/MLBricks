@@ -2,8 +2,7 @@
 
 The primary public classes are `Bolt`, `BoltConfig`, `BoltModel`,
 `BoltStateMemory`, and `BoltCache`. New models use a modern, quality-selected
-configuration. Historical `Gaussian` / `GaussianConfig`, `BoltPreset`,
-`BoltPresetCache`, and `PostSoftmaxAVQ` remain importable.
+configuration. `BoltPreset`, `BoltPresetCache`, and `PostSoftmaxAVQ` remain importable.
 
 ## Automatic device and precision
 
@@ -33,7 +32,8 @@ separate** `q_proj`, `c_proj`, `g_proj` checkpoint keys. Existing model state
 dictionaries can load without editing. Changing a trained model's math profile
 is **not** an implicit checkpoint conversion. Optimizer state uses different
 parameter layouts; rebuild or migrate it explicitly when enabling packing.
-Keep the old `Gaussian` class for exact legacy runtime behavior.
+The old `Gaussian` and `GaussianConfig` names have been removed. For legacy
+checkpoint weights, use `BoltModel` and explicitly select matching math settings.
 
 ## CUDA acceleration
 

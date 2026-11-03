@@ -171,11 +171,11 @@ if enabled("MLBRICKS_BUILD_BOLT_ACCEL"):
         raise RuntimeError("MLBRICKS_BUILD_BOLT_ACCEL=1 requires CUDA toolkit and CUDA PyTorch")
     csrc = ROOT / "mlbricks" / "bolt" / "native_accel"
     extensions.append(_extension(
-        "mlbricks._bolt_scan_segmented", [csrc / "state_segmented.cpp"],
+        "mlbricks._bolt_scan_segmented", [csrc / "state_segmented_bindings.cpp"],
         cuda_source=csrc / "state_segmented.cu", lineinfo=True, disable_fma=True,
     ))
     extensions.append(_extension(
-        "mlbricks._bolt_scan_short", [csrc / "state_short.cpp"],
+        "mlbricks._bolt_scan_short", [csrc / "state_short_bindings.cpp"],
         cuda_source=csrc / "state_short.cu", lineinfo=True, disable_fma=True,
     ))
 

@@ -16,7 +16,7 @@ from .runtime import (
     normalize_backend, backend_report as collect_backend_report,
     build_execution_plan, compile_module, prepare_module_execution, reset_execution_route, predict_module,
 )
-from .cache import GaussCache, KVCache
+from .cache import BoltLegacyCache, KVCache
 
 
 def _make_norm(spec, dim: int):
@@ -168,7 +168,7 @@ class Brick(nn.Module):
             update, (c, rho) = self.mixer.prefill_with_cache(
                 normalized, start_pos=start_pos
             )
-            if isinstance(cache_buffer, GaussCache):
+            if isinstance(cache_buffer, BoltLegacyCache):
                 cache_buffer.load_prefix(c, rho)
                 state = ("gauss", cache_buffer)
             else:
@@ -200,7 +200,7 @@ class Brick(nn.Module):
             q, c_now, rho_now = self.mixer.project_decode_state(
                 normalized, start_pos=position
             )
-            if len(state) == 2 and isinstance(state[1], GaussCache):
+            if len(state) == 2 and isinstance(state[1], BoltLegacyCache):
                 cache = state[1]
                 update = self.mixer.decode_append_projected(
                     q, c_now, rho_now, cache.c, cache.rho, position=position
@@ -404,7 +404,7 @@ class Bricks(nn.Module):
         for layer in self.layers:
             mixer = layer.mixer
             if isinstance(mixer, Bolt):
-                buffers.append(GaussCache.allocate(
+                buffers.append(BoltLegacyCache.allocate(
                     batch_size, mixer.num_heads, capacity, mixer.latent_dim,
                     device=device, dtype=dtype,
                 ))

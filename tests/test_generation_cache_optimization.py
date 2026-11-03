@@ -1,10 +1,10 @@
 import torch
 
-from mlbricks import Attention, Brick, Bricks, ESA, Bolt, Gaussian
-from mlbricks.cache import GaussCache, KVCache
+from mlbricks import Attention, Brick, Bricks, ESA, Bolt, BoltModel
+from mlbricks.cache import BoltLegacyCache, KVCache
 
 
-def _legacy_gaussian_generate(model, input_ids, steps):
+def _legacy_bolt_model_generate(model, input_ids, steps):
     was = model.training
     model.eval()
     logits, caches = model.prefill(input_ids)  # tuple caches: legacy path
@@ -24,16 +24,16 @@ def _legacy_gaussian_generate(model, input_ids, steps):
     return tokens
 
 
-def test_gaussian_fixed_cache_matches_legacy_cat_path():
+def test_bolt_model_fixed_cache_matches_legacy_cat_path():
     torch.manual_seed(1)
-    model = Gaussian(vocab_size=43, context=32, layers=2, dim=32, heads=4, latent_dim=8)
+    model = BoltModel(vocab_size=43, context=32, layers=2, dim=32, heads=4, latent_dim=8)
     ids = torch.randint(0, 43, (2, 5))
-    expected = _legacy_gaussian_generate(model, ids, 4)
+    expected = _legacy_bolt_model_generate(model, ids, 4)
     actual = model.generate(ids, 4, temperature=0)
     torch.testing.assert_close(actual, expected)
     prepared = model._prepared_generation
     assert prepared is not None
-    assert all(isinstance(c, GaussCache) for c in prepared["caches"])
+    assert all(isinstance(c, BoltLegacyCache) for c in prepared["caches"])
     assert all(c.length == 8 for c in prepared["caches"])
 
 
@@ -74,7 +74,7 @@ def test_bricks_prepares_heterogeneous_fixed_caches():
     )
     model.prepare_generation(batch_size=2, max_context=16, warmup_native=False)
     buffers = model._prepared_generation["buffers"]
-    assert isinstance(buffers[0], GaussCache)
+    assert isinstance(buffers[0], BoltLegacyCache)
     assert isinstance(buffers[1], KVCache)
     assert buffers[2] is None
     ids = torch.randint(0, 41, (2, 4))
@@ -83,15 +83,15 @@ def test_bricks_prepares_heterogeneous_fixed_caches():
 
 
 def test_execution_plan_reports_zero_device_transfers():
-    model = Gaussian(vocab_size=31, context=16, layers=1, dim=32, heads=4, latent_dim=8)
+    model = BoltModel(vocab_size=31, context=16, layers=1, dim=32, heads=4, latent_dim=8)
     plan = model.execution_plan()
     assert plan.device_transfers == 0
     assert plan.requested_backend == "auto"
 
 
-def test_gaussian_prefill_logits_match_eval_forward():
+def test_bolt_model_prefill_logits_match_eval_forward():
     torch.manual_seed(3)
-    model = Gaussian(vocab_size=47, context=24, layers=2, dim=32, heads=4, latent_dim=8).eval()
+    model = BoltModel(vocab_size=47, context=24, layers=2, dim=32, heads=4, latent_dim=8).eval()
     ids = torch.randint(0, 47, (2, 7))
     with torch.no_grad():
         direct = model(ids)

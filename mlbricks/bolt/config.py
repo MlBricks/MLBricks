@@ -1,16 +1,105 @@
-"""Professional, checkpoint-explicit BOLT language-model configuration."""
+"""BOLT architecture and runtime configuration.
+
+All active model settings live in the BOLT namespace.
+"""
 from __future__ import annotations
 from dataclasses import dataclass
-from ..gaussian import GaussianConfig
+from ..runtime import normalize_backend
 
 
 @dataclass
-class BoltConfig(GaussianConfig):
+class BoltModelSettings:
+    vocab_size: int
+    context: int = 2048
+    layers: int = 6
+    dim: int = 384
+    heads: int = 6
+    latent_dim: int = 32  # legacy-only when bolt_mode='legacy'
+    bolt_mode: str = "quality"  # quality (AVQ-198), fast (BOLT), legacy
+    bolt_cache: str = "normal"  # normal=32, tight=16
+    avq_dim: int = 198
+    position: str = "none"
+    ffn: str = "standard"
+    residual: str = "standard"
+    norm: str = "rmsnorm"
+    activation: str = "gelu"
+    ffn_mult: int = 4
+    dropout: float = 0.0
+    bias: bool = False
+    tie_embeddings: bool = True
+    backend: str = "auto"
+    eps: float = 1e-6
+    ffn_state_dim: int = 256
+    ffn_depth_embedding_dim: int = 64
+    ffn_virtual_refinements: int = 2
+    ffn_virtual_hidden_dim: int = 128
+    ffn_micro_hidden_dim: int = 64
+    ffn_micro_refinements: int = 1
+    residual_update_ratio: float = 0.18
+    residual_stream_ratio: float = 1.08
+    residual_update_softness: float = 8.0
+    residual_stream_softness: float = 8.0
+
+    def __post_init__(self) -> None:
+        for name in ("vocab_size", "context", "layers", "dim", "heads", "latent_dim"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.dim % self.heads:
+            raise ValueError("dim must be divisible by heads")
+        self.backend = normalize_backend(self.backend, warn_legacy=True)
+        self.bolt_mode = str(self.bolt_mode).strip().lower()
+        self.bolt_cache = str(self.bolt_cache).strip().lower()
+        if self.bolt_mode not in ("quality", "fast", "legacy"):
+            raise ValueError("bolt_mode must be quality, fast or legacy")
+        if self.bolt_cache not in ("normal", "tight"):
+            raise ValueError("bolt_cache must be normal or tight")
+        if int(self.avq_dim) < 1:
+            raise ValueError("avq_dim must be positive")
+        self.ffn = str(self.ffn).strip().lower().replace("-", "_")
+        aliases = {
+            "default": "standard", "ffn": "standard", "standard": "standard",
+            "saffn": "saffn", "stateaware": "saffn", "state_aware": "saffn", "ffnbrick": "saffn",
+            "virtual": "virtual", "virtual_state_aware": "virtual", "virtual_ffnbrick": "virtual",
+            "micro": "micro", "micro_virtual": "micro", "micro_ffnbrick": "micro",
+        }
+        if self.ffn not in aliases:
+            raise ValueError("ffn must be standard, saffn, virtual, or micro")
+        self.ffn = aliases[self.ffn]
+        self.residual = str(self.residual).strip().lower().replace("-", "_")
+        if self.residual in {"default", "residual"}:
+            self.residual = "standard"
+        if self.residual in {"controller", "res_controller"}:
+            self.residual = "rescontroller"
+        if self.residual not in {"standard", "rescontroller"}:
+            raise ValueError("residual must be standard or rescontroller")
+        self.norm = str(self.norm).strip().lower().replace("-", "_")
+        if self.norm not in {"rmsnorm", "rms", "layernorm", "layer_norm"}:
+            raise ValueError("norm must be rmsnorm or layernorm")
+
+    # ESA-style compatibility names.
+    @property
+    def block(self) -> int:
+        return self.context
+
+    @property
+    def n_layer(self) -> int:
+        return self.layers
+
+    @property
+    def embd(self) -> int:
+        return self.dim
+
+    @property
+    def head(self) -> int:
+        return self.heads
+
+
+@dataclass
+class BoltConfig(BoltModelSettings):
     """Configuration for :class:`BoltModel`.
 
     ``profile`` selects BOLT latent width. New models default to standard
-    (32) and the quality-selected memory initialization. Legacy ``GaussianConfig``
-    checkpoints should continue to load through ``Gaussian`` unchanged.
+    (32) and the quality-selected memory initialization. Historical checkpoint tensors keep their original parameter names.
     """
     heads: int = 12  # validated BOLT attention layout by default
     profile: str | None = None  # None keeps legacy `bolt_cache` keywords usable

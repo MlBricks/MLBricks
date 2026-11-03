@@ -394,8 +394,8 @@ Attention(
 ### Professional BOLT model and components
 
 The canonical language-model classes are **`BoltModel`** and **`BoltConfig`**.
-They are distinct from historical **`Gaussian`** / **`GaussianConfig`**, which
-remain available for existing models and checkpoints.
+They own the complete BOLT model implementation. Historical checkpoint weights
+can be loaded with matching BOLT architecture settings.
 
 `BoltStateMemory` implements the learnable recurrent state; `BoltCache` holds
 compact attention features and state for cached generation. Historical
@@ -796,7 +796,7 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 
 | Group | Exports |
 | --- | --- |
-| Attention / Bolt | `Attention`, `Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `Gaussian`, `GaussianConfig` |
+| Attention / Bolt | `Attention`, `Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig` |
 | SOUP | `SOUP`, `soup` |
 | Composition | `Bricks`, `Brick` |
 | Vision | `VisionBolt`, `VisionBoltConfig`, `vision_native_available`, `vision_native_cuda_built`, `vesa`, `Vesa`, `VesaConfig` |
@@ -816,4 +816,4 @@ MLBricks Kit is distributed under the repository-level PolyForm Noncommercial Li
 
 ### Compatibility and complete BOLT exports
 
-`Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `BoltStateMemory`, `BoltCache`, `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`, `Gaussian`, `GaussianConfig`
+`Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `BoltStateMemory`, `BoltCache`, `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`

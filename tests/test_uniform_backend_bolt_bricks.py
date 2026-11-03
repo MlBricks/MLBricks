@@ -11,7 +11,7 @@ from mlbricks import (
     ESA,
     FFN,
     Bolt,
-    Gaussian,
+    BoltModel,
     ResController,
     StateAwareFFN,
     VesaConfig,
@@ -35,10 +35,10 @@ def test_set_backend_override():
     assert a.set_backend("native").backend == "native"
 
 
-def test_gaussian_forward_all_positions():
+def test_bolt_model_forward_all_positions():
     ids = torch.randint(0, 97, (2, 8))
     for position in ("none", "learned", "sinusoidal", "rope"):
-        model = Gaussian(
+        model = BoltModel(
             vocab_size=97,
             context=32,
             layers=2,
@@ -51,8 +51,8 @@ def test_gaussian_forward_all_positions():
         assert model(ids).shape == (2, 8, 97)
 
 
-def test_gaussian_saffn_and_rescontroller():
-    model = Gaussian(
+def test_bolt_model_saffn_and_rescontroller():
+    model = BoltModel(
         vocab_size=97,
         context=16,
         layers=2,
@@ -67,8 +67,8 @@ def test_gaussian_saffn_and_rescontroller():
     assert model(ids).shape == (1, 6, 97)
 
 
-def test_gaussian_cache_generation():
-    model = Gaussian(
+def test_bolt_model_cache_generation():
+    model = BoltModel(
         vocab_size=97,
         context=16,
         layers=2,

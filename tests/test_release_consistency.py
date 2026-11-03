@@ -31,7 +31,7 @@ def test_package_description_matches_uniform_backend_release() -> None:
     )["project"]
     description = project["description"].lower()
     assert "auto/native/pytorch" in description
-    assert "gaussian" in description
+    assert "boltmodel" in description
     assert "bricks" in description
     assert "pulse" not in description
     assert "flare" not in description

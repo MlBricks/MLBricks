@@ -1,7 +1,7 @@
 import torch
 
-from mlbricks import Attention, Brick, Bricks, Bolt, Gaussian
-from mlbricks.cache import GaussCache, KVCache
+from mlbricks import Attention, Brick, Bricks, Bolt, BoltModel
+from mlbricks.cache import BoltLegacyCache, KVCache
 
 
 def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
@@ -33,7 +33,7 @@ def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
     torch.testing.assert_close(got_v[:, :, :6], ref_v[:, :, :6])
 
 
-def test_gauss_decode_append_projected_matches_append_then_decode_pytorch_rope():
+def test_bolt_decode_append_projected_matches_append_then_decode_pytorch_rope():
     torch.manual_seed(102)
     gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", position="rope").eval()
     hist = torch.randn(2, 5, 32)
@@ -62,15 +62,15 @@ def test_gauss_decode_append_projected_matches_append_then_decode_pytorch_rope()
     torch.testing.assert_close(got_r[:, :, :6], ref_r[:, :, :6])
 
 
-def test_gaussian_prepared_generation_updates_cache_length_without_cache_append(monkeypatch):
+def test_bolt_model_prepared_generation_updates_cache_length_without_cache_append(monkeypatch):
     torch.manual_seed(103)
-    model = Gaussian(vocab_size=47, context=24, layers=2, dim=32, heads=4, latent_dim=8)
+    model = BoltModel(vocab_size=47, context=24, layers=2, dim=32, heads=4, latent_dim=8)
     model.prepare_generation(batch_size=1, max_context=12, warmup_native=False)
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("prepared generation must not call GaussCache.append")
+        raise AssertionError("prepared generation must not call BoltLegacyCache.append")
 
-    monkeypatch.setattr(GaussCache, "append", forbidden)
+    monkeypatch.setattr(BoltLegacyCache, "append", forbidden)
     ids = torch.randint(0, 47, (1, 5))
     out = model.generate(ids, 4, temperature=0)
     assert out.shape == (1, 9)
@@ -93,7 +93,7 @@ def test_bricks_prepared_generation_avoids_python_cache_append(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("prepared generation must not call cache.append")
 
-    monkeypatch.setattr(GaussCache, "append", forbidden)
+    monkeypatch.setattr(BoltLegacyCache, "append", forbidden)
     monkeypatch.setattr(KVCache, "append", forbidden)
     ids = torch.randint(0, 53, (1, 5))
     out = model.generate(ids, 4, temperature=0)

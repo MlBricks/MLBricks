@@ -68,9 +68,8 @@ assume optimizer states are interchangeable between the layouts.
 
 ## Compatibility reference
 
-The historical `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`, `Gaussian`,
-and `GaussianConfig` imports are maintained for existing code. Their older
-construction options are described below; use profiles for new applications.
+The historical `BoltPreset`, `BoltPresetCache`, and `PostSoftmaxAVQ` imports
+remain available. Use BOLT profiles for new applications.
 
 ---
 
@@ -106,8 +105,17 @@ The new architecture uses PyTorch SDPA and an autograd-safe O(log T) affine scan
 
 ## Cached generation
 
-`Bolt.prefill(x)` returns `(output, (C, state))`, where `state` is FP32 AVQ state for `quality` and `None` for `fast`. `Bolt.decode_step(token, cache)` advances both. `BoltModel.prepare_generation` uses `BoltPresetCache` for these modes and `GaussCache` for legacy mode.
+`Bolt.prefill(x)` returns `(output, (C, state))`, where `state` is FP32 AVQ state for `quality` and `None` for `fast`. `Bolt.decode_step(token, cache)` advances both. `BoltModel.prepare_generation` uses `BoltPresetCache` for these modes and `BoltLegacyCache` for legacy mode.
 
 ## Native modern BOLT CUDA kernels
 
 The new **modern BOLT-32/16 + AVQ-198 native extension** (`mlbricks._bolt_modern_cuda`) is optional and independent of the historical `_gauss_cuda` kernels. Build using `MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1` and a CUDA-enabled PyTorch/toolkit. It accelerates the BOLT gated-feature projection and AVQ recurrent scan (including backward), and provides fused CUDA cached decode without RoPE. Training/prefill attention still uses CUDA SDPA. See [README_NATIVE.md](README_NATIVE.md) for build commands, supported paths, parity tests and limitations. On machines without the extension, `backend='auto'` falls back to PyTorch, while `backend='native'` gives an explicit build error.
+
+### BOLT-owned implementation
+
+The canonical language-model implementation and network block now live in
+`mlbricks/bolt/model.py`, with primary model settings in `mlbricks/bolt/config.py`.
+The obsolete `mlbricks/gaussian.py` module and `Gaussian` / `GaussianConfig`
+imports have been removed. The legacy BOLT cache type is `BoltLegacyCache`.
+Weights stored using the original parameter keys remain loadable when the
+matching BOLT architecture settings are explicitly selected.
