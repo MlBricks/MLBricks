@@ -120,6 +120,12 @@ class ESA(nn.Module):
         )
         self.layer.compass = self.compass
 
+        # Cache the original Fast-EsaQ decode method.
+        self._direct_decode = (
+            self.layer.decode_step
+            if self.esa_variant == "current" else None
+        )
+
         self.register_buffer("_esa_device_ref", torch.empty(0), persistent=False)
 
         if device == "auto":
@@ -242,6 +248,7 @@ class ESA(nn.Module):
         try:
             self.layer = torch.compile(self.layer, mode=mode, fullgraph=False)
             self.compiled = True
+            self._direct_decode = None
         except Exception:
             self.compiled = False
         return self
@@ -351,10 +358,12 @@ class ESA(nn.Module):
         return self._fast_run(x, state, backend=backend)
 
     def decode_step(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Decode a token with optimized Half-Life Fast-EsaQ dispatch."""
+        """Decode using the cached Fast-EsaQ Half-Life method."""
+
+        decode = self._direct_decode
 
         if (
-            self.esa_variant == "current"
+            decode is not None
             and x.ndim == 2
             and state is not None
             and state.ndim == 3
@@ -362,14 +371,21 @@ class ESA(nn.Module):
             and x.shape[1] == self.embd
             and state.shape == (x.shape[0], self.head, self.embd // self.head)
             and state.device == x.device
-            and (not self.auto_move_input or x.device == self._esa_device_ref.device)
-            and (not self.strict_checks or self.batch is None or x.shape[0] == self.batch)
-            and not self.compiled
+            and (
+                not self.auto_move_input
+                or x.device == self._buffers["_esa_device_ref"].device
+            )
+            and (
+                not self.strict_checks
+                or self.batch is None
+                or x.shape[0] == self.batch
+            )
         ):
-            y, new_state = self.layer.decode_step(x, state)
-            return y[:, 0, :], new_state
+            out, next_state = decode(x, state)
+            return out[:, 0, :], next_state
 
         squeezed = x.ndim == 2
+
         if squeezed:
             x = x.unsqueeze(1)
 
@@ -377,7 +393,6 @@ class ESA(nn.Module):
             raise ValueError("decode_step expects [B,C] or [B,1,C]")
 
         y, new_state = self._fast_run(x, state)
-
         return (y[:, 0] if squeezed else y), new_state
 
     lightning_prefill = prefill
