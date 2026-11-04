@@ -3,7 +3,7 @@ import inspect
 import pytest
 import torch
 
-from mlbricks import ESA as MLBricksESA
+from mlbricks import ESAAdapter as MLBricksESA
 from mlbricks.esa.fast_engine import ESA, CurrentESA, BaseESA, ESAConfig, make_esa, make_model
 from mlbricks.esa.fast_engine.core import ESA as CoreESA
 

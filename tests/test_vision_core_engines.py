@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from mlbricks import ESA, Bolt, Vesa, VisionBolt
+from mlbricks import ESAAdapter as ESA, Bolt, Vesa, VisionBolt
 from mlbricks.vesa.layers.mixer import ESAMixer
 
 

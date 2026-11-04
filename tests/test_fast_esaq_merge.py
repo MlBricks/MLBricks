@@ -3,7 +3,7 @@ import math
 import torch
 import pytest
 
-from mlbricks import ESA, ESAModel, ESAModelConfig
+from mlbricks import ESAAdapter as ESA, ESAModel, ESAModelConfig
 from mlbricks.esa.fast_engine import CurrentESA, BaseESA
 
 @pytest.mark.parametrize("heads", [1, 2, 4, 6])

@@ -8,7 +8,7 @@ from mlbricks import (
     Attention,
     Brick,
     Bricks,
-    ESA,
+    ESAAdapter as ESA,
     FFN,
     Bolt,
     BoltModel,

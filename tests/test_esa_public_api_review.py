@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from mlbricks import ESA, ESAConfig, ESAModelConfig
+from mlbricks import ESAAdapter as ESA, ESAConfig, ESAModelConfig
 from mlbricks.vesa.config import ESAConfig as VESAESAConfig
 
 

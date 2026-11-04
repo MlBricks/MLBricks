@@ -36,6 +36,7 @@ from .residualbrick import native_backend_available as residualbrick_native_back
 from .residualbrick import native_backend_name as residualbrick_native_backend_name
 from .esa import (
     ESA,
+    ESAAdapter,
     ESAConfig,
     ESAModel,
     ESAModelConfig,
@@ -135,6 +136,7 @@ __all__ = [
     "residualbrick_native_backend_available",
     "residualbrick_native_backend_name",
     "ESA",
+    "ESAAdapter",
     "esa",
     "ESAConfig",
     "ESAModel",

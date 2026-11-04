@@ -4,6 +4,17 @@ MLBricks Kit is a modular neural-network toolkit for building and experimenting 
 
 It provides unified `auto`, `native`, and `pytorch` backend dispatch together with reusable components and architectures including **ESA, Bolt, BoltModel, VisionBolt, VESA, Bricks, FFNBrick, ResController, SOUP, and ElasticBit**. MLBricks also includes native C++/CUDA execution paths, adaptive runtime planning, model lifecycle utilities, and production-oriented inference/training APIs.
 
+## Fast-EsaQ direct API
+
+`from mlbricks import ESA` now exposes the original Fast-EsaQ v0.4.0 ESA class,
+not an additional MLBricks decoder wrapper. Its `forward` and `decode_step`
+return `(output, state)`, and one-token output is `[B,1,D]`.
+`variant="current"` uses learned Half-Life ESA; `variant="base"` uses the
+historical learned-bounds implementation. Use `ESAAdapter` only for historical
+MLBricks single-output modules and checkpoints; existing `ESAModel` continues
+to use that compatibility adapter until its independent checkpoint migration.
+See `DIRECT_FASTESAQ_MIGRATION.md`.
+
 ## Core components
 
 - **ESA** — Entangled State Attention for recurrent/state-based sequence processing.

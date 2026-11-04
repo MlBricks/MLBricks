@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mlbricks import ESA, ESAConfig
+from mlbricks import ESAAdapter as ESA, ESAConfig
 from mlbricks.backends.thunder import thunder_scan
 from mlbricks.generation import parse_engine_spec
 from mlbricks.planner import AUTO_COMPASS_CANDIDATES, ceil_div

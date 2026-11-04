@@ -64,7 +64,9 @@ def _call_with_supported_kwargs(cls, kwargs: dict[str, Any]):
 def _load_mixer_class(name: str):
     key = name.lower().strip()
     if key == "esa":
-        from mlbricks import ESA
+        # SOUP's built-in mixer uses the historical single-output and headed-
+        # state compatibility contract; external SOUP users can supply native ESA.
+        from mlbricks.esa.layer import ESA
         return ESA
     if key == "bolt":
         try:

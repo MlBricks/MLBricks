@@ -4,7 +4,7 @@ import json
 
 import torch
 
-from mlbricks import ESA, ESAModel, ESAModelConfig, thunderBoost
+from mlbricks import ESAAdapter as ESA, ESAModel, ESAModelConfig, thunderBoost
 from mlbricks.planner import sequence_bucket
 
 

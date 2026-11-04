@@ -9,7 +9,7 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
-from mlbricks import ESA, ESAModel, ESAModelConfig
+from mlbricks import ESAAdapter as ESA, ESAModel, ESAModelConfig
 
 
 ROOT = Path(__file__).resolve().parents[1]

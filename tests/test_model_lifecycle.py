@@ -5,7 +5,7 @@
 import torch
 
 from mlbricks import (
-    ESA,
+    ESAAdapter as ESA,
     ESAModel,
     ESAModelConfig,
     Trainer,

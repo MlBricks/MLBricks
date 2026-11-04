@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mlbricks import Bolt, Brick, Bricks, ESA, FFN, StateAwareFFN
+from mlbricks import Bolt, Brick, Bricks, ESAAdapter as ESA, FFN, StateAwareFFN
 
 
 def _make_composed_bricks(device: torch.device) -> Bricks:

@@ -1,6 +1,6 @@
 import torch
 
-from mlbricks import Attention, Brick, Bricks, ESA, Bolt, BoltModel
+from mlbricks import Attention, Brick, Bricks, ESAAdapter as ESA, Bolt, BoltModel
 from mlbricks.cache import BoltLegacyCache, KVCache
 
 

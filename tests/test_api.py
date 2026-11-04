@@ -3,7 +3,7 @@ import inspect
 import pytest
 import torch
 
-from mlbricks import ESA
+from mlbricks import ESAAdapter as ESA
 
 
 def test_default_backend_and_compass():

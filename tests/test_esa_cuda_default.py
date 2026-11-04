@@ -4,7 +4,7 @@ import inspect
 import pytest
 import torch
 
-from mlbricks import ESA, ESAConfig
+from mlbricks import ESAAdapter as ESA, ESAConfig
 
 
 def test_esa_auto_constructor_defaults():
