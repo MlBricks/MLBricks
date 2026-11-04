@@ -1,114 +1,30 @@
-"""Ready-made Bolt causal language model."""
-from __future__ import annotations
+"""BOLT causal model, network blocks, generation, and automatic device placement.
 
-from dataclasses import asdict, dataclass
-import math
+The BOLT implementation and all model operations live in this module.
+"""
+from __future__ import annotations
+from dataclasses import asdict
+import contextlib
 from typing import Any
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .bolt import Bolt
-from .components import Embedding, FFN, LayerNorm, LMHead, RMSNorm, Residual
-from .ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
-from .residualbrick import ResController
-from .position import make_position
-from .runtime import (
+from .attention import Bolt
+from .presets import BoltPresetCache
+from .config import BoltConfig, BoltModelSettings
+from .precision import native_bf16_supported
+from ..cache import BoltLegacyCache
+from ..components import Embedding, FFN, LayerNorm, LMHead, RMSNorm, Residual
+from ..ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
+from ..residualbrick import ResController
+from ..position import make_position
+from ..runtime import (
     normalize_backend, backend_report as collect_backend_report,
-    build_execution_plan, compile_module, prepare_module_execution, reset_execution_route, predict_module,
+    build_execution_plan, compile_module, prepare_module_execution,
+    reset_execution_route, predict_module,
 )
-from .cache import GaussCache
-from .bolt.presets import BoltPresetCache
-
-
-@dataclass
-class GaussianConfig:
-    vocab_size: int
-    context: int = 2048
-    layers: int = 6
-    dim: int = 384
-    heads: int = 6
-    latent_dim: int = 32  # legacy-only when bolt_mode='legacy'
-    bolt_mode: str = "quality"  # quality (AVQ-198), fast (BOLT), legacy
-    bolt_cache: str = "normal"  # normal=32, tight=16
-    avq_dim: int = 198
-    position: str = "none"
-    ffn: str = "standard"
-    residual: str = "standard"
-    norm: str = "rmsnorm"
-    activation: str = "gelu"
-    ffn_mult: int = 4
-    dropout: float = 0.0
-    bias: bool = False
-    tie_embeddings: bool = True
-    backend: str = "auto"
-    eps: float = 1e-6
-    ffn_state_dim: int = 256
-    ffn_depth_embedding_dim: int = 64
-    ffn_virtual_refinements: int = 2
-    ffn_virtual_hidden_dim: int = 128
-    ffn_micro_hidden_dim: int = 64
-    ffn_micro_refinements: int = 1
-    residual_update_ratio: float = 0.18
-    residual_stream_ratio: float = 1.08
-    residual_update_softness: float = 8.0
-    residual_stream_softness: float = 8.0
-
-    def __post_init__(self) -> None:
-        for name in ("vocab_size", "context", "layers", "dim", "heads", "latent_dim"):
-            if int(getattr(self, name)) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if self.dim % self.heads:
-            raise ValueError("dim must be divisible by heads")
-        self.backend = normalize_backend(self.backend, warn_legacy=True)
-        self.bolt_mode = str(self.bolt_mode).strip().lower()
-        self.bolt_cache = str(self.bolt_cache).strip().lower()
-        if self.bolt_mode not in ("quality", "fast", "legacy"):
-            raise ValueError("bolt_mode must be quality, fast or legacy")
-        if self.bolt_cache not in ("normal", "tight"):
-            raise ValueError("bolt_cache must be normal or tight")
-        if int(self.avq_dim) < 1:
-            raise ValueError("avq_dim must be positive")
-        if self.bolt_mode != "legacy" and self.backend == "native":
-            raise ValueError("native BOLT / AVQ is not yet supported; use auto/pytorch")
-        self.ffn = str(self.ffn).strip().lower().replace("-", "_")
-        aliases = {
-            "default": "standard", "ffn": "standard", "standard": "standard",
-            "saffn": "saffn", "stateaware": "saffn", "state_aware": "saffn", "ffnbrick": "saffn",
-            "virtual": "virtual", "virtual_state_aware": "virtual", "virtual_ffnbrick": "virtual",
-            "micro": "micro", "micro_virtual": "micro", "micro_ffnbrick": "micro",
-        }
-        if self.ffn not in aliases:
-            raise ValueError("ffn must be standard, saffn, virtual, or micro")
-        self.ffn = aliases[self.ffn]
-        self.residual = str(self.residual).strip().lower().replace("-", "_")
-        if self.residual in {"default", "residual"}:
-            self.residual = "standard"
-        if self.residual in {"controller", "res_controller"}:
-            self.residual = "rescontroller"
-        if self.residual not in {"standard", "rescontroller"}:
-            raise ValueError("residual must be standard or rescontroller")
-        self.norm = str(self.norm).strip().lower().replace("-", "_")
-        if self.norm not in {"rmsnorm", "rms", "layernorm", "layer_norm"}:
-            raise ValueError("norm must be rmsnorm or layernorm")
-
-    # ESA-style compatibility names.
-    @property
-    def block(self) -> int:
-        return self.context
-
-    @property
-    def n_layer(self) -> int:
-        return self.layers
-
-    @property
-    def embd(self) -> int:
-        return self.dim
-
-    @property
-    def head(self) -> int:
-        return self.heads
 
 
 def _norm(kind: str, dim: int, bias: bool):
@@ -117,7 +33,7 @@ def _norm(kind: str, dim: int, bias: bool):
     return LayerNorm(dim, bias=bias)
 
 
-def _residual(cfg: GaussianConfig):
+def _residual(cfg: BoltModelSettings):
     if cfg.residual == "standard":
         return Residual(cfg.dropout)
     return ResController(
@@ -129,7 +45,7 @@ def _residual(cfg: GaussianConfig):
     )
 
 
-def _ffn(cfg: GaussianConfig, layer_index: int):
+def _ffn(cfg: BoltModelSettings, layer_index: int):
     if cfg.ffn == "standard":
         return FFN(
             cfg.dim,
@@ -166,8 +82,8 @@ def _ffn(cfg: GaussianConfig, layer_index: int):
     )
 
 
-class _GaussianBlock(nn.Module):
-    def __init__(self, cfg: GaussianConfig, layer_index: int, rotary=None) -> None:
+class BoltBlock(nn.Module):
+    def __init__(self, cfg: BoltModelSettings, layer_index: int, rotary=None) -> None:
         super().__init__()
         self.cfg = cfg
         self.norm1 = _norm(cfg.norm, cfg.dim, cfg.bias)
@@ -175,12 +91,21 @@ class _GaussianBlock(nn.Module):
         if legacy:
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, eps=cfg.eps, position=rotary)
+                             backend=cfg.backend, eps=cfg.eps, position=rotary,
+                             precision=getattr(cfg, 'precision', 'fp32'),
+                             device='cpu')
         else:
+            is_bolt_config = hasattr(cfg,'profile')
             self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
                              cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, position=rotary)
+                             backend=cfg.backend, position=rotary,
+                             profile=cfg.profile if is_bolt_config else None,
+                             attention_scale=getattr(cfg,'attention_scale',None),
+                             memory_init=getattr(cfg,'memory_init',None),
+                             projection=getattr(cfg,'projection',None),
+                             precision=getattr(cfg,'precision','auto'),
+                             device='cpu')
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
         self.ffn = _ffn(cfg, layer_index)
@@ -238,7 +163,7 @@ class _GaussianBlock(nn.Module):
     @torch.no_grad()
     def prefill(
         self, x, previous_mixer=None, previous_state=None, *,
-        start_pos: int = 0, cache_buffer: GaussCache | None = None,
+        start_pos: int = 0, cache_buffer: BoltLegacyCache | None = None,
     ):
         normalized = self.norm1(x)
         mixer_update, (c, rho) = self.attn.prefill_with_cache(
@@ -266,7 +191,7 @@ class _GaussianBlock(nn.Module):
         q, c_now, rho_now = self.attn.project_decode_state(
             normalized, start_pos=position
         )
-        if isinstance(cache, GaussCache):
+        if isinstance(cache, BoltLegacyCache):
             mixer_update = self.attn.decode_append_projected(
                 q, c_now, rho_now, cache.c, cache.rho, position=position
             )[:, None, :]
@@ -274,7 +199,7 @@ class _GaussianBlock(nn.Module):
             next_cache = cache
         else:
             # Backward-compatible external prefill/decode API. Optimized model
-            # generation uses GaussCache and never takes this torch.cat path.
+            # generation uses BoltLegacyCache and never takes this torch.cat path.
             c_old, rho_old = cache
             c = torch.cat([c_old, c_now], dim=2)
             rho = torch.cat([rho_old, rho_now], dim=2)
@@ -288,14 +213,14 @@ class _GaussianBlock(nn.Module):
         return x, next_cache, mixer_update, next_state
 
 
-class Gaussian(nn.Module):
+class BoltModelCore(nn.Module):
     """Complete causal LM made from :class:`Bolt` blocks.
 
     Backend is ``auto`` implicitly.  Users normally omit it and only specify
     ``native`` or ``pytorch`` when they deliberately want to override dispatch.
     """
 
-    def __init__(self, config: GaussianConfig | None = None, **kwargs: Any) -> None:
+    def __init__(self, config: BoltModelSettings | None = None, **kwargs: Any) -> None:
         super().__init__()
         if config is None:
             # Accept ESA-style names as a convenience.
@@ -303,7 +228,7 @@ class Gaussian(nn.Module):
             for old, new in aliases.items():
                 if old in kwargs and new not in kwargs:
                     kwargs[new] = kwargs.pop(old)
-            config = GaussianConfig(**kwargs)
+            config = BoltConfig(**kwargs)
         elif kwargs:
             raise TypeError("Pass either config=... or keyword configuration, not both")
         self.config = config
@@ -316,7 +241,7 @@ class Gaussian(nn.Module):
         self.token_embedding = Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
-            [_GaussianBlock(config, i, rotary=rotary) for i in range(config.layers)]
+            [BoltBlock(config, i, rotary=rotary) for i in range(config.layers)]
         )
         self.final_norm = _norm(config.norm, config.dim, config.bias)
         self.lm_head = LMHead(
@@ -431,7 +356,7 @@ class Gaussian(nn.Module):
                     batch_size,a.num_heads,capacity,a.latent_dim,a.avq_dim,
                     device=device,dtype=dtype))
             else:
-                caches.append(GaussCache.allocate(
+                caches.append(BoltLegacyCache.allocate(
                     batch_size,a.num_heads,capacity,a.latent_dim,
                     device=device,dtype=dtype))
         self._prepared_generation = {
@@ -444,7 +369,7 @@ class Gaussian(nn.Module):
         if warmup_native and device.type == "cuda" and self.backend != "pytorch":
             # Pay extension import/load cost before the autoregressive loop.
             try:
-                from ._backend import load_cuda_extension
+                from .._backend import load_cuda_extension
                 load_cuda_extension()
             except Exception:
                 if self.backend == "native":
@@ -456,22 +381,29 @@ class Gaussian(nn.Module):
 
     def _generation_caches(self, input_ids: torch.Tensor, capacity: int):
         p = next(self.parameters())
+        cache_dtype = p.dtype
+        policy = getattr(self.config, 'precision', 'fp32')
+        if p.device.type == 'cuda' and policy != 'fp32':
+            if policy == 'bf16' or (policy == 'auto' and native_bf16_supported(p.device)):
+                cache_dtype = torch.bfloat16
+            else:
+                cache_dtype = torch.float16
         prepared = self._prepared_generation
         if (prepared is None
             or prepared["batch_size"] != input_ids.size(0)
             or prepared["capacity"] < capacity
             or prepared["device"] != str(input_ids.device)
-            or prepared["dtype"] != p.dtype):
+            or prepared["dtype"] != cache_dtype):
             self.prepare_generation(
                 batch_size=input_ids.size(0), max_context=capacity,
-                device=input_ids.device, dtype=p.dtype, warmup_native=True,
+                device=input_ids.device, dtype=cache_dtype, warmup_native=True,
             )
             prepared = self._prepared_generation
         return prepared["caches"]
 
     @torch.no_grad()
     def prefill(
-        self, input_ids: torch.Tensor, *, cache_buffers: list[GaussCache] | None = None
+        self, input_ids: torch.Tensor, *, cache_buffers: list[BoltLegacyCache] | None = None
     ):
         x = self._embed(input_ids, start_pos=0)
         caches = []
@@ -560,3 +492,80 @@ class Gaussian(nn.Module):
             f"dim={c.dim}, heads={c.heads}, latent_dim={c.latent_dim}, "
             f"position={c.position!r}, backend={self.backend!r}"
         )
+
+# Historical private symbol retained for deserializing older model objects.
+
+
+
+class BoltModel(BoltModelCore):
+    """Complete BOLT language model.
+
+    The constructor automatically places model weights on CUDA when available.
+    Input token IDs and targets are transferred to the model's current device.
+    ``precision='auto'`` uses autocast on CUDA and full precision on CPU.
+    """
+    def __init__(self, config: BoltConfig | BoltModelSettings | None = None, **kwargs):
+        if config is None:
+            aliases = {'block':'context','n_layer':'layers','embd':'dim','head':'heads'}
+            for old,new in aliases.items():
+                if old in kwargs and new not in kwargs:
+                    kwargs[new] = kwargs.pop(old)
+            config = BoltConfig(**kwargs)
+        elif kwargs:
+            raise TypeError('Pass a config or keyword arguments, not both')
+        if not isinstance(config, BoltModelSettings):
+            raise TypeError('config must be BoltConfig or a compatible legacy configuration')
+        super().__init__(config)
+        requested = getattr(config,'device','auto')
+        if str(requested).lower() == 'auto':
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device(requested)
+            if device.type == 'cuda' and not torch.cuda.is_available():
+                raise RuntimeError('CUDA was explicitly requested but is unavailable')
+        self.to(device)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def _autocast(self):
+        precision = getattr(self.config,'precision','fp32')
+        if self.device.type != 'cuda' or precision == 'fp32':
+            return contextlib.nullcontext()
+        if precision == 'auto':
+            dtype = torch.bfloat16 if native_bf16_supported(self.device) else torch.float16
+        elif precision == 'bf16':
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError('Requested BF16 precision is unsupported by this CUDA GPU')
+            dtype = torch.bfloat16
+        else:
+            dtype = torch.float16
+        return torch.autocast('cuda',dtype=dtype)
+
+    def _on_device(self, data):
+        if data is None:
+            return None
+        return data.to(self.device, non_blocking=True) if data.device != self.device else data
+
+    def forward(self, input_ids, *, targets=None):
+        input_ids = self._on_device(input_ids)
+        targets = self._on_device(targets)
+        with self._autocast():
+            return super().forward(input_ids, targets=targets)
+
+    @torch.no_grad()
+    def prefill(self,input_ids,*,cache_buffers=None):
+        with self._autocast():
+            return super().prefill(self._on_device(input_ids), cache_buffers=cache_buffers)
+
+    @torch.no_grad()
+    def decode_step(self,input_ids,caches,*,position):
+        with self._autocast():
+            return super().decode_step(self._on_device(input_ids),caches,position=position)
+
+    @torch.no_grad()
+    def generate(self,input_ids,max_new_tokens,*,temperature=1.,top_k=None):
+        # Parent implementation calls self.prefill/decode_step, which handle autocast.
+        return super().generate(self._on_device(input_ids),max_new_tokens,
+                                temperature=temperature,top_k=top_k)

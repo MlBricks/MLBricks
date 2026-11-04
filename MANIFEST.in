@@ -26,3 +26,5 @@ include mlbricks/ffnbrick/LICENSE_FFNBRICK.txt
 include mlbricks/residualbrick/LICENSE_RESIDUALBRICK.txt
 include mlbricks/soup/LICENSE_SOUP.txt
 include mlbricks/vesa/LICENSE_VESA.txt
+
+recursive-include mlbricks/bolt/native_accel *.cpp *.cu

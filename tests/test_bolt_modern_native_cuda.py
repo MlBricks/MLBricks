@@ -5,6 +5,7 @@ import pytest
 import torch
 from mlbricks import Bolt
 from mlbricks.bolt import native_backend as backend
+from mlbricks.bolt import accelerated
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA GPU required')
 
@@ -88,7 +89,10 @@ def test_bolt_native_preallocated_cache(mode):
 
 
 def test_no_legacy_substitution_on_missing_extension(monkeypatch):
+    # The new optimized recurrence is an independent valid native provider;
+    # disable both native providers to test the truly-unavailable case.
     monkeypatch.setattr(backend,'get_extension',lambda:None)
-    m=Bolt(384,12,mode='quality',backend='native').cuda()
+    monkeypatch.setattr(accelerated,'available',lambda:False)
+    m=Bolt(384,12,mode='quality',backend='native',device='cuda',precision='fp32')
     with pytest.raises(RuntimeError,match='mlbricks._bolt_modern_cuda'):
         m(torch.randn(1,4,384,device='cuda'))

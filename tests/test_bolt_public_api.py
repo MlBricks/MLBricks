@@ -3,7 +3,7 @@ import inspect
 import torch
 
 import mlbricks
-from mlbricks import Bolt, BoltAttention, Bolt, BoltModel, BoltConfig, Gaussian, GaussianConfig
+from mlbricks import Bolt, BoltAttention, BoltModel, BoltConfig
 from mlbricks.bolt import Bolt as BoltFromPackage
 
 
@@ -17,8 +17,8 @@ def test_bolt_is_canonical_and_legacy_alias_is_identical():
 
 
 def test_bolt_model_aliases_preserve_ready_made_model_api():
-    assert BoltModel is Gaussian
-    assert BoltConfig is GaussianConfig
+    assert BoltModel.__module__ == "mlbricks.bolt.model"
+    assert BoltConfig.__module__ == "mlbricks.bolt.config"
     model = BoltModel(vocab_size=31, context=16, layers=1, dim=32, heads=4, latent_dim=8)
     ids = torch.randint(0, 31, (1, 4))
     assert model(ids).shape == (1, 4, 31)
@@ -32,7 +32,7 @@ def test_legacy_gauss_import_constructs_bolt():
 
 def test_bolt_prefill_decode_step_matches_full_causal_forward():
     torch.manual_seed(7)
-    layer = Bolt(16, 4, latent_dim=4, backend="pytorch", dropout=0.0).eval()
+    layer = Bolt(16, 4, latent_dim=4, backend="pytorch", dropout=0.0, device="cpu", precision="fp32").eval()
     prefix = torch.randn(2, 5, 16)
     continuation = torch.randn(2, 3, 16)
 
@@ -59,7 +59,7 @@ def test_bolt_packed_training_matches_explicit_sdpa_and_preserves_parameters():
     import torch.nn.functional as F
 
     torch.manual_seed(19)
-    layer = Bolt(32, 4, latent_dim=8, backend="pytorch", dropout=0.0, use_sdpa=True).train()
+    layer = Bolt(32, 4, latent_dim=8, backend="pytorch", dropout=0.0, use_sdpa=True, device="cpu", precision="fp32").train()
     x1 = torch.randn(2, 7, 32, requires_grad=True)
     x2 = x1.detach().clone().requires_grad_(True)
 

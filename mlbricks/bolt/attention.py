@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import contextlib
 from typing import Tuple
 
 import torch
@@ -11,6 +12,7 @@ from .._reference import attention_forward_reference, gauss_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
 from ..position import RoPE
+from .precision import native_bf16_supported
 
 from .._backend import (
     WORKSPACES,
@@ -611,8 +613,42 @@ class Bolt(nn.Module):
         use_sdpa: bool = True,
         position=None,
         native_full_sequence: bool = False,
+        profile: str | None = None,
+        state_memory: bool = True,
+        device: str = 'auto',
+        precision: str = 'auto',
+        attention_scale: str | None = None,
+        memory_init: str | None = None,
+        projection: str | None = None,
     ):
         super().__init__()
+        if not isinstance(state_memory, bool):
+            raise TypeError('state_memory must be True or False')
+        # A caller can opt out of AVQ without knowing the historical
+        # quality/fast mode names. Retain explicit mode='fast' and 'legacy'
+        # for existing callers and their checkpoints.
+        if not state_memory and mode != 'legacy':
+            mode = 'fast'
+        if profile is not None:
+            if profile not in ('standard', 'compact'):
+                raise ValueError('profile must be standard or compact')
+            if latent_dim is not None and int(latent_dim) != (32 if profile == 'standard' else 16):
+                raise ValueError('latent_dim conflicts with profile')
+            cache = 'normal' if profile == 'standard' else 'tight'
+            if mode == 'legacy':
+                raise ValueError('profile cannot be used with legacy mode')
+            mode = 'quality' if mode is None else mode
+        self.profile = profile
+        self.precision = str(precision).lower()
+        if self.precision not in ('auto','fp16','bf16','fp32'):
+            raise ValueError('precision must be auto, fp16, bf16 or fp32')
+        requested = str(device).strip().lower()
+        if requested == 'auto':
+            resolved_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            resolved_device = torch.device(device)
+            if resolved_device.type == 'cuda' and not torch.cuda.is_available():
+                raise RuntimeError('CUDA was explicitly selected but is unavailable')
         # PyTorch-like constructor keyword: nn.MultiheadAttention(embed_dim=..., num_heads=...).
         # Preserve Bolt(384, 12) and Bolt(d_model=384, num_heads=12) unchanged.
         # Refuse ambiguous duplicate dimension keywords rather than choosing silently.
@@ -644,6 +680,9 @@ class Bolt(nn.Module):
                 d_model, num_heads, mode=target_mode, cache=cache, avq_dim=avq_dim,
                 bias=bias, dropout=dropout, causal=causal, backend=backend,
                 position=position,
+                projection=projection or ('packed' if profile is not None else 'separate'),
+                attention_scale=attention_scale or ('latent' if profile is not None else 'head'),
+                memory_init=memory_init or ('balanced' if profile is not None else 'legacy'),
             )
             self.d_model=int(d_model)
             self.num_heads=int(num_heads)
@@ -654,6 +693,8 @@ class Bolt(nn.Module):
             self.mode=self._modern.mode
             self.cache_mode=self._modern.cache_mode
             self.avq_dim=self._modern.avq_dim
+            self.state_memory = self._modern.avq is not None
+            self.to(resolved_device)
             return
         if latent_dim is None:
             latent_dim=32
@@ -666,6 +707,7 @@ class Bolt(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = self.d_model // self.num_heads
         self.latent_dim = int(latent_dim)
+        self.state_memory = False  # historical BOLT has no AVQ component
         self.dropout = float(dropout)
         self.causal = bool(causal)
         self.backend = _validate_backend(backend)
@@ -690,6 +732,7 @@ class Bolt(nn.Module):
         # source Parameter version changes.
         self._packed_qcg_cache = None
         self._packed_qcg_versions = None
+        self.to(resolved_device)
 
     def set_backend(self, backend: str, *, recursive: bool = True):
         if self.is_modern:
@@ -898,7 +941,29 @@ class Bolt(nn.Module):
             B, T, self.num_heads * self.latent_dim
         )
 
+    def _precision_context(self):
+        current_device = next(self.parameters()).device
+        # BoltModel already provides a model-wide autocast scope. Creating
+        # one more autocast manager per BOLT layer is redundant and adds
+        # Python dispatcher overhead to every training iteration.
+        if current_device.type == 'cuda' and torch.is_autocast_enabled('cuda'):
+            return contextlib.nullcontext()
+        if current_device.type != 'cuda' or self.precision == 'fp32':
+            return contextlib.nullcontext()
+        if self.precision == 'bf16' and not torch.cuda.is_bf16_supported():
+            raise RuntimeError('BF16 is not supported on this GPU')
+        dtype = (torch.bfloat16 if self.precision == 'bf16' else
+                 (torch.bfloat16 if self.precision == 'auto' and native_bf16_supported(current_device)
+                  else torch.float16))
+        return torch.autocast('cuda', dtype=dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device != next(self.parameters()).device:
+            x = x.to(next(self.parameters()).device, non_blocking=True)
+        with self._precision_context():
+            return self._forward_impl(x)
+
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
         if self.is_modern:
             return self._modern(x)
         if x.dim() != 3:
@@ -1103,7 +1168,15 @@ class Bolt(nn.Module):
 
     @torch.no_grad()
     def prefill_with_cache(self, x: torch.Tensor, *, start_pos: int = 0):
+        """Prefill under the same execution precision used by forward()."""
+        with self._precision_context():
+            return self._prefill_with_cache_impl(x, start_pos=start_pos)
+
+    @torch.no_grad()
+    def _prefill_with_cache_impl(self, x: torch.Tensor, *, start_pos: int = 0):
         """Fast prefill: output and compact cache. Modern returns C+AVQ state."""
+        if x.device != next(self.parameters()).device:
+            x = x.to(next(self.parameters()).device, non_blocking=True)
         if self.is_modern:
             return self._modern.prefill_with_cache(x, start_pos=start_pos)
         if x.dim() != 3 or x.size(-1) != self.d_model:
@@ -1154,11 +1227,23 @@ class Bolt(nn.Module):
         x: torch.Tensor,
         cache: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Decode under the same execution precision as forward()."""
+        with self._precision_context():
+            return self._decode_step_impl(x, cache)
+
+    @torch.no_grad()
+    def _decode_step_impl(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Decode one token and append it to the compact Bolt cache.
 
         ``x`` may be ``[B,D]`` or ``[B,1,D]``. The returned output always
         has shape ``[B,1,D]`` to match ESA/SOUP's recurrent mixer contract.
         """
+        if x.device != next(self.parameters()).device:
+            x = x.to(next(self.parameters()).device, non_blocking=True)
         if self.is_modern:
             return self._modern.decode_step(x, cache)
         if x.dim() == 2:

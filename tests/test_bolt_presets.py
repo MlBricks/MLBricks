@@ -12,7 +12,7 @@ from mlbricks import Bolt, BoltModel, BoltPreset, BoltPresetCache
 @pytest.mark.parametrize('position', [None, 'rope'])
 def test_preset_forward_cached_parity_with_nonzero_avq(mode, cache, position):
     torch.manual_seed(12)
-    layer=Bolt(32,4,mode=mode,cache=cache,position=position,backend='pytorch').eval()
+    layer=Bolt(32,4,mode=mode,cache=cache,position=position,backend='pytorch',device='cpu',precision='fp32').eval()
     assert layer.is_modern
     assert layer.latent_dim==(32 if cache=='normal' else 16)
     assert layer.avq_dim==(198 if mode=='quality' else 0)
@@ -42,7 +42,7 @@ def test_bolt_default_is_quality_normal_198_and_fast_has_no_avq():
 
 def test_cached_generation_reuses_state_and_repeated_prefill_resets_it():
     torch.manual_seed(7)
-    m=BoltModel(vocab_size=47,dim=32,heads=4,layers=2,context=16,dropout=0.).eval()
+    m=BoltModel(vocab_size=47,dim=32,heads=4,layers=2,context=16,dropout=0.,device='cpu',precision='fp32').eval()
     for block in m.blocks:
         with torch.no_grad():block.attn._modern.avq.gamma.fill_(.12)
     tokens=torch.randint(0,47,(1,7))
@@ -88,7 +88,7 @@ def test_checkpoint_round_trip_and_strict_old_dimension_rejection():
 
 
 def test_native_is_not_silently_used_for_new_equations():
-    m=Bolt(32,4)
+    m=Bolt(32,4,device='cpu',precision='fp32')
     m.set_backend('native')
     with pytest.raises(RuntimeError,match='requires a CUDA tensor'):
         m(torch.randn(1,3,32))

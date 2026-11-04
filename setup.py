@@ -62,6 +62,7 @@ def _extension(
     cuda_source: Path | None = None,
     use_fast_math: bool = False,
     lineinfo: bool = False,
+    disable_fma: bool = False,
     libraries: list[str] | None = None,
 ):
     # setuptools requires extension source paths to be relative to setup.py.
@@ -96,6 +97,8 @@ def _extension(
             nvcc.append("-Xcompiler=/Zc:preprocessor")
         if use_fast_math:
             nvcc.append("--use_fast_math")
+        if disable_fma:
+            nvcc.append("--fmad=false")
         if lineinfo and os.getenv("MLBRICKS_NATIVE_LINEINFO", "0") == "1":
             nvcc.append("-lineinfo")
         extra_compile_args["nvcc"] = nvcc
@@ -160,6 +163,21 @@ if enabled("MLBRICKS_BUILD_BOLT_MODERN_NATIVE") and has_cuda_toolkit:
             lineinfo=True,
         )
     )
+
+# Optional accelerated BOLT state-memory kernels (production source build).
+# The original modern/native extension and its ABI remain unchanged.
+if enabled("MLBRICKS_BUILD_BOLT_ACCEL"):
+    if not has_cuda_toolkit:
+        raise RuntimeError("MLBRICKS_BUILD_BOLT_ACCEL=1 requires CUDA toolkit and CUDA PyTorch")
+    csrc = ROOT / "mlbricks" / "bolt" / "native_accel"
+    extensions.append(_extension(
+        "mlbricks._bolt_scan_segmented", [csrc / "state_segmented_bindings.cpp"],
+        cuda_source=csrc / "state_segmented.cu", lineinfo=True, disable_fma=True,
+    ))
+    extensions.append(_extension(
+        "mlbricks._bolt_scan_short", [csrc / "state_short_bindings.cpp"],
+        cuda_source=csrc / "state_short.cu", lineinfo=True, disable_fma=True,
+    ))
 
 # Legacy pre-1.0 VESA recurrence extension. Unified VESA now uses mlbricks.esa.
 # Keep explicit opt-in for compatibility, but do not build this unused engine by default.
