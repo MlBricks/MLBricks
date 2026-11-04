@@ -351,12 +351,33 @@ class ESA(nn.Module):
         return self._fast_run(x, state, backend=backend)
 
     def decode_step(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode a token with optimized Half-Life Fast-EsaQ dispatch."""
+
+        if (
+            self.esa_variant == "current"
+            and x.ndim == 2
+            and state is not None
+            and state.ndim == 3
+            and state.dtype == torch.float32
+            and x.shape[1] == self.embd
+            and state.shape == (x.shape[0], self.head, self.embd // self.head)
+            and state.device == x.device
+            and (not self.auto_move_input or x.device == self._esa_device_ref.device)
+            and (not self.strict_checks or self.batch is None or x.shape[0] == self.batch)
+            and not self.compiled
+        ):
+            y, new_state = self.layer.decode_step(x, state)
+            return y[:, 0, :], new_state
+
         squeezed = x.ndim == 2
         if squeezed:
             x = x.unsqueeze(1)
+
         if x.ndim != 3 or x.size(1) != 1:
             raise ValueError("decode_step expects [B,C] or [B,1,C]")
+
         y, new_state = self._fast_run(x, state)
+
         return (y[:, 0] if squeezed else y), new_state
 
     lightning_prefill = prefill
