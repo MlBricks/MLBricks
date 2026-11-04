@@ -19,12 +19,12 @@ def test_training_timer_excludes_paused_time():
     assert timer.elapsed > after
 
 
-def test_short_prefill_route_avoids_fused(monkeypatch):
+def test_legacy_bounded_gate_native_readout_is_not_exposed():
     import mlbricks.native as native
-    monkeypatch.setattr(native, "fused_enabled_for", lambda tensor: True)
-    monkeypatch.delenv("MLBRICKS_FUSED_READOUT", raising=False)
-    native.EXECUTION_PLANNER.route_cache.clear()
-    short = torch.empty(1, 256, 3 * 64)
-    larger = torch.empty(4, 256, 3 * 64)
-    assert native.should_use_fused_readout(short, 64, 16) is False
-    assert native.should_use_fused_readout(larger, 64, 16) is True
+    for name in (
+        "should_use_fused_readout",
+        "thunder_fused_readout",
+        "thunder_forward_hierarchical",
+        "lightning_fused_step",
+    ):
+        assert not hasattr(native, name)

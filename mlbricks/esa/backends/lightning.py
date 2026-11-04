@@ -5,10 +5,8 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from ..precision import resolve_scan_dtype
 
 
 def associative_compass_scan(
@@ -138,109 +136,3 @@ def lightning_scan(
         E = E[:, :T]
 
     return E
-
-
-class LightningESA(nn.Module):
-    """Lightning backend using an exact chunked affine scan."""
-
-    def __init__(
-        self,
-        embd: int,
-        head: int = 4,
-        *,
-        dropout: float = 0.0,
-        compass: int = 4,
-        precision: str = "fp16",
-        gate_min: float = 0.80,
-        gate_max: float = 0.995,
-        eps: float = 1e-5,
-        strict_precision: bool = False,
-    ):
-        super().__init__()
-
-        if embd <= 0:
-            raise ValueError(f"embd must be positive, got {embd}.")
-        if head <= 0:
-            raise ValueError(f"head must be positive, got {head}.")
-        if embd % head != 0:
-            raise ValueError(
-                f"embd must be divisible by head, got embd={embd}, head={head}"
-            )
-        if not isinstance(compass, int) or compass <= 0:
-            raise ValueError(
-                f"compass must be a positive integer, got {compass!r}"
-            )
-
-        self.embd = int(embd)
-        self.head = int(head)
-        self.head_dim = self.embd // self.head
-        self.compass = int(compass)
-
-        self.precision = str(precision)
-        self.gate_min = float(gate_min)
-        self.gate_max = float(gate_max)
-        self.eps = float(eps)
-        self.strict_precision = bool(strict_precision)
-
-        self.qgv = nn.Linear(
-            self.embd,
-            3 * self.embd,
-            bias=False,
-        )
-        self.out_proj = nn.Linear(
-            self.embd,
-            self.embd,
-            bias=False,
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, C = x.shape
-
-        q, gate_raw, value_raw = self.qgv(x).split(C, dim=-1)
-
-        q = q.reshape(B, T, self.head, self.head_dim)
-        gate_raw = gate_raw.reshape(
-            B,
-            T,
-            self.head,
-            self.head_dim,
-        )
-        value_raw = value_raw.reshape(
-            B,
-            T,
-            self.head,
-            self.head_dim,
-        )
-
-        gate = torch.sigmoid(gate_raw)
-        A = self.gate_min + (
-            self.gate_max - self.gate_min
-        ) * gate
-
-        V = torch.tanh(value_raw)
-        B_write = (1.0 - A) * V
-
-        scan_dtype = resolve_scan_dtype(
-            self.precision,
-            x.device,
-            strict_precision=self.strict_precision,
-        )
-
-        E = lightning_scan(
-            A.to(scan_dtype).contiguous(),
-            B_write.to(scan_dtype).contiguous(),
-            compass=self.compass,
-        )
-
-        E = E.reshape(B, T, C)
-        q = q.reshape(B, T, C).to(E.dtype)
-
-        E = E * torch.rsqrt(
-            E.pow(2).mean(dim=-1, keepdim=True)
-            + self.eps
-        )
-
-        y = torch.sigmoid(q) * E
-        y = self.out_proj(y.to(x.dtype))
-        return self.dropout(y)

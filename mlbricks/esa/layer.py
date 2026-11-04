@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from collections.abc import Mapping
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -139,17 +143,85 @@ class ESA(nn.Module):
         return self
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        # Fail even with strict=False when given a checkpoint for another ESA
-        # equation; silent partial loading would produce invalid predictions.
+        if not isinstance(state_dict, Mapping):
+            raise TypeError("Expected checkpoint mapping")
+
         keys = set(state_dict)
-        has_legacy = any(k.endswith("out_proj.weight") for k in keys)
-        has_fast = any(k.endswith("log_half_life") or k.endswith("raw_alpha") for k in keys)
-        if has_legacy and not has_fast:
+        old = any(k.endswith("out_proj.weight") for k in keys)
+        half = "log_half_life" in keys or "layer.log_half_life" in keys
+        base = "raw_alpha" in keys or "layer.raw_alpha" in keys
+
+        if old and not (half or base):
             raise ValueError(
-                "Old Thunder ESA weights are incompatible with Fast-EsaQ. "
-                "Use your backed-up original code for those checkpoints."
+                "Old Thunder ESA weights are incompatible with Fast-EsaQ"
             )
-        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+        bare = any(
+            k in keys for k in
+            ("qgv.weight", "log_half_life", "raw_alpha")
+        )
+
+        if bare:
+            if any(k.startswith("layer.") for k in keys):
+                raise ValueError("Cannot mix bare and prefixed keys")
+
+            from .fast_engine.public_api import detect_esa_variant
+            variant = detect_esa_variant(state_dict)
+
+            if variant != self.esa_variant:
+                raise ValueError(
+                    f"Fast-EsaQ checkpoint variant {variant!r} "
+                    f"does not match {self.esa_variant!r}"
+                )
+
+            state_dict = OrderedDict(
+                ("layer." + key, value)
+                for key, value in state_dict.items()
+            )
+        elif half and self.esa_variant != "current":
+            raise ValueError("Half-life checkpoint requires current ESA")
+        elif base and self.esa_variant != "base":
+            raise ValueError("Base checkpoint requires BaseESA")
+
+        return super().load_state_dict(
+            state_dict, strict=strict, assign=assign
+        )
+
+    def load_fast_esaq_checkpoint(self, path: str | Path, *, strict=True):
+        checkpoint = torch.load(
+            str(path), map_location="cpu", weights_only=True
+        )
+
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError("Checkpoint must be a mapping")
+
+        state = checkpoint.get(
+            "state_dict", checkpoint.get("model", checkpoint)
+        )
+        if not isinstance(state, Mapping):
+            raise ValueError("Missing Fast-EsaQ state dictionary")
+
+        label = checkpoint.get(
+            "architecture", checkpoint.get("variant")
+        )
+        if label is not None:
+            from .fast_engine.core import normalize_variant
+            if normalize_variant(label) != self.esa_variant:
+                raise ValueError("Fast-EsaQ checkpoint variant mismatch")
+
+        cfg = checkpoint.get("config", {})
+        if cfg is not None:
+            if not isinstance(cfg, Mapping):
+                raise ValueError("Invalid checkpoint config")
+            for key, val in (
+                ("embd", self.embd), ("head", self.head)
+            ):
+                if key in cfg and int(cfg[key]) != val:
+                    raise ValueError(
+                        f"Fast-EsaQ checkpoint {key} mismatch"
+                    )
+
+        return self.load_state_dict(state, strict=strict)
 
     def resolved_backend(self) -> str:
         if self.backend == "cuda":
@@ -209,19 +281,26 @@ class ESA(nn.Module):
     def _fast_run(self, x, state=None, *, reverse=False, backend=None):
         x = self._prepare_input(x)
         state, flat = self._fast_input_state(state, x.shape[0], x.device)
-        # Backend per-call overrides are resolved using a temporary setting.
-        # Restore policy after call, including on exceptions.
-        selected = self.backend if backend is None or backend == "lightning" else _public_backend(backend)
-        selected_engine = _engine_backend(selected)
-        engine = getattr(self.layer, "_orig_mod", self.layer)
-        original_backend = engine.resolved_backend()
-        if selected_engine != original_backend:
-            engine.set_backend(selected_engine)
-        try:
+        if backend is None or backend == "lightning":
             y, last = self.layer(x.flip(1) if reverse else x, state)
-        finally:
-            if selected_engine != original_backend:
-                engine.set_backend(original_backend)
+        else:
+            selected_engine = _engine_backend(
+                _public_backend(backend)
+            )
+            engine = getattr(
+                self.layer, "_orig_mod", self.layer
+            )
+            old_backend = engine.resolved_backend()
+
+            if selected_engine != old_backend:
+                engine.set_backend(selected_engine)
+            try:
+                y, last = self.layer(
+                    x.flip(1) if reverse else x, state
+                )
+            finally:
+                if selected_engine != old_backend:
+                    engine.set_backend(old_backend)
         if reverse:
             y = y.flip(1)
         if flat:
