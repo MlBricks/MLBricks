@@ -88,20 +88,23 @@ class ESA(nn.Module):
         return self.requested_backend
 
     def _apply(self, fn, recurse=True):
-        """Keep small Half-Life control weights FP32 after .to/.half/.bfloat16.
+        """Preserve native FP32 gate controls after mixed-precision casts.
 
-        The original fused decode binding requires these parameters in FP32.
-        No changes to the recurrence or kernel code are made.
+        Half-Life and BaseESA fused CUDA decode require FP32 retention
+        parameters/state; projection weights and activations may be FP16.
         """
         result = super()._apply(fn, recurse=recurse)
-        if getattr(self, "esa_variant", None) == "current":
-            for name in ("log_half_life", "raw_decay_bias"):
+        variant = getattr(self, "esa_variant", None)
+        if variant in {"current", "base"}:
+            names = (("log_half_life", "raw_decay_bias") if variant == "current"
+                     else ("raw_alpha", "raw_beta"))
+            for name in names:
                 param = getattr(self, name)
                 if param.dtype != torch.float32:
                     param.data = param.data.float()
                     if param.grad is not None:
                         param.grad = param.grad.float()
-            if hasattr(self, "state_norm"):
+            if variant == "current" and hasattr(self, "state_norm"):
                 param = self.state_norm.weight
                 if param.dtype != torch.float32:
                     param.data = param.data.float()
@@ -115,8 +118,6 @@ class ESA(nn.Module):
         if not x.is_cuda:
             raise RuntimeError("backend='native' requires a CUDA input; use backend='auto' on CPU")
         if x.ndim == 3 and x.size(1) == 1:
-            if self.esa_variant == "base":
-                raise RuntimeError("Native Base ESA one-token decode kernel is unavailable; use backend='auto'")
             if torch.is_grad_enabled():
                 raise RuntimeError("Native ESA single-token decode requires torch.no_grad() or torch.inference_mode()")
 
@@ -160,8 +161,9 @@ class BaseESA(ESA, _LearnedBoundsESA):
                  **kwargs: Any):
         if normalize_variant(variant) != "base":
             raise ValueError("BaseESA requires variant='base'")
-        scan, _ = _modes(backend)
-        _LearnedBoundsESA.__init__(self, dim=embd, heads=head, scan=scan, **kwargs)
+        scan, fused = _modes(backend)
+        _LearnedBoundsESA.__init__(self, dim=embd, heads=head, scan=scan,
+                                   fused_decode=fused, **kwargs)
         # Keep self.variant == 'learned' for the legacy reference forward!
         self._setup_api(embd=embd, head=head, variant="base",
                         backend=backend, device=device)

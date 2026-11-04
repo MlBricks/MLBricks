@@ -59,7 +59,8 @@ class BaseESA(learned.ESAFullMixer):
     """
 
     def __init__(self, dim: int, heads: int = 6, scan: str = "auto",
-                 cumpass: int = 16, parallel_chunk: int = 128, cuda_warps: int = 8):
+                 cumpass: int = 16, parallel_chunk: int = 128, cuda_warps: int = 8,
+                 fused_decode: str = "auto"):
         super().__init__(dim=dim, heads=heads, variant="learned")
         scan = normalize_scan(scan)
         if not isinstance(cumpass, int) or cumpass < 1:
@@ -72,6 +73,10 @@ class BaseESA(learned.ESAFullMixer):
             raise ValueError("cuda_warps must be 4, 8, or 16")
         self.parallel_chunk = parallel_chunk
         self.cuda_warps = cuda_warps
+        if fused_decode not in {"auto", "on", "off"}:
+            raise ValueError("fused_decode must be 'auto', 'on', or 'off'")
+        self.fused_decode = fused_decode
+        self._fused_unavailable = False
 
     def forward(self, x, state=None):
         if self.scan == "reference":
@@ -87,7 +92,24 @@ class BaseESA(learned.ESAFullMixer):
         if state is not None and (tuple(state.shape) != (B, self.heads, self.dh)
                                   or state.device != x.device):
             raise ValueError(f"Initial state must be {(B, self.heads, self.dh)} on {x.device}")
-        q, g, vraw = self.qgv(x).chunk(3, dim=-1)
+        packed = self.qgv(x)
+        # BaseESA's original learned-bounds recurrence, fused exactly like
+        # Half-Life ESA for inference-only, one-token CUDA decoding.
+        if (T == 1 and x.is_cuda and not torch.is_grad_enabled()
+                and self.fused_decode != "off" and not self._fused_unavailable):
+            try:
+                from .base_decode import decode_base
+                read, final = decode_base(
+                    packed, x, self.raw_alpha, self.raw_beta, state, self.heads)
+                return self.W_O(read), final
+            except (RuntimeError, OSError, ImportError) as exc:
+                if self.fused_decode == "on":
+                    raise
+                import warnings
+                self._fused_unavailable = True
+                warnings.warn(f"Fused BaseESA decode unavailable ({exc}); "
+                              "using unfused recurrence", RuntimeWarning, stacklevel=2)
+        q, g, vraw = packed.chunk(3, dim=-1)
         gate = g.float().reshape(B, T, self.heads, self.dh)
         v = torch.tanh(vraw.float().reshape(B, T, self.heads, self.dh))
         alpha, beta = self.bounds()
@@ -255,7 +277,7 @@ def make_esa(variant: str = "current", *, dim: int = 384, heads: int = 6,
     if normalize_variant(variant) == "base":
         if chunk_size != 32:
             raise ValueError("PROGRESS learned uses fixed chunk_size=32; cannot change it without changing the implementation")
-        return BaseESA(dim=dim, heads=heads, scan=scan,
+        return BaseESA(dim=dim, heads=heads, scan=scan, fused_decode=fused_decode,
                        cumpass=cumpass, parallel_chunk=parallel_chunk, cuda_warps=cuda_warps)
     return ESA(dim=dim, heads=heads, chunk_size=chunk_size, scan=scan,
                       fused_decode=fused_decode, cumpass=cumpass, parallel_chunk=parallel_chunk, cuda_warps=cuda_warps)
