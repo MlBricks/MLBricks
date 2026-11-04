@@ -18,7 +18,7 @@ from mlbricks import (
 )
 
 
-def test_default_backend_is_auto_everywhere_relevant():
+def test_default_backend_is_auto_for_esa_and_other_components():
     assert inspect.signature(ESA).parameters["backend"].default == "auto"
     assert inspect.signature(Attention).parameters["backend"].default == "auto"
     assert inspect.signature(Bolt).parameters["backend"].default == "auto"
@@ -85,7 +85,7 @@ def test_bolt_model_cache_generation():
 def test_bricks_mixed_pipeline_forward_and_generation():
     layers = [
         Brick(
-            mixer=ESA(embd=32, head=4, precision="fp32", device=None),
+            mixer=ESA(embd=32, head=4, backend="pytorch", precision="fp32", device=None),
             ffn=FFN(32, 64, activation="silu"),
             dim=32,
         ),

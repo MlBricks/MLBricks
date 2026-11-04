@@ -69,7 +69,7 @@ def test_bricks_prepares_heterogeneous_fixed_caches():
         layers=[
             Brick(mixer=Bolt(32, 4, latent_dim=8), dim=32),
             Brick(mixer=Attention(32, 4), dim=32),
-            Brick(mixer=ESA(embd=32, head=4, device="cpu"), dim=32),
+            Brick(mixer=ESA(embd=32, head=4, backend="pytorch", device="cpu"), dim=32),
         ],
     )
     model.prepare_generation(batch_size=2, max_context=16, warmup_native=False)

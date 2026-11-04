@@ -480,3 +480,46 @@ MLBRICKS_BUILD_ELASTICBIT_NATIVE=0
 ```
 
 Official native-wheel CI enables the required native build flags explicitly.
+
+## Fast-EsaQ ESA replacement (local integration, not a published beta release)
+
+The default `mlbricks.ESA` now delegates to the half-life Fast-EsaQ v0.4.0
+engine, bundled inside `mlbricks.esa.fast_engine`. It keeps the MLBricks
+Tensor-returning `forward()` and `(output, state)` `prefill()` and `decode_step()`
+interfaces. The FP32 recurrent state can coexist with FP16/BF16 model weights.
+There is no ESA architecture selector and no old Thunder ESA fallback.
+
+This **changes the neural architecture and weight parameter names**. Original
+Thunder checkpoints are not directly compatible; do not load them under the
+new implementation. Old Thunder ESA checkpoints are rejected, even with `strict=False`.
+Read [FASTESAQ_MERGE_NOTES.md](FASTESAQ_MERGE_NOTES.md) for migration, limitations,
+and a complete example in `examples/fast_esaq_migration.py`. Fast-EsaQ CUDA source
+is included but the CUDA extensions require testing on a supported GPU/NVCC
+setup before release. The repository version metadata is intentionally unchanged
+for this local development artifact; assign a new release version before publishing.
+
+### Automatic ESA dispatch with CUDA device defaults
+
+The public MLBricks ESA layer defaults to `backend="auto"` and
+`device="cuda"`. Fast-EsaQ automatically selects a supported scan and decode
+execution path based on its dispatch rules. The automatic policy can use
+PyTorch operations on the requested CUDA device when a native kernel is not
+supported; it does **not** promise the fastest possible kernel or tune all scan
+parameters.
+
+```python
+from mlbricks import ESA
+
+esa = ESA(embd=384, head=6)  # backend="auto", device="cuda"
+
+# Explicit CPU reference execution:
+# esa = ESA(embd=384, head=6, backend="pytorch", device="cpu")
+
+# Request native-only execution explicitly:
+# esa = ESA(embd=384, head=6, backend="cuda", device="cuda")
+```
+
+A CUDA device must still be available for the default constructor; automatic
+backend dispatch does **not** mean automatic CPU device fallback. Specify
+`device="cpu"` to run on CPU; for explicit CPU reference execution, select
+`backend="pytorch"` as well.

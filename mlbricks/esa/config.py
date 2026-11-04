@@ -9,7 +9,7 @@ from typing import Literal
 
 from ..runtime import normalize_backend
 
-Backend = Literal["auto", "native", "pytorch"]
+Backend = Literal["cuda", "auto", "native", "pytorch"]
 Precision = Literal["fp8", "fp16", "bf16", "fp32", "fp64"]
 
 
@@ -26,8 +26,6 @@ class ESAConfig:
     compass: int | str | None = "auto"
 
     precision: Precision = "fp16"
-    gate_min: float = 0.8
-    gate_max: float = 0.995
     eps: float = 1e-5
     strict_precision: bool = False
     strict_backend: bool = False
@@ -41,7 +39,10 @@ class ESAConfig:
             raise ValueError(
                 f"embd must be divisible by head, got embd={self.embd}, head={self.head}."
             )
-        self.backend = normalize_backend(self.backend, warn_legacy=True)
+        if str(self.backend).strip().lower() == "cuda":
+            self.backend = "cuda"
+        else:
+            self.backend = normalize_backend(self.backend, warn_legacy=True)
 
         # None is accepted for old checkpoints/configs and upgraded to auto.
         if self.compass is None:

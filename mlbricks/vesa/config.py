@@ -28,8 +28,8 @@ class ESAConfig:
     """VESA adapter configuration for the canonical :mod:`mlbricks.esa` engine.
 
     ``chunk_size`` and ``gate_bias`` remain accepted for source compatibility
-    with early VESA configurations. New execution uses ESA's production
-    ``compass`` planner and bounded-gate Q/G/V formulation.
+    with early VESA configurations. The ESA engine now uses learned
+    half-life retention gates rather than externally bounded gate values.
     """
 
     dim: int = 192
@@ -38,8 +38,6 @@ class ESAConfig:
     chunk_size: int = 64  # legacy VESA field; retained for config compatibility
     compass: int | str | None = "auto"
     precision: str = "fp16"
-    gate_min: float = 0.80
-    gate_max: float = 0.995
     eps: float = 1e-5
     gate_bias: float = 0.0  # legacy field; canonical ESA projections are bias-free
 
@@ -50,8 +48,6 @@ class ESAConfig:
             raise ValueError("heads must be positive")
         if self.chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
-        if not (0.0 <= float(self.gate_min) < float(self.gate_max) <= 1.0):
-            raise ValueError("gate_min/gate_max must satisfy 0 <= min < max <= 1")
         if float(self.eps) <= 0.0:
             raise ValueError("eps must be positive")
         compass = self.compass

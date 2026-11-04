@@ -45,8 +45,6 @@ class ESAMixer(nn.Module):
             backend=config.backend,
             precision=config.precision,
             compass=config.compass,
-            gate_min=config.gate_min,
-            gate_max=config.gate_max,
             eps=config.eps,
             device=None,
             auto_move_input=False,
@@ -78,9 +76,21 @@ class ESAMixer(nn.Module):
         old VESA projection. Its semantics now intentionally match canonical ESA
         rather than the removed two-way gate/value projection.
         """
-        from ...esa.generation import _project_affine_terms
-
-        _, A, B_write = _project_affine_terms(self.engine, x)
+        import math
+        import torch.nn.functional as F
+        core = getattr(self.engine.layer, "_orig_mod", self.engine.layer)
+        B, T, D = x.shape
+        _, raw_gate, raw_value = core.qgv(x).chunk(3, dim=-1)
+        gate = raw_gate.reshape(B, T, self.core_heads, D // self.core_heads).float()
+        value = torch.tanh(raw_value.reshape(B, T, self.core_heads, D // self.core_heads).float())
+        if self.engine.esa_variant == "current":
+            half = core.log_half_life.exp()
+            decay = F.softplus(gate + core.raw_decay_bias[None, None, :, None])
+            A = torch.exp(-math.log(2.0) * decay / half[None, None, :, None])
+        else:
+            alpha, beta = core.bounds()
+            A = alpha[None, None, :, None] + (beta - alpha)[None, None, :, None] * torch.sigmoid(gate)
+        B_write = (1.0 - A) * value
         return A.flatten(2), B_write.flatten(2)
 
     def forward(

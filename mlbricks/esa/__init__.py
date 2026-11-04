@@ -2,10 +2,10 @@
 
 from .config import ESAConfig
 from .layer import ESA
+from .fast_engine import BaseESA as FastBaseESA, CurrentESA as FastCurrentESA
 from .model import ESAModel, ESAModelConfig
 from .generation import GenerationResult, GenerationStats
 from .compass import compass, CompassResult
-from .backends import ThunderESA
 from .benchmark import (
     ESABenchmarkConfig,
     DEFAULT_BENCHMARK_CONFIG,
@@ -21,6 +21,8 @@ from .boost import thunderBoost
 
 __all__ = [
     "ESA",
+    "FastCurrentESA",
+    "FastBaseESA",
     "ESAConfig",
     "ESAModel",
     "ESAModelConfig",
@@ -28,7 +30,6 @@ __all__ = [
     "GenerationStats",
     "compass",
     "CompassResult",
-    "ThunderESA",
     "ESABenchmarkConfig",
     "DEFAULT_BENCHMARK_CONFIG",
     "FAST_BENCHMARK_CONFIG",

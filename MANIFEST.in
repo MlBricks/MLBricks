@@ -28,3 +28,6 @@ include mlbricks/soup/LICENSE_SOUP.txt
 include mlbricks/vesa/LICENSE_VESA.txt
 
 recursive-include mlbricks/bolt/native_accel *.cpp *.cu
+
+# Fast-EsaQ native source (compilation is lazy / opt-in)
+recursive-include mlbricks/esa/fast_engine/cuda *.cu *.cpp

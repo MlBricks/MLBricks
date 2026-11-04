@@ -158,8 +158,6 @@ class ESAModelConfig:
     training_compile: bool = True
     training_compile_mode: str = "default"
     training_compile_fullgraph: bool = False
-    gate_min: float = 0.80
-    gate_max: float = 0.995
     eps: float = 1e-5
     tie_embeddings: bool = True
     format_version: int = 2
@@ -247,6 +245,9 @@ class ESAModelConfig:
     ) -> "ESAModelConfig":
         """Construct a model configuration from serialized dictionary values."""
         allowed = cls.__dataclass_fields__.keys()
+        # Do not silently construct Fast-EsaQ for explicitly old Thunder configs.
+        if data.get("esa_architecture", "fast_esaq") != "fast_esaq":
+            raise ValueError("This installation supports Fast-EsaQ only; an old ESA config cannot be loaded")
         return cls(
             **{
                 key: value
@@ -280,8 +281,6 @@ class _ESABlock(nn.Module):
             precision=cfg.precision,
             compass=cfg.compass,
             dropout=cfg.dropout,
-            gate_min=cfg.gate_min,
-            gate_max=cfg.gate_max,
             eps=cfg.eps,
             device=None,
         )
@@ -659,6 +658,18 @@ class ESAModel(nn.Module):
 
 
 
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # Reject incompatible ESA parameters even for non-strict loads.
+        keys = set(state_dict)
+        has_fast = any(k.endswith("esa.layer.log_half_life") or k.endswith("esa.layer.raw_alpha") for k in keys)
+        has_old_esa = any(k.endswith("esa.layer.out_proj.weight") for k in keys)
+        if has_old_esa and not has_fast:
+            raise ValueError(
+                "Old Thunder ESA checkpoint is incompatible with Fast-EsaQ. "
+                "Use your backed-up original repository."
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def set_backend(self, backend: str, *, recursive: bool = True):
         value = normalize_backend(backend, warn_legacy=True)

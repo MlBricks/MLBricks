@@ -13,7 +13,7 @@ def _make_composed_bricks(device: torch.device) -> Bricks:
         context=16,
         layers=[
             Brick(
-                mixer=ESA(embd=32, head=4, precision="fp32", device=None),
+                mixer=ESA(embd=32, head=4, backend="auto", precision="fp32", device=None),
                 ffn=StateAwareFFN(32),
                 dim=32,
             ),

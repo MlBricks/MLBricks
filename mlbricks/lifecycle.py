@@ -140,23 +140,6 @@ def save(
     return path
 
 
-def _load_legacy_esa(path: Path, device: torch.device, strict: bool) -> nn.Module:
-    """Read pre-unified ESA artifacts through the new public loader."""
-    from .esa.model import ESAModel, ESAModelConfig
-
-    config_path = path / "config.json"
-    state_path = path / "model.pt"
-    config = ESAModelConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
-    model = ESAModel(config, device=device)
-
-    metadata_path = path / "metadata.json"
-    if metadata_path.exists():
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    state = torch.load(state_path, map_location=device, weights_only=True)
-    model.load_state_dict(state, strict=strict)
-    return model
-
-
 def load(
     path: str | Path,
     *,
@@ -183,9 +166,12 @@ def load(
         except Exception:
             metadata = {}
 
-    # Pre-unified ESA artifacts used config.json + a weights-only model.pt.
+    # Old ESA config.json + weights-only model.pt requires the old equation.
     if metadata.get("format") != FORMAT_NAME and (path / "config.json").exists():
-        return _load_legacy_esa(path, target_device, strict)
+        raise ValueError(
+            "Pre-Fast-EsaQ ESA checkpoints are unsupported by this package. "
+            "Open them using your backed-up original MLBricks installation."
+        )
 
     model = torch.load(model_path, map_location=target_device, weights_only=False)
     if not isinstance(model, nn.Module):

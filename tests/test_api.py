@@ -9,11 +9,12 @@ from mlbricks import ESA
 def test_default_backend_and_compass():
     signature = inspect.signature(ESA)
     assert signature.parameters["backend"].default == "auto"
+    assert signature.parameters["device"].default == "cuda"
     assert signature.parameters["compass"].default == "auto"
 
 
 def test_thunder_forward_cpu_auto():
-    layer = ESA(embd=32, head=4, precision="fp32", device=None)
+    layer = ESA(embd=32, head=4, backend="auto", precision="fp32", device=None)
     x = torch.randn(2, 16, 32)
     y = layer(x)
     assert y.shape == x.shape

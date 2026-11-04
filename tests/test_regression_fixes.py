@@ -94,6 +94,7 @@ def test_thunderboost_restores_eval_mode():
         head=2,
         batch=1,
         block=2,
+        backend="pytorch",
         precision="fp32",
         device="cpu",
     ).eval()

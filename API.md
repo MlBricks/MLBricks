@@ -231,14 +231,17 @@ ESA(
     *,
     compass="auto",
     dropout=0.0,
-    gate_min=0.8,
-    gate_max=0.995,
     eps=1e-5,
-    device="auto",
+    device="cuda",
     auto_compile=False,
     compile_mode="default",
     auto_move_input=True,
     strict_checks=False,
+    esa_variant="current",
+    chunk_size=32,
+    cumpass=None,
+    parallel_chunk=128,
+    cuda_warps=8,
 )
 ```
 

@@ -144,9 +144,9 @@ class _LayerFastPlan:
 
 
 def _unwrap_esa_backend(mixer: nn.Module) -> nn.Module:
-    # MLBricks ESA is a public wrapper around ThunderESA in ``mixer.layer``.
-    # torch.compile may add one or more ``_orig_mod`` wrappers. Generation
-    # packing must operate on the actual trained qgv/out_proj tensors.
+    # MLBricks ESA wraps Fast-EsaQ in ``mixer.layer``. Older SOUP packed
+    # generation expects out_proj, so it deliberately refuses this architecture.
+    # torch.compile may add one or more ``_orig_mod`` wrappers.
     target = getattr(mixer, "layer", mixer)
     seen = set()
     while hasattr(target, "_orig_mod") and id(target) not in seen:

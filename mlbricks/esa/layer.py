@@ -10,12 +10,24 @@ import torch.nn as nn
 from ..runtime import normalize_backend
 
 
+def _public_backend(backend: str) -> str:
+    """Expose 'cuda' as an ESA backend without changing other MLBricks modules."""
+    if isinstance(backend, str) and backend.strip().lower() == "cuda":
+        return "cuda"
+    return normalize_backend(backend, warn_legacy=True)
+
+
+def _engine_backend(backend: str) -> str:
+    """Fast-EsaQ names its strict CUDA kernel execution policy 'native'."""
+    return "native" if backend == "cuda" else backend
+
+
 class ESA(nn.Module):
     """Public Entangled State Attention sequence-mixing layer.
 
-    Thunder is the single production ESA backend. ``compass="auto"`` is the
-    default and lets MLBricks choose a validated scan configuration. Advanced
-    users can pass a positive integer such as ``compass=16`` or ``compass=32``.
+    Uses Fast-EsaQ's half-life gated recurrence exclusively. The MLBricks
+    adapter returns a tensor from forward() and exposes FP32 recurrent state
+    through prefill(), forward_with_state(), and decode_step().
     """
 
     def __init__(
@@ -29,14 +41,17 @@ class ESA(nn.Module):
         *,
         compass: int | str | None = "auto",
         dropout: float = 0.0,
-        gate_min: float = 0.80,
-        gate_max: float = 0.995,
         eps: float = 1e-5,
-        device: str | torch.device | None = "auto",
+        device: str | torch.device | None = "cuda",
         auto_compile: bool = False,
         compile_mode: str = "default",
         auto_move_input: bool = True,
         strict_checks: bool = False,
+        esa_variant: str = "current",
+        chunk_size: int = 32,
+        cumpass: int | None = None,
+        parallel_chunk: int = 128,
+        cuda_warps: int = 8,
     ):
         super().__init__()
 
@@ -53,15 +68,17 @@ class ESA(nn.Module):
         if block is not None and block <= 0:
             raise ValueError(f"block must be positive when set, got {block}.")
 
+        if esa_variant not in {"current", "base"}:
+            raise ValueError("esa_variant must be current or base")
+        self.esa_variant = esa_variant
+        self.chunk_size = int(chunk_size)
         self.embd = int(embd)
         self.head = int(head)
         self.batch = None if batch is None else int(batch)
         self.block = None if block is None else int(block)
-        self.backend = normalize_backend(backend, warn_legacy=True)
+        self.backend = _public_backend(backend)
         self.precision = str(precision).lower()
         self.dropout = float(dropout)
-        self.gate_min = float(gate_min)
-        self.gate_max = float(gate_max)
         self.eps = float(eps)
         self.auto_move_input = bool(auto_move_input)
         self.strict_checks = bool(strict_checks)
@@ -79,52 +96,70 @@ class ESA(nn.Module):
             if self.compass <= 0:
                 raise ValueError(f"compass must be positive, got {self.compass}.")
 
-        from .backends.thunder import ThunderESA
-        self.layer = ThunderESA(
+        # Fast-EsaQ execution controls. Preserve MLBricks' existing ``compass``
+        # API; explicit ``cumpass`` takes priority when provided.
+        self.cumpass = (self.compass if isinstance(self.compass, int) else 16) if cumpass is None else cumpass
+        self.parallel_chunk = parallel_chunk
+        self.cuda_warps = cuda_warps
+
+        # Fast-EsaQ v0.4.0. It returns (y, FP32 recurrent state).
+        from .fast_engine.public_api import ESA as FastESA
+        self.layer = FastESA(
             embd=self.embd,
             head=self.head,
-            compass=self.compass,
-            dropout=self.dropout,
-            precision=self.precision,
-            gate_min=self.gate_min,
-            gate_max=self.gate_max,
-            eps=self.eps,
-            runtime_backend=self.backend,
+            variant=self.esa_variant,
+            backend=_engine_backend(self.backend),
+            cumpass=self.cumpass,
+            parallel_chunk=self.parallel_chunk,
+            cuda_warps=self.cuda_warps,
+            **({"chunk_size": self.chunk_size} if self.esa_variant == "current" else {}),
         )
+        self.layer.compass = self.compass
 
         self.register_buffer("_esa_device_ref", torch.empty(0), persistent=False)
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         if device is not None:
+            requested_device = torch.device(device)
+            if requested_device.type == "cuda" and not torch.cuda.is_available():
+                raise RuntimeError(
+                    "ESA defaults to device='cuda', but CUDA is not available. "
+                    "For CPU use, specify backend='pytorch', device='cpu'."
+                )
             self.to(device)
         if auto_compile:
             self.compile(mode=compile_mode)
 
     def set_backend(self, backend: str, *, recursive: bool = True):
         del recursive
-        self.backend = normalize_backend(backend, warn_legacy=True)
+        self.backend = _public_backend(backend)
         target = getattr(self.layer, "_orig_mod", self.layer)
-        if hasattr(target, "runtime_backend"):
-            target.runtime_backend = self.backend
+        target.set_backend(_engine_backend(self.backend))
         return self
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # Fail even with strict=False when given a checkpoint for another ESA
+        # equation; silent partial loading would produce invalid predictions.
+        keys = set(state_dict)
+        has_legacy = any(k.endswith("out_proj.weight") for k in keys)
+        has_fast = any(k.endswith("log_half_life") or k.endswith("raw_alpha") for k in keys)
+        if has_legacy and not has_fast:
+            raise ValueError(
+                "Old Thunder ESA weights are incompatible with Fast-EsaQ. "
+                "Use your backed-up original code for those checkpoints."
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def resolved_backend(self) -> str:
-        if self.backend == "pytorch":
-            return "pytorch"
-        if self.backend == "native":
-            return "native-required"
-        try:
-            from .native import available
-            return "native" if available() else "pytorch"
-        except Exception:
-            return "pytorch"
+        if self.backend == "cuda":
+            return "cuda"  # Requested strict CUDA policy, not a kernel benchmark.
+        return getattr(self.layer, "_orig_mod", self.layer).resolved_backend()
 
     def compile(self, mode: str = "default"):
         """Compile this ESA layer with torch.compile and return the module.
 
-        The selected compile mode is also recorded on the underlying Thunder
-        module so ``backend="auto"`` can use the qualified compiled route.
+        The requested compile mode is recorded on the underlying Fast-EsaQ module.
         """
         self.compile_mode = str(mode)
         target = getattr(self.layer, "_orig_mod", self.layer)
@@ -156,12 +191,54 @@ class ESA(nn.Module):
                 raise ValueError(f"ESA block limit is {self.block}, got {T}.")
         return x
 
+    def _fast_input_state(self, state, batch, device):
+        if state is None:
+            return None, False
+        flat = state.ndim == 2
+        expected = (batch, self.head, self.embd // self.head)
+        if flat:
+            if tuple(state.shape) != (batch, self.embd):
+                raise ValueError(f"Expected flat ESA state {(batch, self.embd)}")
+            state = state.reshape(expected)
+        elif tuple(state.shape) != expected:
+            raise ValueError(f"Expected ESA state {expected}")
+        if state.device != device:
+            raise ValueError("ESA state and input must be on the same device")
+        return state.float(), flat
+
+    def _fast_run(self, x, state=None, *, reverse=False, backend=None):
+        x = self._prepare_input(x)
+        state, flat = self._fast_input_state(state, x.shape[0], x.device)
+        # Backend per-call overrides are resolved using a temporary setting.
+        # Restore policy after call, including on exceptions.
+        selected = self.backend if backend is None or backend == "lightning" else _public_backend(backend)
+        selected_engine = _engine_backend(selected)
+        engine = getattr(self.layer, "_orig_mod", self.layer)
+        original_backend = engine.resolved_backend()
+        if selected_engine != original_backend:
+            engine.set_backend(selected_engine)
+        try:
+            y, last = self.layer(x.flip(1) if reverse else x, state)
+        finally:
+            if selected_engine != original_backend:
+                engine.set_backend(original_backend)
+        if reverse:
+            y = y.flip(1)
+        if flat:
+            last = last.reshape(x.shape[0], self.embd)
+        return y, last
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer(self._prepare_input(x))
+        y, _ = self._fast_run(x)
+        return y
 
     def init_state(self, batch: int, *, device=None, dtype=None, layout: str = "heads") -> torch.Tensor:
-        from .generation import lightning_init_state
-        return lightning_init_state(self, batch, device=device, dtype=dtype, layout=layout)
+        if device is None:
+            device = self._esa_device_ref.device
+        shape = (batch, self.head, self.embd // self.head) if layout == "heads" else (batch, self.embd) if layout == "flat" else None
+        if shape is None:
+            raise ValueError("layout must be heads or flat")
+        return torch.zeros(shape, dtype=torch.float32 if dtype is None else dtype, device=device)
 
     def forward_with_state(
         self,
@@ -178,15 +255,9 @@ class ESA(nn.Module):
         such as VESA that need the production ESA engine during both training
         and recurrent inference.
         """
-        from .generation import esa_forward_with_state
-        return esa_forward_with_state(
-            self,
-            self._prepare_input(x),
-            state=state,
-            backend=backend,
-            compass=compass,
-            reverse=reverse,
-        )
+        # Compass remains a performance hint; Fast-EsaQ determines scan
+        # execution using its own backend policy.
+        return self._fast_run(x, state, reverse=reverse, backend=backend)
 
     @torch.no_grad()
     def prefill(
@@ -198,18 +269,16 @@ class ESA(nn.Module):
         compass: int | str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Process a full sequence and return outputs plus final recurrent state."""
-        from .generation import esa_prefill
-        return esa_prefill(
-            self,
-            self._prepare_input(x),
-            state=state,
-            backend=backend,
-            compass=compass,
-        )
+        return self._fast_run(x, state, backend=backend)
 
     def decode_step(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        from .generation import lightning_decode_step
-        return lightning_decode_step(self, x, state)
+        squeezed = x.ndim == 2
+        if squeezed:
+            x = x.unsqueeze(1)
+        if x.ndim != 3 or x.size(1) != 1:
+            raise ValueError("decode_step expects [B,C] or [B,1,C]")
+        y, new_state = self._fast_run(x, state)
+        return (y[:, 0] if squeezed else y), new_state
 
     lightning_prefill = prefill
     lightning_step = decode_step

@@ -45,7 +45,6 @@ from .trainer import Trainer, TrainerState, train
 from .optim import Adam, AdamW, FP16_ADAM_MIN_EPS, stabilize_optimizer
 from .esa import GenerationResult, GenerationStats
 from .esa import compass, CompassResult
-from .esa import ThunderESA
 from .esa import (
     ESABenchmarkConfig,
     DEFAULT_BENCHMARK_CONFIG,
@@ -157,7 +156,6 @@ __all__ = [
     "GenerationStats",
     "compass",
     "CompassResult",
-    "ThunderESA",
     "thunderBoost",
     "FFN",
     "Embedding",
