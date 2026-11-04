@@ -4,7 +4,7 @@ import json
 
 import torch
 
-from mlbricks import ESAAdapter as ESA, ESAModel, ESAModelConfig, thunderBoost
+from mlbricks import ESA, ESAModel, ESAModelConfig, thunderBoost
 from mlbricks.planner import sequence_bucket
 
 
@@ -92,10 +92,7 @@ def test_thunderboost_restores_eval_mode():
     layer = ESA(
         embd=8,
         head=2,
-        batch=1,
-        block=2,
         backend="pytorch",
-        precision="fp32",
         device="cpu",
     ).eval()
     boosted = thunderBoost(
@@ -105,6 +102,7 @@ def test_thunderboost_restores_eval_mode():
         amp=False,
         steps=1,
         device="cpu",
+        batch=torch.randn(1,2,8),
     )
     assert boosted.training is False
 

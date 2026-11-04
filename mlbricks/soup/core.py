@@ -64,9 +64,7 @@ def _call_with_supported_kwargs(cls, kwargs: dict[str, Any]):
 def _load_mixer_class(name: str):
     key = name.lower().strip()
     if key == "esa":
-        # SOUP's built-in mixer uses the historical single-output and headed-
-        # state compatibility contract; external SOUP users can supply native ESA.
-        from mlbricks.esa.layer import ESA
+        from mlbricks.esa import ESA
         return ESA
     if key == "bolt":
         try:
@@ -130,123 +128,6 @@ def _is_state_aware(module: nn.Module) -> bool:
     return len(positional) >= 4
 
 
-@dataclass
-class _LayerFastPlan:
-    layer: nn.Module
-    mixer_backend: nn.Module
-    input_weight: torch.Tensor
-    input_bias: torch.Tensor
-    depth_terms: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    candidate_scale: torch.Tensor
-    write_scale: torch.Tensor
-    delta_mag_scale: torch.Tensor
-    mix_scale: torch.Tensor
-    dim: int
-    state_dim: int
-
-
-def _unwrap_esa_backend(mixer: nn.Module) -> nn.Module:
-    # MLBricks ESA wraps Fast-EsaQ in ``mixer.layer``. Older SOUP packed
-    # generation expects out_proj, so it deliberately refuses this architecture.
-    # torch.compile may add one or more ``_orig_mod`` wrappers.
-    target = getattr(mixer, "layer", mixer)
-    seen = set()
-    while hasattr(target, "_orig_mod") and id(target) not in seen:
-        seen.add(id(target)); target = target._orig_mod
-    return target
-
-
-def _can_fastpath_layer(layer: nn.Module) -> bool:
-    mixer = _unwrap_esa_backend(layer.mixer)
-    ffn = layer.ffn
-    return (
-        hasattr(mixer, "qgv") and hasattr(mixer, "out_proj")
-        and hasattr(mixer, "head") and hasattr(mixer, "head_dim")
-        and hasattr(mixer, "gate_min") and hasattr(mixer, "gate_max") and hasattr(mixer, "eps")
-        and hasattr(ffn, "x_proj") and hasattr(ffn, "context_candidate")
-        and hasattr(ffn, "context_write") and hasattr(ffn, "state_proj")
-        and hasattr(ffn, "output") and hasattr(ffn, "depth_proj")
-        and hasattr(ffn, "depth_embedding") and hasattr(ffn, "state_dim")
-    )
-
-
-def _build_layer_fast_plan(layer: nn.Module) -> _LayerFastPlan:
-    if not _can_fastpath_layer(layer):
-        raise ConfigurationError("generation fast path requires built-in ESA + SAFFN-compatible layer")
-    mixer_backend = _unwrap_esa_backend(layer.mixer)
-    d = int(layer.norm.weight.numel())
-    s = int(layer.ffn.state_dim)
-    w = torch.cat([mixer_backend.qgv.weight.detach(), layer.ffn.x_proj.weight.detach()], dim=0).contiguous()
-    b = torch.cat([
-        torch.zeros(3*d, device=w.device, dtype=layer.ffn.x_proj.bias.dtype),
-        layer.ffn.x_proj.bias.detach(),
-    ], dim=0).contiguous()
-    depth = layer.ffn.depth_proj(layer.ffn.depth_embedding).detach()
-    dc, dw, dv = depth.split(s, dim=-1)
-    return _LayerFastPlan(
-        layer=layer, mixer_backend=mixer_backend, input_weight=w, input_bias=b, depth_terms=(dc, dw, dv),
-        candidate_scale=torch.sigmoid(layer.ffn.candidate_transition_logit).detach(),
-        write_scale=torch.sigmoid(layer.ffn.write_transition_logit).detach(),
-        delta_mag_scale=torch.exp(layer.ffn.delta_magnitude_log_scale).detach(),
-        mix_scale=torch.sigmoid(layer.mix).detach(), dim=d, state_dim=s,
-    )
-
-
-def _packed_esa_and_xproj(z: torch.Tensor, mixer_state: torch.Tensor, plan: _LayerFastPlan):
-    d, s, layer = plan.dim, plan.state_dim, plan.layer
-    mixer = plan.mixer_backend
-    packed = F.linear(z, plan.input_weight, plan.input_bias)
-    qgv, xall = packed[..., :3*d], packed[..., 3*d:]
-    q, gate_raw, value_raw = qgv.split(d, dim=-1)
-    xc, xw, xv = xall.split(s, dim=-1)
-    B, T, _ = z.shape
-    H, HD = int(mixer.head), int(mixer.head_dim)
-    q = q.reshape(B, T, H, HD)
-    gate_raw = gate_raw.reshape(B, T, H, HD)
-    value_raw = value_raw.reshape(B, T, H, HD)
-    gate = torch.sigmoid(gate_raw)
-    A = mixer.gate_min + (mixer.gate_max - mixer.gate_min) * gate
-    V = torch.tanh(value_raw)
-    B_write = (1.0 - A) * V
-    new_state = A[:, 0].to(mixer_state.dtype) * mixer_state + B_write[:, 0].to(mixer_state.dtype)
-    E = new_state.unsqueeze(1).reshape(B, T, d)
-    qflat = q.reshape(B, T, d).to(E.dtype)
-    E = E * torch.rsqrt(E.pow(2).mean(dim=-1, keepdim=True) + mixer.eps)
-    context = mixer.out_proj((torch.sigmoid(qflat) * E).to(z.dtype))
-    if hasattr(mixer, "dropout"):
-        context = mixer.dropout(context)
-    return context, new_state.contiguous(), xc, xw, xv
-
-
-def _fast_saffn(context, previous_context, state, xc, xw, xv, plan: _LayerFastPlan, *, first_layer: bool):
-    ffn, s = plan.layer.ffn, plan.state_dim
-    dc, dw, dv = plan.depth_terms
-    if first_layer:
-        delta = context
-        candidate_context = context + plan.candidate_scale * context
-        write_context = context + plan.write_scale * context
-        candidate = torch.tanh(xc + ffn.context_candidate(candidate_context) + dc)
-        write = torch.sigmoid(xw + ffn.context_write(write_context) + dw)
-        next_state = write * candidate
-    else:
-        delta = context - previous_context
-        candidate_context = context + plan.candidate_scale * delta
-        write_context = context + plan.write_scale * delta
-        sc, sw = ffn.state_proj(state).split(s, dim=-1)
-        candidate = torch.tanh(xc + ffn.context_candidate(candidate_context) + sc + dc)
-        write = torch.sigmoid(xw + ffn.context_write(write_context) + sw + dw)
-        dm = torch.sqrt(delta.float().square().mean(-1, keepdim=True) + 1e-6).to(context.dtype)
-        scaled = plan.delta_mag_scale * dm
-        retain = torch.sigmoid(ffn.retain_logit - scaled * ffn.retain_delta_scale)
-        next_state = (1.0 - write) * (retain * state) + write * candidate
-    if first_layer:
-        dm = torch.sqrt(delta.float().square().mean(-1, keepdim=True) + 1e-6).to(context.dtype)
-        scaled = plan.delta_mag_scale * dm
-    value = F.silu(xv + dv)
-    read = torch.sigmoid(ffn.read_logit + scaled * ffn.read_delta_scale)
-    return ffn.output(next_state * value * read), next_state
-
-
 class StateAwareFFN(nn.Module):
     def __init__(self, dim: int, state_dim: int, layer_index: int, total_layers: int, depth_dim: int = 64):
         super().__init__(); s=int(state_dim); self.state_dim=s
@@ -272,7 +153,7 @@ class SOUPLayer(nn.Module):
     def __init__(self, dim, state_dim, layer_index, total_layers, mixer, ffn):
         super().__init__(); self.state_dim=int(state_dim); self.norm=RMSNorm(dim); self.mixer=mixer; self.ffn=ffn; self.mix=nn.Parameter(torch.tensor(-1.0))
     def forward(self,x,state,previous_context):
-        z=self.norm(x); context=self.mixer(z); ffn_out,state=self.ffn(z,context,previous_context,state); x=x+torch.sigmoid(self.mix)*(context+ffn_out); return x,state,context
+        z=self.norm(x); result=self.mixer(z); context=result[0] if isinstance(result,tuple) else result; ffn_out,state=self.ffn(z,context,previous_context,state); x=x+torch.sigmoid(self.mix)*(context+ffn_out); return x,state,context
 
 
 class ObserverStateMemory(nn.Module):
@@ -310,27 +191,32 @@ class SOUPDecodeCache(NamedTuple):
     observer_count: torch.Tensor
 
 
-class _FastObserverPlan:
-    def __init__(self, observer):
-        self.observer=observer; m=observer.mem_dim
-        self.state_w=torch.cat([observer.state_write.weight.detach(),observer.write_gate.weight.detach()],dim=0).contiguous()
-        self.state_b=torch.cat([torch.zeros(m,device=self.state_w.device,dtype=observer.write_gate.bias.dtype),observer.write_gate.bias.detach()],dim=0).contiguous()
-        self.kv_w=torch.cat([observer.key.weight.detach(),observer.value.weight.detach()],dim=0).contiguous()
-    def decode(self,h,state,written_sum,weight_sum):
-        obs=self.observer; m=obs.mem_dim; past=(written_sum/(weight_sum+1e-6)).to(h.dtype).unsqueeze(1)
-        q=F.normalize(obs.query(torch.cat([h,state],dim=-1)).float(),dim=-1); kv=F.linear(past,self.kv_w); kraw,value=kv[...,:m],kv[...,m:]
-        relevance=torch.sigmoid((q*F.normalize(kraw.float(),dim=-1)).sum(-1,keepdim=True)/math.sqrt(m)+obs.relevance_bias).to(h.dtype); memory=relevance*value
-        pair=F.linear(state,self.state_w,self.state_b); cand_raw,gate_raw=pair.split(m,dim=-1); cand=torch.tanh(cand_raw); w=torch.sigmoid(gate_raw); written=w*cand
-        return memory,written_sum+written[:,0].float(),weight_sum+w[:,0].float()
-
-
 def _resolve_mixer(spec, config, dim, backend, precision):
-    if isinstance(spec,str):
-        cls=_load_mixer_class(spec); cfg=dict(config); cfg.setdefault('embd',dim); cfg.setdefault('dim',dim); cfg.setdefault('d_model',dim); cfg.setdefault('backend',backend); cfg.setdefault('precision',precision)
-        if spec.lower()=='esa': cfg.setdefault('head',8); cfg.setdefault('device',None); cfg.setdefault('auto_move_input',False); cfg.setdefault('auto_compile',False)
-        if spec.lower()=='bolt': cfg.setdefault('num_heads',8)
-        return _call_with_supported_kwargs(cls,cfg), spec.lower()
-    module=_instantiate_custom(spec,dict(config),kind='mixer') if isinstance(spec,nn.Module) else _instantiate_custom(spec,{**dict(config),'dim':dim},kind='mixer')
+    if isinstance(spec, str):
+        key = spec.lower().strip()
+        if key == "esa":
+            from mlbricks.esa import ESA
+            cfg = dict(config)
+            head = int(cfg.pop("head", 8))
+            if dim % head:
+                raise ConfigurationError("SOUP ESA requires dim divisible by head")
+            variant = cfg.pop("variant", "current")
+            b = cfg.pop("backend", backend)
+            cfg.pop("precision", None)  # Precision is a SOUP/model concern.
+            cfg.pop("device", None)  # Device moves with parent module.
+            for retired in ("auto_move_input", "auto_compile", "compass"):
+                if retired in cfg:
+                    raise ConfigurationError(f"Retired ESA argument: {retired}")
+            return ESA(embd=dim, head=head, variant=variant,
+                       backend=b, device=None, **cfg), key
+        cls = _load_mixer_class(key)
+        cfg = dict(config)
+        for name,value in (("embd",dim),("dim",dim),("d_model",dim),
+                           ("backend",backend),("precision",precision)):
+            cfg.setdefault(name,value)
+        if key == "bolt": cfg.setdefault("num_heads",8)
+        return _call_with_supported_kwargs(cls,cfg),key
+    module = _instantiate_custom(spec,dict(config),kind="mixer") if isinstance(spec,nn.Module) else _instantiate_custom(spec,{**dict(config),"dim":dim},kind="mixer")
     return module,module.__class__.__name__
 
 
@@ -358,7 +244,7 @@ class SOUP(nn.Module):
         for i in range(self.depth-1): bridges.append(nn.Identity() if self.widths[i]==self.widths[i+1] else nn.Linear(self.widths[i],self.widths[i+1],bias=False))
         self.state_bridges=nn.ModuleList(bridges); self._uniform_widths=len(set(self.widths))==1
         self.observer=ObserverStateMemory(self.dim,self.widths[-1],memory_dim); self.fusion=SOUPFusion(self.dim,self.widths[-1],fusion_hidden)
-        self._generation_plans=None; self._observer_fast=None; self._generation_fast=False
+
     @property
     def parameter_count(self): return sum(p.numel() for p in self.parameters() if p.requires_grad)
     def _apply(self,fn):
@@ -401,21 +287,17 @@ class SOUP(nn.Module):
     def resolved_backend(self):
         vals=[row['resolved'] for row in self.element_backends()]
         return vals[0] if vals and all(v==vals[0] for v in vals) else (vals or self.backend)
-    def clear_generation_plan(self): self._generation_plans=None; self._observer_fast=None; self._generation_fast=False; return self
+    def clear_generation_plan(self): return self
     def train(self,mode=True):
         if mode: self.clear_generation_plan()
         return super().train(mode)
-    def prepare_generation(self,fast=True):
-        if self.training: raise RuntimeError('call model.eval() before prepare_generation()')
-        self.clear_generation_plan()
-        # The packed fast path is currently specific to built-in ESA + SAFFN.
-        # Mixed recurrent stacks (for example ESA + Bolt) remain fully
-        # supported through the standard per-mixer prefill/decode contract.
-        can_fast=bool(fast) and all(_can_fastpath_layer(layer) for layer in self.layers)
-        self._generation_fast=can_fast
-        if can_fast:
-            self._generation_plans=[_build_layer_fast_plan(layer) for layer in self.layers]; self._observer_fast=_FastObserverPlan(self.observer)
+    def prepare_generation(self, fast=True):
+        if self.training:
+            raise RuntimeError("call model.eval() before prepare_generation()")
+        # Fast-EsaQ is already optimized; obsolete bounded-gate SOUP packed
+        # recurrence was removed. Recurrent decode uses the native mixer.
         return self
+
     def _forward_uniform(self,h,state,prev):
         # Training hot path for the canonical equal-width configuration.
         # Identity bridges remain registered for checkpoint/module compatibility
@@ -442,7 +324,6 @@ class SOUP(nn.Module):
     @torch.no_grad()
     def prefill(self,x):
         if x.dim()!=3 or x.shape[-1]!=self.dim or x.shape[1]<1: raise ValueError(f"SOUP prefill input must be [B,T,{self.dim}] with T>=1")
-        if self._generation_fast and self._generation_plans is None: self.prepare_generation(True)
         state=x.new_zeros(*x.shape[:-1],self.widths[0]); prev=torch.zeros_like(x); h=x; mixer_states=[]
         for i,layer in enumerate(self.layers):
             if not callable(getattr(layer.mixer,'prefill',None)): raise RuntimeError('mixer must provide prefill() for recurrent generation')
@@ -458,16 +339,9 @@ class SOUP(nn.Module):
         relevance=torch.sigmoid((q*k).sum(-1,keepdim=True)/math.sqrt(self.observer.mem_dim)+self.observer.relevance_bias).to(h.dtype); memory=relevance*self.observer.value(past)
         cand=torch.tanh(self.observer.state_write(state)); w=torch.sigmoid(self.observer.write_gate(state)); written=w*cand
         h,_=self.fusion(h,state,memory); return h,SOUPDecodeCache(tuple(states),cache.observer_sum+written[:,0].float(),cache.observer_count+w[:,0].float())
-    def _decode_fast(self,x,cache):
-        h=x; prev=None; state=None; states=[]
-        for i,plan in enumerate(self._generation_plans):
-            z=plan.layer.norm(h); context,mstate,xc,xw,xv=_packed_esa_and_xproj(z,cache.mixer_states[i],plan); ffn_out,state=_fast_saffn(context,prev,state,xc,xw,xv,plan,first_layer=(i==0)); h=h+plan.mix_scale*(context+ffn_out); prev=context; states.append(mstate)
-            if i<len(self.state_bridges): state=self.state_bridges[i](state)
-        memory,osum,ocount=self._observer_fast.decode(h,state,cache.observer_sum,cache.observer_count); h,_=self.fusion(h,state,memory); return h,SOUPDecodeCache(tuple(states),osum,ocount)
     def decode_step(self,x,cache):
         if x.dim()==2: x=x.unsqueeze(1)
         if x.dim()!=3 or x.shape[1]!=1 or x.shape[-1]!=self.dim: raise ValueError(f"SOUP decode_step expects [B,1,{self.dim}]")
-        if self._generation_fast and self._generation_plans is not None: return self._decode_fast(x,cache)
         return self._decode_standard(x,cache)
     lightning_prefill=prefill; lightning_step=decode_step
     @torch.no_grad()

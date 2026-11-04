@@ -22,7 +22,7 @@ from .generation import (
     sample_next_token,
     parse_engine_spec,
 )
-from .layer import ESA
+from .fast_engine.public_api import ESA
 from ..components import Embedding, FFN, LayerNorm, LMHead
 from ..ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
 from ..residualbrick import ResController
@@ -276,12 +276,8 @@ class _ESABlock(nn.Module):
         self.esa = ESA(
             embd=cfg.embd,
             head=cfg.head,
-            block=cfg.block,
-            backend=cfg.backend,
-            precision=cfg.precision,
-            compass=cfg.compass,
-            dropout=cfg.dropout,
-            eps=cfg.eps,
+            variant="current",
+            backend=normalize_backend(cfg.backend),
             device=None,
         )
 
@@ -471,7 +467,7 @@ class _ESABlock(nn.Module):
         previous_esa: torch.Tensor | None = None,
         previous_ffn_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        esa_update = self.esa(self.ln1(x))
+        esa_update, _ = self.esa(self.ln1(x))
         x, ln2_x = self._residual_and_ln2(x, esa_update)
         x, next_ffn_state = self._mlp_residual(
             x, ln2_x, esa_update, previous_esa, previous_ffn_state
@@ -488,11 +484,10 @@ class _ESABlock(nn.Module):
         previous_esa: torch.Tensor | None = None,
         previous_ffn_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        esa_update, state = self.esa.prefill(
-            self.ln1(x),
-            backend=backend,
-            compass=compass,
-        )
+        if backend is not None:
+            self.esa.set_backend(normalize_backend(backend))
+        # Compass is a retired adapter option, not a native decode argument.
+        esa_update, state = self.esa.prefill(self.ln1(x))
         x, ln2_x = self._residual_and_ln2(x, esa_update)
         x, next_ffn_state = self._mlp_residual(
             x, ln2_x, esa_update, previous_esa, previous_ffn_state
@@ -518,7 +513,8 @@ class _ESABlock(nn.Module):
             self.ln1(x),
             state,
         )
-        x = x + y
+        # Fast-EsaQ preserves [B,1,D]; this model step uses [B,D].
+        x = x + (y[:, 0] if x.ndim == 2 else y)
         x = x + self.mlp(self.ln2(x))
         return x, new_state
 
@@ -533,6 +529,8 @@ class _ESABlock(nn.Module):
             self.ln1(x),
             state,
         )
+        if x.ndim == 2:
+            esa_update = esa_update[:, 0]
         x, ln2_x = self._residual_and_ln2(x, esa_update)
         x, next_ffn_state = self._mlp_residual(
             x, ln2_x, esa_update, previous_esa, previous_ffn_state
@@ -660,15 +658,19 @@ class ESAModel(nn.Module):
 
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        # Reject incompatible ESA parameters even for non-strict loads.
-        keys = set(state_dict)
-        has_fast = any(k.endswith("esa.layer.log_half_life") or k.endswith("esa.layer.raw_alpha") for k in keys)
-        has_old_esa = any(k.endswith("esa.layer.out_proj.weight") for k in keys)
-        if has_old_esa and not has_fast:
-            raise ValueError(
-                "Old Thunder ESA checkpoint is incompatible with Fast-EsaQ. "
-                "Use your backed-up original repository."
-            )
+        from collections import OrderedDict
+        keys = tuple(state_dict)
+        legacy = any(".esa.layer." in key for key in keys)
+        if legacy:
+            if not any(key.endswith(("esa.layer.log_half_life", "esa.layer.raw_alpha")) for key in keys):
+                raise ValueError("Old Thunder weights are not compatible with Fast-EsaQ")
+            updated = OrderedDict()
+            for key, value in state_dict.items():
+                new_key = key.replace(".esa.layer.", ".esa.")
+                if new_key in updated:
+                    raise ValueError(f"Checkpoint key collision: {new_key}")
+                updated[new_key] = value
+            state_dict = updated
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def set_backend(self, backend: str, *, recursive: bool = True):

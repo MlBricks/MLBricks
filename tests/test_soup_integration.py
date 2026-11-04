@@ -71,8 +71,8 @@ def test_soup_mixed_generation_fast_request_falls_back_safely():
     ).cpu().eval()
 
     model.prepare_generation(fast=True)
-    assert model._generation_fast is False
-    assert model._generation_plans is None
+    assert not hasattr(model, "_generation_fast")
+    assert not hasattr(model,"_generation_plans")
 
     x = torch.randn(1, 4, 16)
     y, cache = model.prefill(x)

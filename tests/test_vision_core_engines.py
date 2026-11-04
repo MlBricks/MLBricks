@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from mlbricks import ESAAdapter as ESA, Bolt, Vesa, VisionBolt
+from mlbricks import ESA, Bolt, Vesa, VisionBolt
 from mlbricks.vesa.layers.mixer import ESAMixer
 
 
@@ -29,7 +29,7 @@ def test_vesa_classifier_uses_canonical_esa_core() -> None:
     assert mixers
     assert all(isinstance(mixer, ESAMixer) for mixer in mixers)
     assert all(isinstance(mixer.core_engine, ESA) for mixer in mixers)
-    assert all(mixer.core_engine.layer.qgv.out_features == 3 * COMMON["dim"] for mixer in mixers)
+    assert all(mixer.core_engine.qgv.out_features == 3 * COMMON["dim"] for mixer in mixers)
 
 
 def test_visionbolt_classifier_uses_canonical_bolt_core() -> None:
@@ -79,21 +79,21 @@ def test_visual_ar_generation_uses_core_prefill_decode_contract() -> None:
 
 def test_canonical_esa_forward_with_state_matches_forward() -> None:
     torch.manual_seed(321)
-    engine = ESA(embd=16, head=4, backend="pytorch", precision="fp32", device=None).eval()
+    engine = ESA(embd=16, head=4, backend="pytorch", device=None).eval()
     x = torch.randn(2, 7, 16)
-    direct = engine(x)
-    stateful, state = engine.forward_with_state(x)
+    direct, _ = engine(x)
+    stateful, state = engine(x)
     torch.testing.assert_close(stateful, direct, rtol=1e-5, atol=1e-6)
     assert state.shape == (2, 4, 4)
 
 
 def test_canonical_esa_forward_with_state_continuation_matches_one_pass() -> None:
     torch.manual_seed(654)
-    engine = ESA(embd=16, head=4, backend="pytorch", precision="fp32", device=None).eval()
+    engine = ESA(embd=16, head=4, backend="pytorch", device=None).eval()
     prefix = torch.randn(2, 5, 16)
     continuation = torch.randn(2, 3, 16)
-    _, state = engine.forward_with_state(prefix)
-    tail, final_state = engine.forward_with_state(continuation, state=state)
-    combined, combined_state = engine.forward_with_state(torch.cat([prefix, continuation], dim=1))
+    _, state = engine(prefix)
+    tail, final_state = engine(continuation, state=state)
+    combined, combined_state = engine(torch.cat([prefix, continuation], dim=1))
     torch.testing.assert_close(tail, combined[:, -continuation.shape[1]:], rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(final_state, combined_state, rtol=1e-5, atol=1e-6)

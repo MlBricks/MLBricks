@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mlbricks import Bolt, Brick, Bricks, ESAAdapter as ESA, FFN, StateAwareFFN
+from mlbricks import Bolt, Brick, Bricks, ESA, FFN, StateAwareFFN
 
 
 def _make_composed_bricks(device: torch.device) -> Bricks:
@@ -13,7 +13,7 @@ def _make_composed_bricks(device: torch.device) -> Bricks:
         context=16,
         layers=[
             Brick(
-                mixer=ESA(embd=32, head=4, backend="auto", precision="fp32", device=None),
+                mixer=ESA(embd=32, head=4, backend="auto", device=None),
                 ffn=StateAwareFFN(32),
                 dim=32,
             ),

@@ -3,21 +3,18 @@ import inspect
 import pytest
 import torch
 
-from mlbricks import ESAAdapter as MLBricksESA
+from mlbricks import ESA as MLBricksESA
 from mlbricks.esa.fast_engine import ESA, CurrentESA, BaseESA, ESAConfig, make_esa, make_model
 from mlbricks.esa.fast_engine.core import ESA as CoreESA
 
 
-def test_new_names_wrapper_defaults_and_custom():
-    m = MLBricksESA(embd=24, head=6, device="cpu", backend="pytorch",
-                    cumpass=8, parallel_chunk=64, cuda_warps=4)
-    assert (m.layer.cumpass, m.layer.parallel_chunk, m.layer.cuda_warps) == (8, 64, 4)
-    y = m(torch.randn(2, 7, 24))
-    assert y.shape == (2, 7, 24)
-    d = MLBricksESA(embd=24, head=6, device="cpu", backend="pytorch")
-    assert (d.layer.cumpass, d.layer.parallel_chunk, d.layer.cuda_warps) == (16, 128, 8)
-    old_compass_api = MLBricksESA(embd=24, head=6, device="cpu", compass=12)
-    assert old_compass_api.layer.cumpass == 12
+def test_direct_names_defaults_and_custom():
+    m=MLBricksESA(embd=24,head=6,device='cpu',backend='pytorch',cumpass=8,parallel_chunk=64,cuda_warps=4)
+    assert (m.cumpass,m.parallel_chunk,m.cuda_warps)==(8,64,4)
+    y,state=m(torch.randn(2,7,24))
+    assert y.shape==(2,7,24) and state.shape==(2,6,4)
+    d=MLBricksESA(embd=24,head=6,device='cpu',backend='pytorch')
+    assert (d.cumpass,d.parallel_chunk,d.cuda_warps)==(16,128,8)
 
 
 @pytest.mark.parametrize("maker", [

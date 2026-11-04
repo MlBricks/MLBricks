@@ -4,16 +4,24 @@ MLBricks Kit is a modular neural-network toolkit for building and experimenting 
 
 It provides unified `auto`, `native`, and `pytorch` backend dispatch together with reusable components and architectures including **ESA, Bolt, BoltModel, VisionBolt, VESA, Bricks, FFNBrick, ResController, SOUP, and ElasticBit**. MLBricks also includes native C++/CUDA execution paths, adaptive runtime planning, model lifecycle utilities, and production-oriented inference/training APIs.
 
-## Fast-EsaQ direct API
+## Minimal ESA — native Fast-EsaQ
 
-`from mlbricks import ESA` now exposes the original Fast-EsaQ v0.4.0 ESA class,
-not an additional MLBricks decoder wrapper. Its `forward` and `decode_step`
-return `(output, state)`, and one-token output is `[B,1,D]`.
-`variant="current"` uses learned Half-Life ESA; `variant="base"` uses the
-historical learned-bounds implementation. Use `ESAAdapter` only for historical
-MLBricks single-output modules and checkpoints; existing `ESAModel` continues
-to use that compatibility adapter until its independent checkpoint migration.
-See `DIRECT_FASTESAQ_MIGRATION.md`.
+MLBricks exposes exactly one public ESA constructor, `from mlbricks import ESA`.
+It is the original Fast-EsaQ v0.4.0 direct class, with no extra MLBricks
+`nn.Module` decoding wrapper. `variant="current"` selects Half-Life ESA;
+`variant="base"` selects historical learned-bounds BaseESA.
+
+```python
+from mlbricks import ESA
+mixer = ESA(embd=384, head=6, variant="current", backend="auto")
+output, state = mixer(x)                         # [B,T,D] and [B,H,D/H]
+next_output, state = mixer.decode_step(token, state)  # [B,1,D]
+```
+
+`ESAModel`, VESA and SOUP now instantiate native ESA. The old adapter,
+`ESAAdapter`, duplicate ESA aliases and redundant layer import modules were
+removed. This is an intentional breaking change. See
+[`MINIMAL_ESA_MIGRATION.md`](MINIMAL_ESA_MIGRATION.md).
 
 ## Core components
 

@@ -2,7 +2,7 @@
 import inspect
 import pytest
 import torch
-from mlbricks import ESA, ESAAdapter, ESAModel, ESAModelConfig, Brick, Bricks
+from mlbricks import ESA, ESAModel, ESAModelConfig, Brick, Bricks
 from mlbricks.esa.fast_engine.public_api import ESA as UpstreamESA
 from mlbricks.esa.fast_engine.public_api import CurrentESA, BaseESA
 
@@ -32,18 +32,10 @@ def test_native_output_and_state(variant, concrete):
 
 
 @pytest.mark.parametrize("variant", ["current", "base"])
-def test_native_vs_same_engine_parity(variant):
-    torch.manual_seed(87)
-    native = ESA(embd=24, head=6, backend="pytorch", variant=variant, device="cpu").eval()
-    adapter = ESAAdapter(embd=24, head=6, backend="pytorch", esa_variant=variant, device="cpu").eval()
-    adapter.layer.load_state_dict(native.state_dict())
-    seq = torch.randn(2, 5, 24)
-    state = torch.zeros(2, 6, 4, dtype=torch.float32)
-    with torch.inference_mode():
-        native_y, native_state = native.decode_step(seq[:, 0], state)
-        adapter_y, adapter_state = adapter.decode_step(seq[:, 0], state)
-    torch.testing.assert_close(native_y[:, 0], adapter_y, atol=0, rtol=0)
-    torch.testing.assert_close(native_state, adapter_state, atol=0, rtol=0)
+def test_public_esa_is_original_concrete_engine(variant):
+    native=ESA(embd=24,head=6,backend='pytorch',variant=variant,device='cpu')
+    assert isinstance(native, CurrentESA if variant=='current' else BaseESA)
+    assert not hasattr(native,'layer')
 
 
 def test_base_and_half_life_keys_distinct():
@@ -53,16 +45,16 @@ def test_base_and_half_life_keys_distinct():
     assert "raw_alpha" in b.state_dict() and "log_half_life" not in b.state_dict()
 
 
-def test_existing_model_still_uses_compat_without_checkpoint_change():
+def test_existing_model_uses_native_without_wrapper():
     cfg = ESAModelConfig(vocab_size=64, block=16, n_layer=2, head=6, embd=24,
                          dropout=0.0, precision="fp32", training_compile=False)
     model = ESAModel(cfg, device="cpu")
-    assert isinstance(model.blocks[0].esa, ESAAdapter)
+    assert isinstance(model.blocks[0].esa, ESA)
     tokens = torch.randint(0, 64, (2, 5))
     y, loss = model(tokens, targets=tokens)
     assert torch.isfinite(loss)
     loss.backward()
-    assert model.blocks[0].esa.layer.qgv.weight.grad is not None
+    assert model.blocks[0].esa.qgv.weight.grad is not None
 
 
 def test_bricks_support_native_direct_mixer():

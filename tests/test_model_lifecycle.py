@@ -5,7 +5,7 @@
 import torch
 
 from mlbricks import (
-    ESAAdapter as ESA,
+    ESA,
     ESAModel,
     ESAModelConfig,
     Trainer,
@@ -60,60 +60,19 @@ def test_lightning_scan_matches_reference():
     )
 
 
-def test_layer_prefill_and_step_match_forward_cpu_thunder():
+def test_direct_esa_prefill_and_step_match_forward_cpu():
     torch.manual_seed(1)
-
-    layer = ESA(
-        embd=32,
-        head=4,
-        backend="thunder",
-        compass=1,
-        precision="fp32",
-        device=None,
-    )
-
-    layer.eval()
-
-    x = torch.randn(
-        2,
-        7,
-        32,
-    )
-
-    y_ref = layer(x)
-
-    y_prefill, state = layer.prefill(
-        x
-    )
-
-    assert torch.allclose(
-        y_ref,
-        y_prefill,
-        atol=1e-6,
-        rtol=1e-6,
-    )
-
-    x_next = torch.randn(
-        2,
-        32,
-    )
-
-    y_step, new_state = (
-        layer.decode_step(
-            x_next,
-            state,
-        )
-    )
-
-    assert y_step.shape == (
-        2,
-        32,
-    )
-
-    assert (
-        new_state.shape
-        == state.shape
-    )
+    layer=ESA(embd=32,head=4,backend='pytorch',device='cpu').eval()
+    x=torch.randn(2,7,32)
+    with torch.inference_mode():
+        y_ref,state_ref=layer(x)
+        y_prefill,state=layer.prefill(x)
+        torch.testing.assert_close(y_prefill,y_ref,atol=0,rtol=0)
+        torch.testing.assert_close(state,state_ref,atol=0,rtol=0)
+        y_step,new_state=layer.decode_step(x[:,0],state)
+        y_native,new_native=layer(x[:,:1],state)
+        torch.testing.assert_close(y_step,y_native,atol=0,rtol=0)
+        torch.testing.assert_close(new_state,new_native,atol=0,rtol=0)
 
 
 def test_model_save_load_roundtrip(
@@ -126,7 +85,7 @@ def test_model_save_load_roundtrip(
         head=4,
         embd=32,
         dropout=0.0,
-        backend="thunder",
+        backend="auto",
         compass=1,
         precision="fp32",
     )
@@ -190,7 +149,7 @@ def test_exact_checkpoint_is_protected(
         head=2,
         embd=16,
         dropout=0.0,
-        backend="thunder",
+        backend="auto",
         compass=1,
         precision="fp32",
     )

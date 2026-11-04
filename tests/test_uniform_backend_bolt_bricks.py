@@ -8,7 +8,7 @@ from mlbricks import (
     Attention,
     Brick,
     Bricks,
-    ESAAdapter as ESA,
+    ESA,
     FFN,
     Bolt,
     BoltModel,
@@ -85,7 +85,7 @@ def test_bolt_model_cache_generation():
 def test_bricks_mixed_pipeline_forward_and_generation():
     layers = [
         Brick(
-            mixer=ESA(embd=32, head=4, backend="pytorch", precision="fp32", device=None),
+            mixer=ESA(embd=32, head=4, backend="pytorch", device=None),
             ffn=FFN(32, 64, activation="silu"),
             dim=32,
         ),
@@ -112,7 +112,7 @@ def test_bricks_mixed_pipeline_forward_and_generation():
     assert model(ids).shape == (1, 5, 97)
     assert model.generate(ids, 2, temperature=0.0).shape == (1, 7)
     names = {row["component"] for row in model.backend_report()}
-    assert {"ESA", "Bolt", "Attention"}.issubset(names)
+    assert {"CurrentESA", "Bolt", "Attention"}.issubset(names)
 
 
 def test_native_override_fails_cleanly_when_not_supported():

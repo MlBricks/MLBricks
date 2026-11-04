@@ -1,12 +1,8 @@
 """Entangled State Attention (ESA) component package."""
 
-from .config import ESAConfig
 # Primary ESA API: the original Fast-EsaQ concrete module, no per-token MLBricks wrapper.
 from .fast_engine.public_api import ESA, save_esa_checkpoint, load_esa_checkpoint
 
-# Explicit compatibility adapter for existing MLBricks model blocks/checkpoints.
-from .layer import ESA as ESAAdapter
-from .fast_engine import BaseESA as FastBaseESA, CurrentESA as FastCurrentESA
 from .model import ESAModel, ESAModelConfig
 from .generation import GenerationResult, GenerationStats
 from .compass import compass, CompassResult
@@ -25,12 +21,8 @@ from .boost import thunderBoost
 
 __all__ = [
     "ESA",
-    "ESAAdapter",
     "save_esa_checkpoint",
     "load_esa_checkpoint",
-    "FastCurrentESA",
-    "FastBaseESA",
-    "ESAConfig",
     "ESAModel",
     "ESAModelConfig",
     "GenerationResult",

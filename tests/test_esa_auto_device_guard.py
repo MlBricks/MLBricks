@@ -2,7 +2,7 @@ import torch
 
 from mlbricks.esa.auto_backend import select_esa_auto_backend
 from mlbricks.esa.generation import _decode_runtime_backend
-from mlbricks.esa.layer import ESA
+from mlbricks import ESA
 
 
 def test_auto_selector_keeps_cpu_on_pytorch_when_cuda_extension_exists(monkeypatch):

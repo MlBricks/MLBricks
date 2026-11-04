@@ -12,11 +12,10 @@ def _mixed_model(device="cpu"):
         context=8,
         layers=[
             mlb.Brick(
-                mixer=mlb.ESAAdapter(
+                mixer=mlb.ESA(
                     embd=dim,
                     head=2,
                     backend="pytorch",
-                    precision="fp32",
                     device=device,
                 ),
                 ffn=mlb.FFN(dim, 32),
@@ -43,7 +42,7 @@ def test_package_level_save_load_mixed_model(tmp_path):
     got = loaded(ids)
 
     assert isinstance(loaded, mlb.Bricks)
-    assert isinstance(loaded.layers[0].mixer, mlb.ESAAdapter)
+    assert isinstance(loaded.layers[0].mixer, mlb.ESA)
     assert isinstance(loaded.layers[1].mixer, mlb.Bolt)
     assert torch.allclose(ref, got, atol=0, rtol=0)
     info = mlb.inspect(path)

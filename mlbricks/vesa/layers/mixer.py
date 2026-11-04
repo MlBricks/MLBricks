@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from ...esa.layer import ESA
+from ...esa import ESA
 from ...runtime import normalize_backend
 from ..config import ESAConfig, FullBackend
 
@@ -43,16 +43,12 @@ class ESAMixer(nn.Module):
             embd=config.dim,
             head=self.core_heads,
             backend=config.backend,
-            precision=config.precision,
-            compass=config.compass,
-            eps=config.eps,
             device=None,
-            auto_move_input=False,
         )
 
     @property
     def backend(self) -> str:
-        return str(self.engine.backend)
+        return str(self.engine.resolved_backend())
 
     @property
     def core_engine(self) -> ESA:
@@ -78,7 +74,7 @@ class ESAMixer(nn.Module):
         """
         import math
         import torch.nn.functional as F
-        core = getattr(self.engine.layer, "_orig_mod", self.engine.layer)
+        core = self.engine
         B, T, D = x.shape
         _, raw_gate, raw_value = core.qgv(x).chunk(3, dim=-1)
         gate = raw_gate.reshape(B, T, self.core_heads, D // self.core_heads).float()
@@ -93,47 +89,37 @@ class ESAMixer(nn.Module):
         B_write = (1.0 - A) * value
         return A.flatten(2), B_write.flatten(2)
 
-    def forward(
-        self,
-        x: Tensor,
-        initial_state: Tensor | None = None,
-        *,
-        reverse: bool = False,
-        backend: FullBackend | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        selected = None if backend is None else normalize_backend(backend, warn_legacy=True)
-        outputs, final_state = self.engine.forward_with_state(
-            x,
-            state=initial_state,
-            backend=selected,
-            reverse=bool(reverse),
-        )
-        return outputs, final_state.reshape(final_state.shape[0], self.config.dim)
+    def _headed_state(self, state: Tensor | None) -> Tensor | None:
+        if state is None:
+            return None
+        if state.ndim == 2:
+            return state.reshape(state.shape[0], self.core_heads,
+                                 self.config.dim // self.core_heads)
+        return state
+
+    def forward(self, x: Tensor, initial_state: Tensor | None = None, *,
+                reverse: bool = False, backend: FullBackend | None = None):
+        if backend is not None:
+            self.engine.set_backend(normalize_backend(backend, warn_legacy=True))
+        # Reverse is a VESA sequence-layout feature, outside native ESA.
+        tokens = x.flip(1) if reverse else x
+        y, state = self.engine(tokens, self._headed_state(initial_state))
+        return (y.flip(1) if reverse else y), state.flatten(1)
 
     @torch.no_grad()
-    def prefill(
-        self,
-        x: Tensor,
-        initial_state: Tensor | None = None,
-        *,
-        backend: FullBackend | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        """Run canonical ESA prefill and return a flattened recurrent state."""
-        selected = None if backend is None else normalize_backend(backend, warn_legacy=True)
-        outputs, final_state = self.engine.prefill(
-            x,
-            state=initial_state,
-            backend=selected,
-        )
-        return outputs, final_state.reshape(final_state.shape[0], self.config.dim)
+    def prefill(self, x: Tensor, initial_state: Tensor | None = None, *,
+                backend: FullBackend | None = None):
+        if backend is not None:
+            self.engine.set_backend(normalize_backend(backend, warn_legacy=True))
+        output, state = self.engine.prefill(x, self._headed_state(initial_state))
+        return output, state.flatten(1)
 
-    def step(self, x: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
+    def step(self, x: Tensor, state: Tensor):
         if x.ndim != 2:
             raise ValueError("step input must have shape [batch, dim]")
-        if state.ndim not in {2, 3}:
-            raise ValueError("state must have shape [batch, dim] or [batch, heads, head_dim]")
-        output, new_state = self.engine.decode_step(x, state)
-        return output, new_state.reshape(new_state.shape[0], self.config.dim)
+        output, new_state = self.engine.decode_step(x, self._headed_state(state))
+        # VESA's spatial step contract is [B,D]. ESA itself remains [B,1,D].
+        return output[:, 0], new_state.flatten(1)
 
     decode_step = step
     lightning_prefill = prefill

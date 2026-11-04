@@ -36,8 +36,6 @@ from .residualbrick import native_backend_available as residualbrick_native_back
 from .residualbrick import native_backend_name as residualbrick_native_backend_name
 from .esa import (
     ESA,
-    ESAAdapter,
-    ESAConfig,
     ESAModel,
     ESAModelConfig,
 )
@@ -82,9 +80,6 @@ from .elasticbit import (
     BitCandidate,
     BackendInfo,
 )
-
-# Friendly lowercase constructor alias.
-esa = ESA
 
 __version__ = "1.0.0b3"
 
@@ -136,9 +131,6 @@ __all__ = [
     "residualbrick_native_backend_available",
     "residualbrick_native_backend_name",
     "ESA",
-    "ESAAdapter",
-    "esa",
-    "ESAConfig",
     "ESAModel",
     "ESAModelConfig",
     "Trainer",

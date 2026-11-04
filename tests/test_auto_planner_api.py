@@ -3,24 +3,18 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mlbricks import ESAAdapter as ESA, ESAConfig
+from mlbricks import ESA
+from mlbricks.esa.fast_engine.config import ESAConfig
 from mlbricks.backends.thunder import thunder_scan
 from mlbricks.generation import parse_engine_spec
 from mlbricks.planner import AUTO_COMPASS_CANDIDATES, ceil_div
 
 
-def test_auto_compass_is_public_only_through_esa_layer():
-    config = ESAConfig(embd=32, head=4)
-    assert config.compass == "auto"
-
-    layer = ESA(
-        embd=32,
-        head=4,
-        precision="fp32",
-        device=None,
-    )
-    assert layer.compass == "auto"
-    assert layer.layer.compass == "auto"
+def test_native_esa_keeps_scan_controls_only_in_engine():
+    config=ESAConfig(embd=32,head=4)
+    assert config.backend == "auto" and config.cumpass==16
+    layer=ESA(embd=32,head=4,backend="pytorch")
+    assert layer.cumpass==16 and layer.resolved_backend()=="pytorch"
 
 
 def test_low_level_thunder_scan_requires_manual_integer():

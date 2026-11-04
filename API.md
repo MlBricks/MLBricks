@@ -228,26 +228,18 @@ outputs, last_state = layer(x)                     # x [B,T,D]
 one_token, next_state = layer.decode_step(token, last_state) # output [B,1,D]
 ```
 
-`esa` is a lowercase alias for the native `ESA`. The original Fast-EsaQ public
-class and CUDA kernel sources are vendored unchanged. It has no extra MLBricks
-`nn.Module` wrapper on decoding. `variant="base"` selects original BaseESA.
-Native checkpoint keys are unprefixed, e.g. `qgv.weight` and `log_half_life`.
+`ESA` directly constructs Fast-EsaQ. There is no additional MLBricks
+`nn.Module` wrapper on decoding. `variant="base"` selects historical BaseESA.
+Native checkpoint keys are unprefixed (`qgv.weight`, `log_half_life`).
 
-### `ESAAdapter` — legacy model compatibility
+The old `ESAAdapter`, lowercase `esa` constructor and top-level adapter
+`ESAConfig` have been removed to keep the public ESA API unambiguous.
+The *internal* engine configuration class remains at
+`mlbricks.esa.fast_engine.config.ESAConfig` for engine developers.
 
-```python
-from mlbricks import ESAAdapter
-layer = ESAAdapter(embd=384, head=6, backend="auto", device="cuda")
-y = layer(x)                                     # legacy tensor-only result
-out, state = layer.decode_step(token, state)    # legacy [B,D] decode output
-```
-
-`ESAAdapter` retains MLBricks-specific options such as `precision`, `compass`,
-`auto_compile`, `auto_move_input` and `esa_variant`. Existing `ESAModel`, VESA,
-and built-in SOUP continue to use it for checkpoint and model API compatibility.
-See `DIRECT_FASTESAQ_MIGRATION.md` for all breaking API changes and migration.
-
-`ESAConfig` is the standalone ESA layer configuration dataclass.
+Both `ESAModel` and other MLBricks components instantiate native ESA.
+Legacy Fast-EsaQ block checkpoints are translated at load time; native ESA
+checkpoints have no `layer.` prefix. See `MINIMAL_ESA_MIGRATION.md`.
 
 ### `ESAModel`
 
@@ -795,7 +787,7 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 | Runtime / planner | `normalize_backend`, `set_module_backend`, `backend_report`, `ExecutionPlan`, `build_execution_plan`, `predict_module`, `prepare_module_execution`, `apply_execution_route`, `reset_execution_route`, `EXECUTION_PLANNER`, `MLBricksExecutionPlanner`, `AUTO_OPERATOR_DEFAULTS` |
 | FFNBrick | `ffnbrick`, `MicroVirtualFFN`, `StateAwareFFN`, `VirtualStateAwareFFN`, `ffnbrick_native_backend_available`, `ffnbrick_native_backend_name` |
 | ResidualBrick | `residualbrick`, `ResController`, `residualbrick_native_backend_available`, `residualbrick_native_backend_name` |
-| ESA | `ESA`, `ESAAdapter`, `esa`, `ESAConfig`, `ESAModel`, `ESAModelConfig`, `GenerationResult`, `GenerationStats`, `compass`, `CompassResult`, `ThunderESA`, `thunderBoost` |
+| ESA | `ESA`, `ESAModel`, `ESAModelConfig`, `GenerationResult`, `GenerationStats`, `compass`, `CompassResult`, `thunderBoost` |
 | Lifecycle / training | `Trainer`, `TrainerState`, `save`, `load`, `inspect`, `predict`, `generate`, `compile`, `train`, `Adam`, `AdamW`, `FP16_ADAM_MIN_EPS`, `stabilize_optimizer` |
 | Basic blocks | `FFN`, `Embedding`, `LMHead`, `Linear`, `LayerNorm`, `RMSNorm`, `Residual`, `ffn`, `embedding`, `embeddings`, `lmhead`, `linear`, `layernorm`, `rmsnorm`, `residual` |
 | ElasticBit | `ElasticBit`, `RuntimeMatrix`, `BitAnalysis`, `BitCandidate`, `BackendInfo` |

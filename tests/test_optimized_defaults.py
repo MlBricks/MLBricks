@@ -4,7 +4,7 @@ import torch
 
 from mlbricks.generation import parse_engine_spec
 from mlbricks import ESAModel, ESAModelConfig
-from mlbricks import ESAConfig
+from mlbricks.esa.fast_engine.config import ESAConfig
 
 
 class TinyTokenizer:
@@ -38,7 +38,7 @@ def test_optimized_model_defaults():
     assert cfg.compass == "auto"
     assert cfg.training_compile is True
     model = ESAModel(cfg)
-    assert model.blocks[0].esa.compass == "auto"
+    assert model.blocks[0].esa.resolved_backend() == "auto"
     assert cfg.training_compile_mode == "default"
 
 
@@ -107,35 +107,18 @@ def test_raw_text_generate_api():
     assert isinstance(text, str)
 
 def test_esa_config_uses_optimized_defaults():
-    config = ESAConfig(embd=64)
+    config = ESAConfig(embd=64, head=4)
 
     assert config.backend == "auto"
-    assert config.compass == "auto"
-    assert config.precision == "fp16"
-
-
-def test_explicit_legacy_thunder_maps_to_auto():
-    config = ESAConfig(
-        embd=64,
-        backend="thunder",
-    )
-
+    assert config.variant == "current"
     assert config.backend == "auto"
-    assert config.compass == "auto"
 
 
-def test_uniform_backends_are_valid():
-    assert ESAConfig(embd=64, backend="pytorch").backend == "pytorch"
-    assert ESAConfig(embd=64, backend="native").backend == "native"
-    assert ESAConfig(embd=64, backend="pulse").backend == "pytorch"
-
-
-def test_explicit_thunder_compass_is_preserved():
-    config = ESAConfig(
-        embd=64,
-        backend="thunder",
-        compass=32,
-    )
-
-    assert config.backend == "auto"
-    assert config.compass == 32
+def test_native_config_has_only_canonical_backends():
+    import pytest
+    with pytest.raises(ValueError):
+        ESAConfig(embd=64, head=4,backend="thunder")
+    with pytest.raises(ValueError):
+        ESAConfig(embd=64, head=4,backend="pulse")
+    assert ESAConfig(embd=64, head=4,backend="native").backend=="native"
+    assert ESAConfig(embd=64, head=4,backend="pytorch").backend=="pytorch"

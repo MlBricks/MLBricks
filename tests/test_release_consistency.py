@@ -9,15 +9,14 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
-from mlbricks import ESAAdapter as ESA, ESAModel, ESAModelConfig
+from mlbricks import ESA, ESAModel, ESAModelConfig
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_all_public_compile_defaults_are_safe() -> None:
-    assert inspect.signature(ESA.__init__).parameters["compile_mode"].default == "default"
-    assert inspect.signature(ESA.compile).parameters["mode"].default == "default"
+    assert inspect.signature(ESA).parameters["backend"].default == "auto"
     assert ESAModelConfig(vocab_size=128).training_compile_mode == "default"
     assert inspect.signature(ESAModel.prefill).parameters["compile_mode"].default == "default"
     assert inspect.signature(ESAModel.compile_generation).parameters["mode"].default == "default"

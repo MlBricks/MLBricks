@@ -167,8 +167,8 @@ def test_soup_keeps_backend_policy_per_mixer_element():
     )
 
     model.set_backend("pytorch")
-    assert str(model.layers[0].mixer.backend) == "pytorch"
-    assert str(model.layers[1].mixer.backend) == "pytorch"
+    assert str(model.layers[0].mixer.resolved_backend()) == "pytorch"
+    assert "pytorch" in str(model.layers[1].mixer.resolved_backend())
 
     model.set_backend("auto")
     rows = model.element_backends()

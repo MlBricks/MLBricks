@@ -87,6 +87,28 @@ class ESA(nn.Module):
         """
         return self.requested_backend
 
+    def _apply(self, fn, recurse=True):
+        """Keep small Half-Life control weights FP32 after .to/.half/.bfloat16.
+
+        The original fused decode binding requires these parameters in FP32.
+        No changes to the recurrence or kernel code are made.
+        """
+        result = super()._apply(fn, recurse=recurse)
+        if getattr(self, "esa_variant", None) == "current":
+            for name in ("log_half_life", "raw_decay_bias"):
+                param = getattr(self, name)
+                if param.dtype != torch.float32:
+                    param.data = param.data.float()
+                    if param.grad is not None:
+                        param.grad = param.grad.float()
+            if hasattr(self, "state_norm"):
+                param = self.state_norm.weight
+                if param.dtype != torch.float32:
+                    param.data = param.data.float()
+                    if param.grad is not None:
+                        param.grad = param.grad.float()
+        return result
+
     def _guard_native(self, x: torch.Tensor) -> None:
         if self.requested_backend != "native":
             return

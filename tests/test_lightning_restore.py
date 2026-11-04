@@ -39,7 +39,7 @@ def test_standard_block_fast_step_matches_general_step() -> None:
     model = _tiny()
     block = model.blocks[0]
     x = torch.randn(2, 8)
-    state = block.esa.init_state(2)
+    state = torch.zeros(2, block.esa.head, block.esa.embd // block.esa.head)
 
     y_fast, state_fast = block.lightning_step_standard(x, state)
     y_general, state_general, _, _ = block.lightning_step(x, state)
@@ -52,7 +52,7 @@ def test_model_standard_lightning_uses_fast_block_path(monkeypatch) -> None:
     model = _tiny()
     token = torch.tensor([1], dtype=torch.long)
     pos = torch.tensor(0, dtype=torch.long)
-    states = torch.stack([block.esa.init_state(1) for block in model.blocks], dim=0)
+    states = torch.stack([torch.zeros(1, block.esa.head, block.esa.embd // block.esa.head) for block in model.blocks], dim=0)
 
     called = [0 for _ in model.blocks]
     for i, block in enumerate(model.blocks):
