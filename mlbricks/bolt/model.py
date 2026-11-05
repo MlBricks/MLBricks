@@ -104,6 +104,8 @@ class BoltBlock(nn.Module):
                              attention_scale=getattr(cfg,'attention_scale',None),
                              memory_init=getattr(cfg,'memory_init',None),
                              projection=getattr(cfg,'projection',None),
+                             avq_return_map=getattr(cfg,'avq_return_map','auto'),
+                             avq_norm_eps=getattr(cfg,'avq_norm_eps',None),
                              precision=getattr(cfg,'precision','auto'),
                              device='cpu')
         self.residual1 = _residual(cfg)

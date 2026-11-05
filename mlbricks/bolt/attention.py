@@ -603,7 +603,7 @@ class Bolt(nn.Module):
         # normal (32-feature cache) / tight (16-feature cache).
         mode: str | None = None,
         cache: str = "normal",
-        avq_dim: int = 198,
+        avq_dim: int | None = None,
         bias: bool = False,
         dropout: float = 0.0,
         causal: bool = True,
@@ -620,6 +620,8 @@ class Bolt(nn.Module):
         attention_scale: str | None = None,
         memory_init: str | None = None,
         projection: str | None = None,
+        avq_return_map: str = 'auto',
+        avq_norm_eps: float | None = None,
     ):
         super().__init__()
         if not isinstance(state_memory, bool):
@@ -674,6 +676,18 @@ class Bolt(nn.Module):
         if self.is_modern:
             from .presets import BoltPreset
             target_mode = 'quality' if mode is None else str(mode)
+            # New compact 12-head layers default to the validated 192-wide
+            # state. Other existing presets keep their 198-wide default.
+            compact_12 = cache == 'tight' and int(num_heads) == 12 and profile == 'compact'
+            if avq_dim is None:
+                avq_dim = 192 if compact_12 else 198
+            if compact_12 and int(avq_dim) == 192:
+                # Match the reference attention denominator and AVQ gate
+                # initialization without exposing a research-named factory.
+                if attention_scale is None:
+                    attention_scale = 'head'
+                if memory_init is None:
+                    memory_init = 'legacy'
             if latent_dim is not None and int(latent_dim) != (32 if cache == 'normal' else 16):
                 raise ValueError('Modern BOLT latent_dim must match cache=normal(32) or tight(16)')
             self._modern = BoltPreset(
@@ -683,7 +697,12 @@ class Bolt(nn.Module):
                 projection=projection or ('packed' if profile is not None else 'separate'),
                 attention_scale=attention_scale or ('latent' if profile is not None else 'head'),
                 memory_init=memory_init or ('balanced' if profile is not None else 'legacy'),
+                avq_return_map=avq_return_map,
+                avq_norm_eps=avq_norm_eps,
             )
+            # Automatic optimization only in eval + inference_mode/no_grad.
+            # It does not replace any Parameter or change optimizer state.
+            self._modern.fuse_for_inference()
             self.d_model=int(d_model)
             self.num_heads=int(num_heads)
             self.head_dim=self.d_model//self.num_heads

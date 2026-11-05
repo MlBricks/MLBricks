@@ -198,7 +198,7 @@ class BoltPreset(nn.Module):
     def __init__(self,d_model,num_heads,*,mode='quality',cache='normal',avq_dim=198,
                  bias=False,dropout=0.,causal=True,backend='auto',position=None,
                  projection='separate', attention_scale='head', memory_init='legacy',
-                 avq_return_map='linear', avq_norm_eps=1e-6):
+                 avq_return_map='linear', avq_norm_eps=None):
         super().__init__()
         if d_model%num_heads:
             raise ValueError('d_model must be divisible by num_heads')
@@ -219,6 +219,16 @@ class BoltPreset(nn.Module):
         self.projection = projection
         self.attention_scale = attention_scale
         self.memory_init = memory_init
+        # A matching input/state width needs no learnable AVQ return map.
+        # The legacy direct BoltPreset constructor retains 'linear' by default.
+        width = int(num_heads) * (32 if cache == 'normal' else 16)
+        if avq_return_map == 'auto':
+            avq_return_map = 'identity' if int(avq_dim) == width else 'linear'
+        if avq_return_map not in ('identity', 'linear'):
+            raise ValueError("avq_return_map must be 'auto', 'identity', or 'linear'")
+        if avq_norm_eps is None:
+            avq_norm_eps = (torch.finfo(torch.float32).eps
+                            if avq_return_map == 'identity' else 1e-6)
         self.avq_return_map = avq_return_map
         self.avq_norm_eps = float(avq_norm_eps)
         # Inference-only cached fused projection; deliberately NOT parameters or
@@ -545,7 +555,9 @@ class BoltPreset(nn.Module):
     def forward(self,x):
         if x.ndim!=3 or x.size(-1)!=self.d_model:
             raise ValueError(f'x must be [B,T,{self.d_model}]')
-        if self._optimized_training_available(x):
+        # Never use the training-only route during evaluation, even if a
+        # backend selector or test hook reports it eligible.
+        if self.training and torch.is_grad_enabled() and self._optimized_training_available(x):
             return self._optimized_train_forward(x)
         o,_=self._attend(x)
         if self.avq is not None:o=self.avq(o)
