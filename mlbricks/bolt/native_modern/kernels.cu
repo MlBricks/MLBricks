@@ -19,14 +19,13 @@ void check_f16_f32(torch::Tensor t, const char* name) {
     TORCH_CHECK(t.scalar_type()==torch::kFloat16 || t.scalar_type()==torch::kFloat32,
                 name, " requires float16 or float32");
 }
-template <typename scalar_t> __global__ void features_forward_kernel(
+template <typename scalar_t, bool APPLY_P> __global__ void features_forward_kernel(
   const scalar_t *__restrict__ q, const scalar_t *__restrict__ u,
   const scalar_t *__restrict__ g, const float *__restrict__ p,
   float *__restrict__ q_out, scalar_t *__restrict__ c_out,
   int64_t n, int64_t heads, int64_t tokens, int64_t width) {
   const int64_t idx=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
   if(idx>=n)return;
-  const int64_t pr= (idx/(tokens*width) % heads)*width + idx%width;
   const float uval=static_cast<float>(u[idx]);
   const float gval=static_cast<float>(g[idx]);
   const float qval=static_cast<float>(q[idx]);
@@ -34,7 +33,12 @@ template <typename scalar_t> __global__ void features_forward_kernel(
   scalar_t gate=static_cast<scalar_t>(tanhf(gval));
   scalar_t gain=static_cast<scalar_t>(1.f+static_cast<float>(gate));
   c_out[idx]=static_cast<scalar_t>(uval*static_cast<float>(gain));
-  q_out[idx]=qval*p[pr];
+  if constexpr (APPLY_P) {
+    const int64_t pr = (idx/(tokens*width) % heads)*width + idx%width;
+    q_out[idx] = qval * p[pr];
+  } else {
+    q_out[idx] = qval;  // Q projection has already absorbed P.
+  }
 }
 template <typename scalar_t> __global__ void features_backward_kernel(
   const float *__restrict__ gq, const scalar_t *__restrict__ gc,
@@ -151,12 +155,32 @@ std::vector<torch::Tensor> bolt_features_forward_cuda(torch::Tensor q,torch::Ten
     auto c=torch::empty_like(u);
     const int64_t n=q.numel();const int threads=256;
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(),"bolt_features_forward",[&]{
-      features_forward_kernel<scalar_t><<< (n+threads-1)/threads,threads,0,at::cuda::getCurrentCUDAStream() >>>(
+      features_forward_kernel<scalar_t, true><<< (n+threads-1)/threads,threads,0,at::cuda::getCurrentCUDAStream() >>>(
         q.data_ptr<scalar_t>(),u.data_ptr<scalar_t>(),g.data_ptr<scalar_t>(),p.data_ptr<float>(),
         query.data_ptr<float>(),c.data_ptr<scalar_t>(),n,q.size(1),q.size(2),q.size(3));
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();return {query,c};
 }
+// Folded inference kernel: identical C generation but no P access or multiply.
+std::vector<torch::Tensor> bolt_features_forward_folded_cuda(torch::Tensor q, torch::Tensor u, torch::Tensor g) {
+    c10::cuda::CUDAGuard device_guard(q.device());
+    check_cuda_contig(q,"q");check_cuda_contig(u,"u");check_cuda_contig(g,"g");
+    check_f16_f32(q,"q");
+    TORCH_CHECK(q.scalar_type()==u.scalar_type() && q.scalar_type()==g.scalar_type(),
+                "feature dtypes must match");
+    TORCH_CHECK(q.dim()==4 && q.sizes()==u.sizes() && q.sizes()==g.sizes(),
+                "features require matching [B,H,T,R]");
+    auto query=torch::empty(q.sizes(),q.options().dtype(torch::kFloat32));
+    auto c=torch::empty_like(u);
+    const int64_t n=q.numel();const int threads=256;
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(),"bolt_features_forward_folded",[&]{
+      features_forward_kernel<scalar_t, false><<< (n+threads-1)/threads,threads,0,at::cuda::getCurrentCUDAStream() >>>(
+        q.data_ptr<scalar_t>(),u.data_ptr<scalar_t>(),g.data_ptr<scalar_t>(),nullptr,
+        query.data_ptr<float>(),c.data_ptr<scalar_t>(),n,q.size(1),q.size(2),q.size(3));
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();return {query,c};
+}
+
 std::vector<torch::Tensor> bolt_features_backward_cuda(torch::Tensor gq,torch::Tensor gc,torch::Tensor q,
                                                         torch::Tensor u,torch::Tensor g,torch::Tensor p) {
     c10::cuda::CUDAGuard device_guard(gq.device());

@@ -103,3 +103,20 @@ def decode_append(q,c_now,cache,scratch,position,scale):
     return get_extension().decode_append(q.contiguous(),c_now.contiguous(),cache,scratch, int(position),float(scale))
 
 __all__=['get_extension','supports_features','features','avq_scan','avq_step','decode_append']
+
+
+def supports_folded_features(q, u, g):
+    """True only for rebuilt CUDA extensions with a no-P feature kernel."""
+    ext = get_extension()
+    return (ext is not None and hasattr(ext, 'features_forward_folded')
+            and q.is_cuda and u.is_cuda and g.is_cuda
+            and q.dtype in (torch.float16, torch.float32)
+            and q.dtype == u.dtype == g.dtype)
+
+
+def features_folded(q, u, g):
+    """Inference-only native Q/C feature transform: no P input or multiply."""
+    ext = get_extension()
+    if ext is None or not hasattr(ext, 'features_forward_folded'):
+        raise RuntimeError('Rebuild BOLT modern CUDA to enable folded feature kernel')
+    return ext.features_forward_folded(q.contiguous(), u.contiguous(), g.contiguous())
