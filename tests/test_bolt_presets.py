@@ -65,13 +65,14 @@ def test_cached_generation_reuses_state_and_repeated_prefill_resets_it():
         torch.testing.assert_close(logits2,expected[:,:4],atol=1e-5,rtol=2e-5)
 
 
-def test_quality_avq_gradients_reach_memory_and_query_scale():
+def test_quality_avq_gradients_reach_memory_and_query_weights():
     torch.manual_seed(11)
     m=Bolt(24,3,mode='quality',cache='tight',backend='pytorch')
     with torch.no_grad():m._modern.avq.gamma.fill_(.12)
     loss=m(torch.randn(2,5,24)).square().mean()
     loss.backward()
-    assert m._modern.p.grad is not None and m._modern.p.grad.abs().sum()>0
+    q_weight = m._modern.packed_qug_weight if m._modern.projection == 'packed' else m._modern.q_proj.weight
+    assert q_weight.grad is not None and q_weight.grad.abs().sum() > 0
     assert m._modern.avq.project.weight.grad is not None
     assert m._modern.avq.project.weight.grad.abs().sum()>0
     assert m._modern.avq.back.weight.grad is not None

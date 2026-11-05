@@ -700,9 +700,6 @@ class Bolt(nn.Module):
                 avq_return_map=avq_return_map,
                 avq_norm_eps=avq_norm_eps,
             )
-            # Automatic optimization only in eval + inference_mode/no_grad.
-            # It does not replace any Parameter or change optimizer state.
-            self._modern._enable_folded_query_inference()
             self.d_model=int(d_model)
             self.num_heads=int(num_heads)
             self.head_dim=self.d_model//self.num_heads

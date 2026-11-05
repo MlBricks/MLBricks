@@ -6,7 +6,7 @@ This patch adds a new, independent `mlbricks._bolt_modern_cuda` C++/CUDA extensi
 
 | Operation | CUDA implementation | Differentiable? |
 |---|---|---|
-| BOLT learned query scale `Q * P`, gated latent `U*(1+tanh G)` | Fused feature kernel + native backward | Yes (Q/U/G/P) |
+| Direct-Q BOLT, gated latent `U*(1+tanh G)` | No-P native gated-feature kernel during inference (when built), PyTorch for training | Training uses autograd through Q/U/G |
 | Causal attention during training/prefill | PyTorch optimized CUDA SDPA | Yes (native PyTorch C++/CUDA) |
 | AVQ recurrence `S[t]=A[t]*S[t-1]+V[t]` | Native CUDA serial-per-channel fused scan + backward | Yes |
 | Cached BOLT attention with C-only cache | Native CUDA fused cache append + stable softmax decode, no RoPE | Inference only |
@@ -53,7 +53,7 @@ m.set_backend('native')
 - `backend='native'`: require the new modern extension; this does not call legacy BOLT native code.
 - Native cached-decode currently supports `position=None` and latent widths **16/32**. `position='rope'` uses PyTorch cached-decode for `auto`; forcing `native` with RoPE decoding raises.
 - The complete full-sequence attention uses PyTorch SDPA regardless of backend; backward still flows through the fused BOLT features and CUDA AVQ scan.
-- Original BOLT state-dict keys are not changed. Rebuilding the same BOLT-32 + AVQ198 module can load its prior checkpoints. It does **not** make P16/AVQ192 checkpoints interchangeable with P32/AVQ198.
+- Modern BOLT trains Q directly and does not allocate a P parameter. Use freshly trained checkpoints for the new parameterization; it is not interchangeable with checkpoints from the prior learned-P implementation.
 
 ## Verification before deployment
 
@@ -62,6 +62,6 @@ python -m pytest tests/test_bolt_native_cuda.py -v
 python examples/bolt_native_benchmark.py
 ```
 
-The GPU test suite compares `native` and `pytorch` **forward, backward, prefill and progressive decoding** with nonzero AVQ gamma. No GPU tests could be run during patch creation in the CPU-only environment; don't treat the kernels as production-validated until the test suite passes on your target GPU.
+The GPU test suite should verify the direct-Q `native` and `pytorch` **forward, backward, prefill and progressive decoding** behavior with nonzero AVQ gamma. No GPU tests could be run during patch creation in the CPU-only environment; don't treat the kernels as production-validated until the test suite passes on your target GPU.
 
 For CUDA builds, work with `torch.autocast('cuda', dtype=torch.float16)` or FP32. BF16 takes PyTorch fallback under `auto`, and is not a supported native feature dtype in this version. Generated cache and recurrent state are separate; AVQ recurrent state uses FP32.
