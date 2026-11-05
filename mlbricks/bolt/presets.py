@@ -67,8 +67,14 @@ class _RMSNorm(nn.Module):
         self.eps = float(eps)
 
     def forward(self, x):
-        z=x.float()
-        return (z * torch.rsqrt(z.square().mean(-1, keepdim=True)+self.eps) * self.weight.float()).to(x.dtype)
+        # AVQ states accumulate in FP32. The paper configuration uses the
+        # default FP32 RMSNorm epsilon (torch.finfo(torch.float32).eps).
+        z = x.float()
+        if self.eps == torch.finfo(torch.float32).eps:
+            return F.rms_norm(z, (z.shape[-1],), self.weight.float(), eps=self.eps).to(x.dtype)
+        # Keep the established implementation for all legacy configurations.
+        return (z * torch.rsqrt(z.square().mean(-1, keepdim=True) + self.eps)
+                * self.weight.float()).to(x.dtype)
 
 
 def _affine_scan(a, b):
@@ -86,7 +92,7 @@ def _affine_scan(a, b):
 class BoltStateMemory(nn.Module):
     """AVQ read-gated memory after causal BOLT attention (198D default)."""
     def __init__(self, input_dim, width=198, *, init_policy="balanced", latent_dim=32,
-                 device='auto', backend='auto'):
+                 device='auto', backend='auto', return_map='linear', norm_eps=1e-6):
         super().__init__()
         if backend not in ('auto', 'native', 'pytorch'):
             raise ValueError('backend must be auto, native or pytorch')
@@ -99,16 +105,23 @@ class BoltStateMemory(nn.Module):
         if width<1:
             raise ValueError('avq_dim must be positive')
         self.width=int(width)
+        if return_map not in ('linear', 'identity'):
+            raise ValueError("return_map must be 'linear' or 'identity'")
+        if return_map == 'identity' and int(input_dim) != self.width:
+            raise ValueError('identity AVQ return requires avq_dim == num_heads * latent_dim')
+        self.return_map = return_map
         self.project=nn.Linear(input_dim,3*width,bias=True)
-        self.norm=_RMSNorm(width)
-        self.back=nn.Linear(width,input_dim,bias=False)
+        self.norm=_RMSNorm(width, eps=norm_eps)
+        self.back=(nn.Identity() if return_map == 'identity'
+                   else nn.Linear(width,input_dim,bias=False))
         self.gamma=nn.Parameter(torch.zeros(()))
         with torch.no_grad():
             nn.init.normal_(self.project.weight,0.,.01)
             nn.init.zeros_(self.project.bias)
             self.project.bias[:width].fill_(math.log(.98/.02))
             self.project.weight[2*width:].zero_()  # zero read-gate initially
-            nn.init.normal_(self.back.weight,0.,.02)
+            if isinstance(self.back, nn.Linear):
+                nn.init.normal_(self.back.weight,0.,.02)
         if init_policy == "balanced":
             # Same gate initialization as the quality-selected configuration.
             # Preserve the global RNG state so later layers are initialized
@@ -184,7 +197,8 @@ class BoltPreset(nn.Module):
     """
     def __init__(self,d_model,num_heads,*,mode='quality',cache='normal',avq_dim=198,
                  bias=False,dropout=0.,causal=True,backend='auto',position=None,
-                 projection='separate', attention_scale='head', memory_init='legacy'):
+                 projection='separate', attention_scale='head', memory_init='legacy',
+                 avq_return_map='linear', avq_norm_eps=None):
         super().__init__()
         if d_model%num_heads:
             raise ValueError('d_model must be divisible by num_heads')
@@ -205,6 +219,22 @@ class BoltPreset(nn.Module):
         self.projection = projection
         self.attention_scale = attention_scale
         self.memory_init = memory_init
+        # A matching input/state width needs no learnable AVQ return map.
+        # The legacy direct BoltPreset constructor retains 'linear' by default.
+        width = int(num_heads) * (32 if cache == 'normal' else 16)
+        if avq_return_map == 'auto':
+            avq_return_map = 'identity' if int(avq_dim) == width else 'linear'
+        if avq_return_map not in ('identity', 'linear'):
+            raise ValueError("avq_return_map must be 'auto', 'identity', or 'linear'")
+        if avq_norm_eps is None:
+            avq_norm_eps = (torch.finfo(torch.float32).eps
+                            if avq_return_map == 'identity' else 1e-6)
+        self.avq_return_map = avq_return_map
+        self.avq_norm_eps = float(avq_norm_eps)
+        # Inference-only cached fused projection; deliberately NOT parameters or
+        # persistent buffers. Original Q and trainable P remain in state_dict.
+        self._fold_query_inference = False
+        self._folded_q_cache = None
         self.d_model=int(d_model)
         self.num_heads=int(num_heads)
         self.head_dim=d_model//num_heads
@@ -243,8 +273,65 @@ class BoltPreset(nn.Module):
             self.q_proj, self.c_proj, self.g_proj = nn.Identity(), nn.Identity(), nn.Identity()
         self.p=nn.Parameter(torch.ones(self.num_heads,self.latent_dim))
         self.out_proj=nn.Linear(width,d_model,bias=bias)
-        self.avq=BoltStateMemory(width,self.avq_dim, init_policy=memory_init, latent_dim=self.latent_dim, device='cpu', backend=backend) if mode=='quality' else None
+        self.avq=(BoltStateMemory(
+            width, self.avq_dim, init_policy=memory_init,
+            latent_dim=self.latent_dim, device='cpu', backend=backend,
+            return_map=avq_return_map, norm_eps=avq_norm_eps,
+        ) if mode == 'quality' else None)
         self.is_modern=True
+
+    def _enable_folded_query_inference(self):
+        """Enable cached Q-weight folding for eval/no_grad, WITHOUT touching P.
+
+        Rebuild the cached projection automatically if trainable parameters
+        change in-place. Calling train(True) invalidates the cache. This is a
+        forward-only optimization: training uses the original learnable P.
+        """
+        self._fold_query_inference = True
+        self._folded_q_cache = None
+        return self
+
+    def _disable_folded_query_inference(self):
+        """Disable the inference fast path; leave all trainable weights intact."""
+        self._fold_query_inference = False
+        self._folded_q_cache = None
+        return self
+
+    def train(self, mode=True):
+        if mode:
+            self._folded_q_cache = None
+        return super().train(mode)
+
+    def _use_folded_query(self):
+        return self._fold_query_inference and not self.training and not torch.is_grad_enabled()
+
+    def _folded_projection(self):
+        """Cache folded Q weights only; never change original Q or P tensors."""
+        width = self.num_heads * self.latent_dim
+        master = self.packed_qug_weight if self.projection == 'packed' else self.q_proj.weight
+        bias = self.packed_qug_bias if self.projection == 'packed' else self.q_proj.bias
+        signature = (master._version, self.p._version,
+                     bias._version if bias is not None else None,
+                     master.device, master.dtype, self.p.device, self.p.dtype)
+        cache = self._folded_q_cache
+        if cache is not None and cache[0] == signature:
+            return cache[1], cache[2]
+        with torch.no_grad():
+            # Q is shaped [H*R,D], so P[H,R] scales the output rows.
+            scale = self.p.reshape(-1, 1).to(device=master.device, dtype=master.dtype)
+            if self.projection == 'packed':
+                q_weight = master[:width] * scale
+                weight = torch.cat((q_weight, master[width:]), dim=0).contiguous()
+                if bias is None:
+                    folded_bias = None
+                else:
+                    q_bias = bias[:width] * scale.flatten()
+                    folded_bias = torch.cat((q_bias, bias[width:]), dim=0).contiguous()
+            else:
+                weight = (master * scale).contiguous()
+                folded_bias = (bias * scale.flatten()).contiguous() if bias is not None else None
+        self._folded_q_cache = (signature, weight, folded_bias)
+        return weight, folded_bias
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
@@ -281,6 +368,7 @@ class BoltPreset(nn.Module):
                     state_dict[prefix + name + '.bias'] = packed_bias[index*width:(index+1)*width].clone()
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
+        self._folded_q_cache = None
 
     def _scale(self):
         dimension = self.latent_dim if self.attention_scale == 'latent' else self.head_dim
@@ -343,21 +431,41 @@ class BoltPreset(nn.Module):
 
     def _project(self,x,start_pos=0):
         b,t,_=x.shape
+        folded = self._use_folded_query()
         if self.projection == 'packed':
-            qug = F.linear(x, self.packed_qug_weight, self.packed_qug_bias)
+            weight, bias = (self._folded_projection() if folded else
+                            (self.packed_qug_weight, self.packed_qug_bias))
+            qug = F.linear(x, weight, bias)
             q, u, g = qug.split(self.num_heads * self.latent_dim, dim=-1)
         else:
-            q, u, g = self.q_proj(x), self.c_proj(x), self.g_proj(x)
+            if folded:
+                weight, bias = self._folded_projection()
+                q = F.linear(x, weight, bias)
+            else:
+                q = self.q_proj(x)
+            u, g = self.c_proj(x), self.g_proj(x)
         q=q.reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
         u=u.reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
         g=g.reshape(b,t,self.num_heads,self.latent_dim).transpose(1,2)
-        if self._native_enabled(x) and _native.supports_features(q,u,g,self.p):
+        if folded:
+            # P has ALREADY been merged into Q weights above. Never q *= 1.
+            # Optional rebuilt native CUDA entry point has NO P input/load/mul.
+            if self._native_enabled(x) and _native.supports_folded_features(q,u,g):
+                q,c=_native.features_folded(q.contiguous(),u.contiguous(),g.contiguous())
+            else:
+                c=u*(1.+torch.tanh(g))
+                # Native cached decode expects FP32 Q; the old native path
+                # produced FP32 Q after multiplying by FP32 P.
+                q=q.float()
+                # The original native extension remains usable for AVQ/decoding.
+                # A rebuilt extension adds the no-P feature kernel.
+        elif self._native_enabled(x) and _native.supports_features(q,u,g,self.p):
             q,c=_native.features(q.contiguous(),u.contiguous(),g.contiguous(),self.p)
         else:
             if self.backend == 'native' and _native.get_extension() is not None:
                 raise RuntimeError('Native BOLT features require compatible CUDA Q/U/G tensors and FP32 P')
             c=u*(1.+torch.tanh(g))
-            # BOLT learned per-feature query multiplier, not legacy dynamic rho.
+            # Training/reference path: P stays a learnable parameter.
             q=q*self.p[None,:,None,:]
         if self.position is not None:
             q=self.position(q,start_pos=int(start_pos))
@@ -425,7 +533,9 @@ class BoltPreset(nn.Module):
     def forward(self,x):
         if x.ndim!=3 or x.size(-1)!=self.d_model:
             raise ValueError(f'x must be [B,T,{self.d_model}]')
-        if self._optimized_training_available(x):
+        # Never use the training-only route during evaluation, even if a
+        # backend selector or test hook reports it eligible.
+        if self.training and torch.is_grad_enabled() and self._optimized_training_available(x):
             return self._optimized_train_forward(x)
         o,_=self._attend(x)
         if self.avq is not None:o=self.avq(o)

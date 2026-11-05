@@ -102,6 +102,7 @@ class BoltConfig(BoltModelSettings):
     (32) and the quality-selected memory initialization. Historical checkpoint tensors keep their original parameter names.
     """
     heads: int = 12  # validated BOLT attention layout by default
+    avq_dim: int | None = None  # resolved from profile; explicit 198 stays 198
     profile: str | None = None  # None keeps legacy `bolt_cache` keywords usable
     # Enabled by default in new BOLT models. Setting False constructs an
     # attention-only model with no AVQ modules, parameters, or recurrent cache.
@@ -109,9 +110,11 @@ class BoltConfig(BoltModelSettings):
     state_dim: int | None = None
     device: str = 'auto'
     precision: str = 'auto'
-    attention_scale: str = 'latent'
-    memory_init: str = 'balanced'
+    attention_scale: str | None = None
+    memory_init: str | None = None
     projection: str = 'packed'
+    avq_return_map: str = 'auto'
+    avq_norm_eps: float | None = None
 
     def __post_init__(self):
         if self.profile is None:
@@ -131,6 +134,16 @@ class BoltConfig(BoltModelSettings):
             self.bolt_mode = 'quality' if self.state_memory else 'fast'
         if self.state_dim is not None:
             self.avq_dim = int(self.state_dim)
+        elif self.avq_dim is None:
+            self.avq_dim = 192 if self.profile == 'compact' and self.heads == 12 else 198
+        compact_192 = self.profile == 'compact' and self.heads == 12 and self.avq_dim == 192
+        # None means omitted: explicit older settings must remain intact.
+        if self.attention_scale is None:
+            self.attention_scale = 'head' if compact_192 else 'latent'
+        if self.memory_init is None:
+            self.memory_init = 'legacy' if compact_192 else 'balanced'
+        if self.avq_return_map not in ('auto', 'linear', 'identity'):
+            raise ValueError('avq_return_map must be auto, linear or identity')
         if self.bolt_mode != 'legacy' and self.latent_dim in (16,32):
             self.bolt_cache = 'normal' if self.profile == 'standard' else 'tight'
             self.latent_dim = 32 if self.profile == 'standard' else 16
