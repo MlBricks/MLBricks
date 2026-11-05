@@ -676,11 +676,13 @@ class Bolt(nn.Module):
         if self.is_modern:
             from .presets import BoltPreset
             target_mode = 'quality' if mode is None else str(mode)
-            # New compact 12-head layers default to the validated 192-wide
-            # state. Other existing presets keep their 198-wide default.
+            # Match AVQ memory to total attention width by default. This
+            # selects Identity for the AVQ return: no 192/384 projection.
+            latent_width = 16 if cache == 'tight' else 32
+            full_attention_width = int(num_heads) * latent_width
             compact_12 = cache == 'tight' and int(num_heads) == 12 and profile == 'compact'
             if avq_dim is None:
-                avq_dim = 192 if compact_12 else 198
+                avq_dim = full_attention_width
             if compact_12 and int(avq_dim) == 192:
                 # Match the reference attention denominator and AVQ gate
                 # initialization without exposing a research-named factory.

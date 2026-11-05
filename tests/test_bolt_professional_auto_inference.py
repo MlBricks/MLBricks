@@ -71,8 +71,8 @@ def test_inference_matches_train_and_cached_decode(projection):
 
 def test_explicit_custom_configuration_still_supported():
     standard = Bolt(48, 12, device='cpu')
-    assert standard.avq_dim == 198
-    assert isinstance(standard._modern.avq.back, nn.Linear)
+    assert standard.avq_dim == 384
+    assert isinstance(standard._modern.avq.back, nn.Identity)
     custom = Bolt(48, 12, profile='compact', avq_dim=192,
                   avq_return_map='linear', avq_norm_eps=1e-6, device='cpu')
     assert isinstance(custom._modern.avq.back, nn.Linear)

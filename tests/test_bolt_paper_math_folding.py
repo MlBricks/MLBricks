@@ -80,6 +80,6 @@ def test_norm_and_no_avq_return_weights():
 
 def test_internal_preset_default_config_stays_configurable():
     m = BoltPreset(384, 12, backend='pytorch')
-    assert m.avq_dim == 198
-    assert isinstance(m.avq.back, nn.Linear)
-    assert m.avq.norm.eps == 1e-6
+    assert m.avq_dim == 384
+    assert isinstance(m.avq.back, nn.Identity)
+    assert m.avq.norm.eps == torch.finfo(torch.float32).eps

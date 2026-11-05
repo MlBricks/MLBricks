@@ -17,7 +17,7 @@ class BoltModelSettings:
     latent_dim: int = 32  # legacy-only when bolt_mode='legacy'
     bolt_mode: str = "quality"  # quality (AVQ-198), fast (BOLT), legacy
     bolt_cache: str = "normal"  # normal=32, tight=16
-    avq_dim: int = 198
+    avq_dim: int | None = None
     position: str = "none"
     ffn: str = "standard"
     residual: str = "standard"
@@ -53,6 +53,11 @@ class BoltModelSettings:
             raise ValueError("bolt_mode must be quality, fast or legacy")
         if self.bolt_cache not in ("normal", "tight"):
             raise ValueError("bolt_cache must be normal or tight")
+        # Default AVQ memory to the complete internal attention representation.
+        # Explicit nonmatching dimensions are retained only for ablation studies.
+        if self.avq_dim is None:
+            cache_width = 16 if self.bolt_cache == "tight" else 32
+            self.avq_dim = int(self.heads) * cache_width
         if int(self.avq_dim) < 1:
             raise ValueError("avq_dim must be positive")
         self.ffn = str(self.ffn).strip().lower().replace("-", "_")
@@ -98,11 +103,12 @@ class BoltModelSettings:
 class BoltConfig(BoltModelSettings):
     """Configuration for :class:`BoltModel`.
 
-    ``profile`` selects BOLT latent width. New models default to standard
-    (32) and the quality-selected memory initialization. Historical checkpoint tensors keep their original parameter names.
+    ``profile`` selects the per-head BOLT latent width (32 or 16).
+    By default AVQ width equals ``heads * latent_width``, so the memory
+    return is Identity, without a learned return projection.
     """
     heads: int = 12  # validated BOLT attention layout by default
-    avq_dim: int | None = None  # resolved from profile; explicit 198 stays 198
+    avq_dim: int | None = None  # default = heads * (16 compact or 32 standard)
     profile: str | None = None  # None keeps legacy `bolt_cache` keywords usable
     # Enabled by default in new BOLT models. Setting False constructs an
     # attention-only model with no AVQ modules, parameters, or recurrent cache.
@@ -135,7 +141,7 @@ class BoltConfig(BoltModelSettings):
         if self.state_dim is not None:
             self.avq_dim = int(self.state_dim)
         elif self.avq_dim is None:
-            self.avq_dim = 192 if self.profile == 'compact' and self.heads == 12 else 198
+            self.avq_dim = int(self.heads) * (16 if self.profile == 'compact' else 32)
         compact_192 = self.profile == 'compact' and self.heads == 12 and self.avq_dim == 192
         # None means omitted: explicit older settings must remain intact.
         if self.attention_scale is None:

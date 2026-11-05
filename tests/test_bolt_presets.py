@@ -15,7 +15,7 @@ def test_preset_forward_cached_parity_with_nonzero_avq(mode, cache, position):
     layer=Bolt(32,4,mode=mode,cache=cache,position=position,backend='pytorch',device='cpu',precision='fp32').eval()
     assert layer.is_modern
     assert layer.latent_dim==(32 if cache=='normal' else 16)
-    assert layer.avq_dim==(198 if mode=='quality' else 0)
+    assert layer.avq_dim==((4 * layer.latent_dim) if mode=='quality' else 0)
     if mode=='quality':
         with torch.no_grad():layer._modern.avq.gamma.fill_(.16)
     x=torch.randn(2,7,32)
@@ -23,7 +23,7 @@ def test_preset_forward_cached_parity_with_nonzero_avq(mode, cache, position):
         entire=layer(x)
         prefix,(c,s)=layer.prefill(x[:,:4])
         torch.testing.assert_close(prefix,entire[:,:4],atol=1e-5,rtol=2e-5)
-        if mode=='quality':assert s.shape==(2,198) and s.dtype==torch.float32
+        if mode=='quality':assert s.shape==(2,4 * layer.latent_dim) and s.dtype==torch.float32
         else:assert s is None
         for j in range(4,7):
             y,(c,s)=layer.decode_step(x[:,j:j+1],(c,s))
@@ -31,9 +31,9 @@ def test_preset_forward_cached_parity_with_nonzero_avq(mode, cache, position):
     assert c.shape==(2,4,7,layer.latent_dim)
 
 
-def test_bolt_default_is_quality_normal_198_and_fast_has_no_avq():
+def test_bolt_default_is_quality_normal_width_matched_and_fast_has_no_avq():
     b=Bolt(384,12)
-    assert (b.is_modern,b.mode,b.cache_mode,b.latent_dim,b.avq_dim)==(True,'quality','normal',32,198)
+    assert (b.is_modern,b.mode,b.cache_mode,b.latent_dim,b.avq_dim)==(True,'quality','normal',32,384)
     f=Bolt(384,12,mode='fast')
     assert f._modern.avq is None and not any('avq' in k for k in f.state_dict())
     legacy=Bolt(32,4,latent_dim=8)
@@ -75,7 +75,7 @@ def test_quality_avq_gradients_reach_memory_and_query_weights():
     assert q_weight.grad is not None and q_weight.grad.abs().sum() > 0
     assert m._modern.avq.project.weight.grad is not None
     assert m._modern.avq.project.weight.grad.abs().sum()>0
-    assert m._modern.avq.back.weight.grad is not None
+    assert isinstance(m._modern.avq.back, torch.nn.Identity)
 
 
 def test_checkpoint_round_trip_and_strict_old_dimension_rejection():

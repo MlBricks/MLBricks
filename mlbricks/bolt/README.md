@@ -10,7 +10,7 @@ from mlbricks import Bolt, BoltConfig, BoltModel, BoltStateMemory, BoltCache
 
 config = BoltConfig(
     vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard", state_dim=198,  # state_memory=True by default
+    profile="standard",  # AVQ defaults to heads * 32 = 384
     device="auto", precision="auto", backend="auto",
 )
 model = BoltModel(config)  # CUDA by default when available; otherwise CPU
@@ -25,7 +25,7 @@ attention_only = BoltModel(BoltConfig(
 ))
 standalone_attention_only = Bolt(embed_dim=384, num_heads=12,
                                  profile="standard", state_memory=False)
-standalone_memory = BoltStateMemory(input_dim=384, width=198)
+standalone_memory = BoltStateMemory(input_dim=384)  # width 384, Identity return
 ```
 
 ## Components
@@ -39,8 +39,8 @@ standalone_memory = BoltStateMemory(input_dim=384, width=198)
 | `BoltCache` | Preallocated compact context and memory state |
 
 `profile="standard"` uses 32 compact dimensions per head;
-`profile="compact"` uses 16. Both use 198-dimensional recurrent state by
-default. The new model profile uses latent-width attention scaling and
+`profile="compact"` uses 16. AVQ defaults to the full attention width: 384 for 12-head standard
+and 192 for 12-head compact. No return projection is needed. The new model profile uses latent-width attention scaling and
 balanced state-memory initialization (`gamma=0.25`). **`state_memory=True` is
 always the default for new BOLT models.** Set `state_memory=False` on `BoltConfig`
 or `Bolt` to disable AVQ; this does not instantiate AVQ projection, recurrence,
@@ -99,25 +99,25 @@ The primary BOLT constructor uses two independent controls:
 
 | `mode` | `cache` | Attention | AVQ | Historical cache/head/token FP16 |
 | --- | --- | --- | --- | --- |
-| `quality` (default) | `normal` (default) | BOLT latent **32** | AVQ **198** | 64 bytes |
-| `quality` | `tight` | BOLT latent **16** | AVQ **198** | 32 bytes |
+| `quality` (default) | `normal` (default) | BOLT latent **32** | AVQ **heads × 32** (Identity) | 64 bytes |
+| `quality` | `tight` | BOLT latent **16** | AVQ **heads × 16** (Identity) | 32 bytes |
 | `fast` | `normal` | BOLT latent **32** | disabled | 64 bytes |
 | `fast` | `tight` | BOLT latent **16** | disabled | 32 bytes |
 
 ```python
 from mlbricks import Bolt, BoltModel
-mixer = Bolt(embed_dim=384, num_heads=12)     # PyTorch-style, quality+normal, AVQ=198
+mixer = Bolt(embed_dim=384, num_heads=12)     # PyTorch-style, quality+normal, AVQ=384
 # Equivalent: Bolt(384, 12) or Bolt(d_model=384, num_heads=12)
 fast = Bolt(384, 12, mode='fast')             # BOLT-32, no AVQ
-tight = Bolt(384, 12, cache='tight')          # BOLT-16 + AVQ-198
+tight = Bolt(384, 12, cache='tight')          # BOLT-16 + AVQ-192
 model = BoltModel(vocab_size=50257, dim=384, heads=12) # quality+normal
 ```
 
 **Native status:** MLBricks has separate CUDA acceleration for modern compact attention/state memory and for the historical legacy BOLT formulation. The modern recurrence extensions are optional; `backend="auto"` uses them when present and compatible, otherwise it safely falls back to PyTorch. The legacy kernels are mathematically different and cannot be substituted for modern BOLT.
 
-**What the presets mean:** `quality` selects the post-softmax AVQ recurrence, not a measured guarantee of superior perplexity. `fast` removes the AVQ overhead; `tight` reduces the historical attention cache, not necessarily overall model memory. The historical cache stores *C only*; AVQ recurrent state contributes `batch * 198 * 4` bytes per layer. Unlike the old BOLT equation, BOLT uses learned scale `P` applied to the Query, and values/keys come from `C=U*(1+tanh(G))`.
+**What the presets mean:** `quality` selects the post-softmax AVQ recurrence, not a measured guarantee of superior perplexity. `fast` removes the AVQ overhead; `tight` reduces the historical attention cache, not necessarily overall model memory. The historical cache stores *C only*; AVQ recurrent state contributes `batch * avq_dim * 4` bytes per layer. Unlike the old BOLT equation, BOLT uses direct-Q weights with no separate `P` multiplier, and values/keys come from `C=U*(1+tanh(G))`.
 
-Modern BOLT uses causal attention and a differentiable affine recurrence. On supported GPUs, the optional short-context and segmented CUDA recurrence kernels implement the same mathematical state update and backward gradients. `mode='legacy'` (with explicit `latent_dim`) retains the historical rho-normalized BOLT and its separate native paths. Previously trained 16D/AVQ-192 models are *not checkpoint-compatible* with 32D/AVQ-198; changing either dimension requires conversion/retraining. Historical BOLT checkpoints require `mode='legacy'` and matching dimensions.
+Modern BOLT uses causal attention and a differentiable affine recurrence. On supported GPUs, the optional short-context and segmented CUDA recurrence kernels implement the same mathematical state update and backward gradients. `mode='legacy'` (with explicit `latent_dim`) retains the historical rho-normalized BOLT and its separate native paths. Models trained with different attention or AVQ widths have different parameter shapes; changing those dimensions requires retraining or explicit weight conversion.
 
 ## Save/Load
 
@@ -129,7 +129,7 @@ Modern BOLT uses causal attention and a differentiable affine recurrence. On sup
 
 ## Native modern BOLT CUDA kernels
 
-The new **modern BOLT-32/16 + AVQ-198 native extension** (`mlbricks._bolt_modern_cuda`) is optional and independent of the historical `_gauss_cuda` kernels. Build using `MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1` and a CUDA-enabled PyTorch/toolkit. It accelerates the BOLT gated-feature projection and AVQ recurrent scan (including backward), and provides fused CUDA cached decode without RoPE. Training/prefill attention still uses CUDA SDPA. See [README_NATIVE.md](README_NATIVE.md) for build commands, supported paths, parity tests and limitations. On machines without the extension, `backend='auto'` falls back to PyTorch, while `backend='native'` gives an explicit build error.
+The new **modern BOLT-32/16 + width-matched AVQ native extension** (`mlbricks._bolt_modern_cuda`) is optional and independent of the historical `_gauss_cuda` kernels. Build using `MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1` and a CUDA-enabled PyTorch/toolkit. It accelerates the BOLT gated-feature projection and AVQ recurrent scan (including backward), and provides fused CUDA cached decode without RoPE. Training/prefill attention still uses CUDA SDPA. See [README_NATIVE.md](README_NATIVE.md) for build commands, supported paths, parity tests and limitations. On machines without the extension, `backend='auto'` falls back to PyTorch, while `backend='native'` gives an explicit build error.
 
 ### BOLT-owned implementation
 

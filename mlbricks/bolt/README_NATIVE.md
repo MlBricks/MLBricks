@@ -1,6 +1,6 @@
 # Native CUDA support for modern BOLT + AVQ
 
-This patch adds a new, independent `mlbricks._bolt_modern_cuda` C++/CUDA extension. It **does not** reuse the legacy rho-normalized BOLT kernels (`_gauss_cuda`). The default remains `Bolt(384,12)`: **BOLT-32 with 198-dimensional read-gated AVQ**.
+This patch adds a new, independent `mlbricks._bolt_modern_cuda` C++/CUDA extension. It **does not** reuse the legacy rho-normalized BOLT kernels (`_gauss_cuda`). The default remains `Bolt(384,12)`: **BOLT-32 with 384-dimensional read-gated AVQ (Identity return)**.
 
 ## Kernel coverage
 
@@ -11,7 +11,7 @@ This patch adds a new, independent `mlbricks._bolt_modern_cuda` C++/CUDA extensi
 | AVQ recurrence `S[t]=A[t]*S[t-1]+V[t]` | Native CUDA serial-per-channel fused scan + backward | Yes |
 | Cached BOLT attention with C-only cache | Native CUDA fused cache append + stable softmax decode, no RoPE | Inference only |
 | AVQ recurrent one-token update | Native CUDA state kernel | Inference only |
-| BOLT-16 / AVQ widths 64/96/192 | Same native kernels; default preset is P32 + AVQ198 | Yes |
+| BOLT-16 / AVQ widths 64/96/192/384 | Same native kernels; default preset is P32 + AVQ384 | Yes |
 
 This is **not** a fused end-to-end Transformer (linear projections, softmax prefill, AVQ projections and RMSNorm still use PyTorch operators). The native kernels are meant to reduce BOLT and recurrent-memory overhead without replacing the well-optimized SDPA prefill. The native decode attention is a basic correctness-first stable-softmax implementation, **not** a claimed performance improvement. CUDA Graph tuning/tiling should follow T4 measurements.
 
@@ -41,7 +41,7 @@ JIT is opt-in to avoid surprise compilation at model startup. Building the exten
 ```python
 from mlbricks import Bolt
 
-m = Bolt(embed_dim=384, num_heads=12, mode='quality', cache='normal', avq_dim=198, backend='auto').cuda()
+m = Bolt(embed_dim=384, num_heads=12, profile='standard', backend='auto')
 print(m.resolved_backend())  # CUDA extension ready or PyTorch fallback
 
 # Force native dispatch: raises if the new extension is missing.

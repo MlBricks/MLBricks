@@ -90,9 +90,9 @@ def _affine_scan(a, b):
 
 
 class BoltStateMemory(nn.Module):
-    """AVQ read-gated memory after causal BOLT attention (198D default)."""
-    def __init__(self, input_dim, width=198, *, init_policy="balanced", latent_dim=32,
-                 device='auto', backend='auto', return_map='linear', norm_eps=1e-6):
+    """AVQ read-gated memory, defaulting to the full attention width."""
+    def __init__(self, input_dim, width=None, *, init_policy="balanced", latent_dim=32,
+                 device='auto', backend='auto', return_map='auto', norm_eps=None):
         super().__init__()
         if backend not in ('auto', 'native', 'pytorch'):
             raise ValueError('backend must be auto, native or pytorch')
@@ -102,14 +102,21 @@ class BoltStateMemory(nn.Module):
             raise ValueError("init_policy must be legacy or balanced")
         self.init_policy = init_policy
         self.latent_dim = int(latent_dim)
-        if width<1:
+        if width is None:
+            width = int(input_dim)
+        if width < 1:
             raise ValueError('avq_dim must be positive')
-        self.width=int(width)
+        self.width = int(width)
+        if return_map == 'auto':
+            return_map = 'identity' if self.width == int(input_dim) else 'linear'
         if return_map not in ('linear', 'identity'):
-            raise ValueError("return_map must be 'linear' or 'identity'")
+            raise ValueError("return_map must be 'auto', 'linear' or 'identity'")
         if return_map == 'identity' and int(input_dim) != self.width:
             raise ValueError('identity AVQ return requires avq_dim == num_heads * latent_dim')
         self.return_map = return_map
+        if norm_eps is None:
+            norm_eps = (torch.finfo(torch.float32).eps
+                        if return_map == 'identity' else 1e-6)
         self.project=nn.Linear(input_dim,3*width,bias=True)
         self.norm=_RMSNorm(width, eps=norm_eps)
         self.back=(nn.Identity() if return_map == 'identity'
@@ -189,16 +196,16 @@ class BoltStateMemory(nn.Module):
 class BoltPreset(nn.Module):
     """BOLT attention with optional post-softmax AVQ and compact Value cache.
 
-    mode: quality (AVQ-198 by default) or fast (no AVQ).
+    mode: quality (AVQ width matches total attention width) or fast (no AVQ).
     cache: normal (latent=32) or tight (latent=16).
     When installed, the independent native CUDA extension fuses BOLT feature
     generation and AVQ recurrence, and optionally the cached attention decoder.
     The old rho-normalized BOLT extension is mathematically incompatible.
     """
-    def __init__(self,d_model,num_heads,*,mode='quality',cache='normal',avq_dim=198,
+    def __init__(self,d_model,num_heads,*,mode='quality',cache='normal',avq_dim=None,
                  bias=False,dropout=0.,causal=True,backend='auto',position=None,
                  projection='separate', attention_scale='head', memory_init='legacy',
-                 avq_return_map='linear', avq_norm_eps=None):
+                 avq_return_map='auto', avq_norm_eps=None):
         super().__init__()
         if d_model%num_heads:
             raise ValueError('d_model must be divisible by num_heads')
@@ -219,9 +226,13 @@ class BoltPreset(nn.Module):
         self.projection = projection
         self.attention_scale = attention_scale
         self.memory_init = memory_init
-        # A matching input/state width needs no learnable AVQ return map.
-        # The legacy direct BoltPreset constructor retains 'linear' by default.
+        # Default memory width to the attention width, so the AVQ return
+        # is Identity and adds no post-scan projection GEMM.
         width = int(num_heads) * (32 if cache == 'normal' else 16)
+        if avq_dim is None:
+            avq_dim = width
+        if int(avq_dim) < 1:
+            raise ValueError('avq_dim must be positive')
         if avq_return_map == 'auto':
             avq_return_map = 'identity' if int(avq_dim) == width else 'linear'
         if avq_return_map not in ('identity', 'linear'):

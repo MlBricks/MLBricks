@@ -1,4 +1,4 @@
-// BOLT-32 / AVQ-198 CUDA kernels. Other 16/192/198 widths are also supported.
+// BOLT-16/32 width-independent AVQ CUDA kernels. Default AVQ matches full attention width.
 // FP16/FP32 latent kernels, FP32 recurrent state and score accumulation.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
