@@ -80,7 +80,7 @@ def test_v8_shipped_kernel_sources_match_validated_notebook():
         'state_segmented.cu':'34b4b6719a730c599e45054a0e9b584613b1e6570180b168a9e2384f3c4a198f',
     }
     for name,sha in expected.items():
-        assert hashlib.sha256((root/name).read_bytes()).hexdigest() == sha
+        assert hashlib.sha256((root/name).read_bytes().replace(b'\r\n', b'\n')).hexdigest() == sha
 
 @pytest.mark.parametrize("profile", ["compact", "standard"])
 def test_v8_direct_math_handles_mixed_precision_query_key_dtype(profile, monkeypatch):

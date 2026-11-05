@@ -34,9 +34,9 @@ this. Existing 198-wide standard presets are unchanged. To load a legacy
 checkpoint created with a linear AVQ return map at matching dimensions,
 construct `Bolt(..., avq_dim=192, avq_return_map="linear", avq_norm_eps=1e-6)`.
 
-The prior `BoltPreset.paper_bolt16_avq192` and manual fusion helpers remain
-available as compatibility internals, but they are not required or
-recommended in the end-user API.
+The experimental factory and public manual-fusion helpers were removed before
+merge. Internally the implementation folds Q during eval/no-gradient execution.
+Users only need `Bolt(...)`, `.train()`, and `.eval()`.
 
 CUDA kernel compilation and end-to-end GPU benchmarks must be verified
 separately; the patch's included regression tests are CPU-safe.

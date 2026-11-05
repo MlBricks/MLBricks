@@ -280,29 +280,7 @@ class BoltPreset(nn.Module):
         ) if mode == 'quality' else None)
         self.is_modern=True
 
-    @classmethod
-    def paper_bolt16_avq192(cls, d_model, num_heads, **kwargs):
-        """Paper-compatible BOLT-16/AVQ-192, identity return, FP32 RMSNorm.
-
-        Requires 12 heads so that the attention output is 12*16 == 192 wide.
-        Training retains the original learnable P; call fuse_for_inference()
-        after training to skip query times P during inference.
-        """
-        if int(num_heads) * 16 != 192:
-            raise ValueError('paper BOLT-16/AVQ-192 requires 12 attention heads')
-        settings = dict(mode='quality', cache='tight', avq_dim=192,
-                        projection='packed', attention_scale='head',
-                        memory_init='legacy', position=None,
-                        avq_return_map='identity',
-                        avq_norm_eps=torch.finfo(torch.float32).eps)
-        # Refuse an accidental incompatible override of the paper math.
-        for name, expected in settings.items():
-            if name in kwargs and kwargs[name] != expected:
-                raise ValueError(f'paper setting {name} must be {expected!r}')
-        settings.update(kwargs)
-        return cls(d_model, num_heads, **settings)
-
-    def fuse_for_inference(self):
+    def _enable_folded_query_inference(self):
         """Enable cached Q-weight folding for eval/no_grad, WITHOUT touching P.
 
         Rebuild the cached projection automatically if trainable parameters
@@ -313,7 +291,7 @@ class BoltPreset(nn.Module):
         self._folded_q_cache = None
         return self
 
-    def unfuse_for_inference(self):
+    def _disable_folded_query_inference(self):
         """Disable the inference fast path; leave all trainable weights intact."""
         self._fold_query_inference = False
         self._folded_q_cache = None

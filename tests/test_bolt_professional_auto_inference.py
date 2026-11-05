@@ -57,7 +57,7 @@ def test_automatic_folded_inference_matches_unfused_and_cache_decode(projection)
         m._modern.p.uniform_(0.4, 1.6)
         m._modern.avq.gamma.fill_(0.1)
     unfused = copy.deepcopy(m)
-    unfused._modern.unfuse_for_inference()
+    unfused._modern._disable_folded_query_inference()
     saved = {k: v.clone() for k, v in m.state_dict().items()}
     x = torch.randn(1, 4, 48)
     with torch.inference_mode():

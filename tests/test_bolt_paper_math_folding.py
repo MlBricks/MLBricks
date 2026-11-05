@@ -8,6 +8,16 @@ import torch.nn.functional as F
 from mlbricks.bolt.presets import BoltPreset
 
 
+def compact_192_preset():
+    # Internal preset used only to exercise the low-level folding implementation.
+    return BoltPreset(384, 12, mode='quality', cache='tight', avq_dim=192,
+                      projection='packed', attention_scale='head',
+                      memory_init='legacy', position=None,
+                      avq_return_map='identity',
+                      avq_norm_eps=torch.finfo(torch.float32).eps,
+                      backend='pytorch')
+
+
 @pytest.mark.parametrize('projection', ['packed', 'separate'])
 @pytest.mark.parametrize('bias', [False, True])
 def test_folded_q_forward_and_decode_preserve_weights(projection, bias):
@@ -23,7 +33,7 @@ def test_folded_q_forward_and_decode_preserve_weights(projection, bias):
         m.avq.gamma.fill_(0.2)
     ref = copy.deepcopy(m)
     old_weights = {name: tensor.clone() for name, tensor in m.state_dict().items()}
-    m.fuse_for_inference()
+    m._enable_folded_query_inference()
     assert m.p.requires_grad
     assert isinstance(m.avq.back, nn.Identity)
     assert m.avq.norm.eps == torch.finfo(torch.float32).eps
@@ -42,17 +52,17 @@ def test_folded_q_forward_and_decode_preserve_weights(projection, bias):
     for name, w in m.state_dict().items():
         torch.testing.assert_close(w, old_weights[name], rtol=0, atol=0)
     assert not any('_folded' in name for name in m.state_dict())
-    m.unfuse_for_inference()
+    m._disable_folded_query_inference()
     with torch.no_grad():
         torch.testing.assert_close(m(inp), ref(inp), rtol=0, atol=0)
 
 
 def test_p_gradient_and_cache_refresh_after_retraining():
     torch.manual_seed(42)
-    m = BoltPreset.paper_bolt16_avq192(384,12, backend='pytorch')
+    m = compact_192_preset()
     assert m.p.requires_grad
     assert m.avq.width == 192 and isinstance(m.avq.back, nn.Identity)
-    m.fuse_for_inference().eval()
+    m._enable_folded_query_inference().eval()
     inp = torch.randn(1,5,384)
     with torch.no_grad():
         m.p.uniform_(0.4,1.6)
@@ -67,12 +77,12 @@ def test_p_gradient_and_cache_refresh_after_retraining():
     assert m._folded_q_cache is None
     m.eval()
     with torch.no_grad():
-        expected = copy.deepcopy(m).unfuse_for_inference()(inp.detach())
+        expected = copy.deepcopy(m)._disable_folded_query_inference()(inp.detach())
         torch.testing.assert_close(m(inp.detach()), expected, atol=2e-5, rtol=2e-5)
 
 
 def test_norm_and_no_avq_back_weights():
-    m=BoltPreset.paper_bolt16_avq192(384,12,backend='pytorch')
+    m=compact_192_preset()
     assert not any(k.endswith('.back.weight') for k in m.state_dict())
     x=torch.randn(3,4,192)
     torch.testing.assert_close(
@@ -80,9 +90,9 @@ def test_norm_and_no_avq_back_weights():
     )
     assert m.avq.norm.eps == torch.finfo(torch.float32).eps
     with pytest.raises(ValueError):
-        BoltPreset.paper_bolt16_avq192(384,6)
+        BoltPreset(384, 6, mode='quality', cache='tight', avq_dim=192, avq_return_map='identity')
     with pytest.raises(ValueError):
-        BoltPreset.paper_bolt16_avq192(384,12, avq_dim=198)
+        BoltPreset(384, 12, mode='quality', cache='tight', avq_dim=198, avq_return_map='identity')
 
 
 def test_legacy_defaults_unchanged():

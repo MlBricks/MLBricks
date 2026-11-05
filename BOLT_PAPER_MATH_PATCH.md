@@ -1,32 +1,27 @@
 # MLBricks BOLT-16 + AVQ-192: paper math and inference-only folded Q
 
-This is an **opt-in** paper-compatible preset. Existing default BOLT configurations, checkpoint shapes, CUDA training kernels, and trainable P are retained.
+The low-level implementation preserves the tested AVQ mathematics. End users configure the existing public `Bolt` class; research-specific factories and explicit folding controls are not part of the public API. Existing checkpoint shapes and trainable P are retained.
 
 ## New usage
 
 ```python
 import torch
-from mlbricks.bolt.presets import BoltPreset
+from mlbricks import Bolt
 
-bolt = BoltPreset.paper_bolt16_avq192(384, 12, backend="auto")
+bolt = Bolt(d_model=384, num_heads=12, profile="compact")
 
-# Train/retrain normally: P is a true trainable nn.Parameter.
-bolt.train()
-assert bolt.p.requires_grad
+bolt.train()  # Q and P trainable
 # ... optimizer/training here ...
 
-# Inference: fold P into cached Q weights, no Q * P or Q * 1 operation.
-bolt.eval().fuse_for_inference()
+bolt.eval()  # folded Q inference is automatic under no_grad/inference_mode
 with torch.inference_mode():
-    out = bolt(torch.randn(1, 16, 384, device=next(bolt.parameters()).device))
+    output = bolt(torch.randn(1, 16, 384))
 
-# Training later still uses the original Q and P; caches are invalidated.
-bolt.train()
-# ... retrain, optimizer updates P and Q ...
-bolt.eval().fuse_for_inference()
+bolt.train()  # original Q and P remain trainable
 ```
 
-`fuse_for_inference()` leaves the Q weights, P parameter, optimizer state, and serialized checkpoint unchanged. A **nonpersistent** folded copy of the Q projection weights (and Q bias, when present) is cached for eval/no-gradient calculations only. The cache is invalidated on re-entering train mode, loading checkpoints, or in-place updates to the original Q or P tensors.
+Automatic folded inference leaves the Q weights, P parameter, optimizer state, and serialized checkpoint unchanged. A **nonpersistent** folded copy of the Q projection weights is cached for eval/no-gradient calculations only.
+
 
 ## Paper configuration
 
