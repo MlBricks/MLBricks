@@ -1,6 +1,6 @@
 // BOLT AVQ V2 strict, opt-in CUDA decoding path. No Triton.
 // Based on the existing verified AVQ FP16 gate-rounding + FP32 state recurrence.
-// Inputs: o[1,1,W] half, state[1,W] float, norm[W] float, gamma[1] float.
+// Inputs: o[1,1,W] half/float, state[1,W] float, norm[W] float, gamma[1] float.
 // V2: PyTorch Linear produces z[1,1,3W] then AVQ runs in-place.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -14,8 +14,10 @@ __device__ __forceinline__ float half_gate(float x) {
     return __half2float(__float2half_rn(x));
 }
 
+template <bool OUT_FP32>
 __global__ void update_inplace_kernel(
-    __half* __restrict__ o,
+    __half* __restrict__ o16,
+    float* __restrict__ o32,
     const __half* __restrict__ z,
     float* __restrict__ state,
     const float* __restrict__ nw,
@@ -47,11 +49,19 @@ __global__ void update_inplace_kernel(
     __syncthreads();
     if(i<width){
         float memory=new_value*inv_norm*nw[i]*(1.f+r);
-        // Keep the old kernel's half-rounding semantics (including the residual).
-        float mh=half_gate(memory), gh=half_gate(gamma[0]);
-        float prod=half_gate(mh*gh);
-        float old=__half2float(o[i]);
-        o[i]=__float2half_rn(old+prod);
+        if constexpr (OUT_FP32) {
+            // Modern native decode_append returns FP32 O. With identity AVQ
+            // return, PyTorch keeps the normalized update and residual in FP32.
+            // Never round them to FP16 just because the projection Z is FP16.
+            float prod=__fmul_rn(gamma[0],memory);
+            o32[i]=__fadd_rn(o32[i],prod);
+        } else {
+            // Existing FP16 path: h/output and gamma*update round to half.
+            float mh=half_gate(memory), gh=half_gate(gamma[0]);
+            float prod=half_gate(mh*gh);
+            float old=__half2float(o16[i]);
+            o16[i]=__float2half_rn(old+prod);
+        }
     }
 }
 
@@ -59,9 +69,15 @@ void v2_launch(const at::Tensor& o,const at::Tensor& z,at::Tensor& state,
                const at::Tensor& nw,const at::Tensor& gamma,double eps){
     int width=state.size(1),threads=width<=256?256:512;
     cudaStream_t stream=at::cuda::getCurrentCUDAStream();
-    update_inplace_kernel<<<1,threads,0,stream>>>(
-        reinterpret_cast<__half*>(o.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(z.data_ptr<at::Half>()),
-        state.data_ptr<float>(),nw.data_ptr<float>(),gamma.data_ptr<float>(),width,(float)eps);
+    auto* zptr=reinterpret_cast<const __half*>(z.data_ptr<at::Half>());
+    if(o.scalar_type()==at::kFloat){
+        update_inplace_kernel<true><<<1,threads,0,stream>>>(
+            nullptr,o.data_ptr<float>(),zptr,
+            state.data_ptr<float>(),nw.data_ptr<float>(),gamma.data_ptr<float>(),width,(float)eps);
+    }else{
+        update_inplace_kernel<false><<<1,threads,0,stream>>>(
+            reinterpret_cast<__half*>(o.data_ptr<at::Half>()),nullptr,zptr,
+            state.data_ptr<float>(),nw.data_ptr<float>(),gamma.data_ptr<float>(),width,(float)eps);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

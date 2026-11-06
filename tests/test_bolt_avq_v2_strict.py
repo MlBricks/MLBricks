@@ -81,3 +81,38 @@ def test_v2_cached_decode_64_steps(monkeypatch):
             monkeypatch.setenv('MLBRICKS_BOLT_V2_STRICT_DECODE', '1')
             torch.testing.assert_close(o1.float(), o2.float(), atol=0.03, rtol=0.02)
             torch.testing.assert_close(state1, state2, atol=6e-4, rtol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('width', [192, 384])
+def test_v2_native_decoder_fp32_attention_output_no_fallback(monkeypatch, width):
+    """Modern CUDA decode returns FP32 O; V2 must actually select native AVQ."""
+    ext = v2_strict.get_extension()
+    if ext is None:
+        pytest.fail('V2 CUDA extension is required for the FP32 integration test')
+    torch.manual_seed(115 + width)
+    m = BoltStateMemory(width, width, device='cuda', backend='native').eval().half()
+    m.use_native = True
+    with torch.no_grad():
+        m.gamma.fill_(0.25)
+    o = torch.randn(1, 1, width, device='cuda', dtype=torch.float32) * 0.05
+    state = torch.randn(1, width, device='cuda', dtype=torch.float32) * 0.005
+    state_original = state.clone()
+    o_original = o.clone()
+    monkeypatch.setenv('MLBRICKS_BOLT_V2_STRICT_DECODE', '1')
+    with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16):
+        assert v2_strict.eligible(m, o, state), 'FP32 attention output rejected by V2'
+        selected = v2_strict.maybe_step(m, o, state)
+        assert selected is not None, 'silent PyTorch/native fallback'
+        actual_y, actual_s = selected
+    monkeypatch.setenv('MLBRICKS_BOLT_V2_STRICT_DECODE', '0')
+    with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16):
+        reference_y, reference_s = m.step(o, state)
+    assert actual_y.dtype == reference_y.dtype == torch.float32
+    assert actual_s.dtype == reference_s.dtype == torch.float32
+    assert torch.isfinite(actual_y).all() and torch.isfinite(actual_s).all()
+    torch.testing.assert_close(actual_y, reference_y, atol=0.03, rtol=0.02)
+    torch.testing.assert_close(actual_s, reference_s, atol=0.002, rtol=0.002)
+    # Standalone maybe_step must not mutate its input state.
+    torch.testing.assert_close(state, state_original, rtol=0, atol=0)
+    torch.testing.assert_close(o, o_original, rtol=0, atol=0)

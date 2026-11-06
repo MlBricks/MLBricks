@@ -9,7 +9,7 @@ The native kernel takes the *original torch.nn.Linear projection* of attention
 output O; it does not use the separately tested V3 custom GEMV. The CUDA
 kernel updates a contiguous FP32 state using separate, correctly rounded
 multiply and add operations. Supported shapes: batch 1, one token,
-identity return map, AVQ width 192 or 384, CUDA FP16 attention output.
+identity return map, AVQ width 192 or 384, CUDA FP16/FP32 attention output.
 
 This path requires qualification on each target GPU/PyTorch version before
 being enabled in production. Its numerical behavior is not promised to be
@@ -51,7 +51,7 @@ def eligible(avq, o, state):
         enabled() and avq.use_native and not avq.training
         and not torch.is_grad_enabled()
         and o.is_cuda and state.is_cuda and o.device == state.device
-        and o.dtype == torch.float16 and state.dtype == torch.float32
+        and o.dtype in (torch.float16, torch.float32) and state.dtype == torch.float32
         and o.is_contiguous() and state.is_contiguous()
         and o.ndim == 3 and o.shape[:2] == (1, 1)
         and int(o.shape[-1]) in (192, 384)

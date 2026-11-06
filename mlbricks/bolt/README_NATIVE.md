@@ -90,7 +90,7 @@ MLBRICKS_BOLT_V2_STRICT_DECODE=1 python your_inference_script.py
 ```
 
 Eligibility: `Bolt`/`BoltPreset` modern quality mode, Identity AVQ return,
-FP16 contiguous attention output, FP32 state, batch 1, one token, widths
+FP16 or FP32 contiguous attention output, FP32 state, batch 1, one token, widths
 192/384, no gradients. Unsupported shapes use the existing code path. The
 compiled extension and compatible CUDA/PyTorch stack are required when
 explicitly selecting a native backend with V2 enabled. The optional speedup
@@ -105,3 +105,16 @@ python -m pytest tests/test_bolt_avq_v2_strict.py \
 The strict V2 path is *not* an end-to-end compiled Transformer, and it does
 not modify native cached attention. Do not merge into a released `main` branch
 without matched GPU parity and performance qualifications.
+
+### FP32 output from the native attention decoder
+
+`mlbricks._bolt_modern_cuda.decode_append` returns FP32 attention output even
+when the compact C cache is FP16. The V2 Strict eligibility gate and compiled
+kernel therefore support FP16 **and** FP32 residual inputs. Both use PyTorch's
+original FP16 autocast projection (`avq.project(o)`), FP32 recurrent state and
+the Identity AVQ return. FP32 residual inputs keep the AVQ readout, gamma
+multiply and final residual addition in FP32; the FP16 path is unchanged.
+
+This fixes the previously observed `selected=0` fallback during full-model
+T4 qualification. A new GPU qualification is required; successful compilation
+and direct FP16 tests alone are not sufficient.

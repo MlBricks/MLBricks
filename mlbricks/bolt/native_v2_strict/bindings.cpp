@@ -14,8 +14,8 @@ static int validate(const at::Tensor& o, const at::Tensor& state,
                 o.device()==gamma.device(), "all input tensors must be on the same GPU");
     TORCH_CHECK(o.is_contiguous() && state.is_contiguous() && norm_weight.is_contiguous() &&
                 gamma.is_contiguous(), "CUDA tensors must be contiguous");
-    TORCH_CHECK(o.scalar_type()==at::kHalf && state.scalar_type()==at::kFloat,
-                "o must be FP16 and state FP32");
+    TORCH_CHECK((o.scalar_type()==at::kHalf || o.scalar_type()==at::kFloat) && state.scalar_type()==at::kFloat,
+                "o must be FP16 or FP32 and state FP32");
     TORCH_CHECK(norm_weight.scalar_type()==at::kFloat && gamma.scalar_type()==at::kFloat,
                 "norm/gamma must be FP32");
     TORCH_CHECK(o.dim()==3 && o.size(0)==1 && o.size(1)==1,
