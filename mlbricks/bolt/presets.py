@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from . import native_backend as _native
 from . import accelerated as _accelerated
+from . import v2_strict as _v2_strict
 
 
 @dataclass
@@ -177,11 +178,19 @@ class BoltStateMemory(nn.Module):
         enhanced=o+self.gamma.to(o.dtype)*update
         return (enhanced,s[:,-1,:].contiguous()) if return_state else enhanced
 
-    def step(self,o,state):
+    def step(self,o,state,*,_v2_cache_inplace=False):
         if o.device != self.project.weight.device:
             o = o.to(self.project.weight.device, non_blocking=True)
         if state.device != o.device:
             state = state.to(o.device, non_blocking=True)
+        # Optional V2 strict native one-token path. Keep the original torch
+        # projection; do not substitute the V3 GEMV reduction. This path is
+        # inference-only and never alters checkpoint/state-dict schemas.
+        candidate = _v2_strict.maybe_step(
+            self, o, state, inplace_cache=_v2_cache_inplace
+        )
+        if candidate is not None:
+            return candidate
         a,v,r=self.components(o)
         if self.use_native and o.is_cuda and _native.get_extension() is not None:
             s=_native.avq_step(a[:,0,:],v[:,0,:],state.float())
@@ -564,8 +573,11 @@ class BoltPreset(nn.Module):
             o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
         o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
         if self.avq is not None:
-            o,s=self.avq.step(o,cache.state)
-            cache.state.copy_(s)
+            # Reuse the already owned cache.state in the optional V2 strict
+            # path, without a second GPU copy. The fallback remains functional.
+            o,s=self.avq.step(o,cache.state,_v2_cache_inplace=True)
+            if s.data_ptr() != cache.state.data_ptr():
+                cache.state.copy_(s)
         cache.length=pos+1
         return self.out_proj(o)
 
