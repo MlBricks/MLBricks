@@ -11,7 +11,7 @@ from mlbricks import Bolt, BoltConfig, BoltModel, BoltStateMemory, BoltCache
 config = BoltConfig(
     vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
     profile="standard",  # AVQ defaults to heads * 32 = 384
-    device="auto", precision="auto", backend="auto",
+    device="auto", backend="auto",  # precision defaults to "fp32"
 )
 model = BoltModel(config)  # CUDA by default when available; otherwise CPU
 logits = model(torch.randint(0, 50257, (1, 32)))
@@ -52,7 +52,12 @@ settings. Historical `mode="fast"` continues to request attention-only BOLT.
 `device="auto"` chooses CUDA if available; explicit `device="cuda:1"` chooses
 a particular GPU. CPU input tokens are moved automatically to the model device,
 but placing inputs directly on the accelerator minimizes transfer overhead.
-`precision="auto"` activates CUDA mixed precision while keeping FP32 weights.
+`precision="fp32"` is the default for `Bolt` and `BoltConfig`, keeping
+FP32 arithmetic and model parameters without automatic mixed precision.
+Explicit `precision="auto"` enables CUDA mixed precision while keeping FP32
+model weights; `precision="fp16"` and `precision="bf16"` remain opt-in.
+The optional V2 Strict native decode kernel requires compatible FP16
+projections, so the FP32 default is not a promise of V2 Strict acceleration.
 
 Native recurrent kernels are optional at source-build time:
 

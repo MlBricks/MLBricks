@@ -106,7 +106,7 @@ class BoltBlock(nn.Module):
                              projection=getattr(cfg,'projection',None),
                              avq_return_map=getattr(cfg,'avq_return_map','auto'),
                              avq_norm_eps=getattr(cfg,'avq_norm_eps',None),
-                             precision=getattr(cfg,'precision','auto'),
+                             precision=getattr(cfg,'precision','fp32'),
                              device='cpu')
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
@@ -504,7 +504,8 @@ class BoltModel(BoltModelCore):
 
     The constructor automatically places model weights on CUDA when available.
     Input token IDs and targets are transferred to the model's current device.
-    ``precision='auto'`` uses autocast on CUDA and full precision on CPU.
+    ``precision='fp32'`` (default) keeps full precision on CUDA and CPU.
+    Explicit ``precision='auto'`` enables CUDA autocast.
     """
     def __init__(self, config: BoltConfig | BoltModelSettings | None = None, **kwargs):
         if config is None:

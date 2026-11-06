@@ -184,11 +184,9 @@ bolt = Bolt(
 )
 ```
 
-You can also import directly from the component package:
-
-```python
-from mlbricks.bolt import Bolt, BoltAttention
-```
+The recommended public import path is the top-level `mlbricks` package.
+`Bolt`, `BoltConfig`, and `BoltModel` default to FP32 precision; mixed
+precision must be requested explicitly.
 
 ### Bolt language model
 

@@ -94,7 +94,7 @@ config = BoltConfig(
     vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
     profile="standard",  # latent width 32
     # state_memory=True is the default
-    device="auto", backend="auto", precision="auto",
+    device="auto", backend="auto",  # precision defaults to "fp32"
 )
 model = BoltModel(config)  # CUDA automatically if available
 
@@ -408,7 +408,7 @@ from mlbricks import BoltConfig, BoltModel
 config = BoltConfig(
     vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
     profile="standard", state_memory=True,  # AVQ = 12 * 32 = 384 (Identity return)
-    backend="auto", device="auto", precision="auto",
+    backend="auto", device="auto",  # precision defaults to "fp32"
 )
 model = BoltModel(config)  # automatically uses CUDA when available
 ids = torch.randint(0, config.vocab_size, (1, 64))  # CPU tensor accepted
@@ -423,9 +423,11 @@ independent: `backend="auto"` routes available CUDA state kernels when built,
 with a safe PyTorch fallback; it never changes the mathematical settings.
 
 `device="auto"` prefers CUDA then CPU. Explicit `device="cuda:1"` works, and
-requesting unavailable CUDA raises a clear error. `precision="auto"` selects
+requesting unavailable CUDA raises a clear error. `precision="fp32"` is the default for standalone `Bolt` and `BoltConfig` / `BoltModel`.
+It disables implicit CUDA autocast. Explicit `precision="auto"` selects
 CUDA mixed precision (BF16 where supported, otherwise FP16); model weights
-remain FP32. Explicit `precision="fp32"` disables autocast. Auto-transferring
+remain FP32. FP16/BF16 are opt-in. The native V2 Strict AVQ kernel is
+precision-specific and might not be eligible for FP32 computation. Auto-transferring
 CPU inputs incurs a copy; feed tensors already on the GPU for best throughput.
 
 The new model supports `model(input_ids)`, `model(input_ids, targets=targets)`,

@@ -616,7 +616,7 @@ class Bolt(nn.Module):
         profile: str | None = None,
         state_memory: bool = True,
         device: str = 'auto',
-        precision: str = 'auto',
+        precision: str = 'fp32',
         attention_scale: str | None = None,
         memory_init: str | None = None,
         projection: str | None = None,
