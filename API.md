@@ -407,7 +407,7 @@ from mlbricks import BoltConfig, BoltModel
 
 config = BoltConfig(
     vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard", state_memory=True, state_dim=198,
+    profile="standard", state_memory=True,  # AVQ = 12 * 32 = 384 (Identity return)
     backend="auto", device="auto", precision="auto",
 )
 model = BoltModel(config)  # automatically uses CUDA when available

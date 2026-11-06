@@ -1,5 +1,5 @@
 // MLBricks BOLT AVQ v4: segmented, multi-CTA affine recurrence for training.
-// Each CTA processes one time chunk across all state dimensions (coalesced).
+// Each CTA processes one time chunk and one 256-channel tile (coalesced).
 // Stage 1: independent chunk-local states starting from zero + affine summary.
 // Stage 2: short sequential scan across chunk summaries (one thread / dimension).
 // Stage 3: correct the stored local states using only A (not recomputing V or local sums).
@@ -22,7 +22,7 @@ __global__ void seg_fwd_local(const float* __restrict__ a,
     const float* __restrict__ v, float* __restrict__ states,
     float* __restrict__ ca,float* __restrict__ cb,
     int T,int D,int NC) {
-  int d=threadIdx.x, b=blockIdx.y, c=blockIdx.x;
+  int d=blockIdx.z*blockDim.x+threadIdx.x, b=blockIdx.y, c=blockIdx.x;
   if(d>=D)return;
   int start=c*AVQ_CHUNK, stop=min(start+AVQ_CHUNK,T);
   float p=1.f, local=0.f;
@@ -52,7 +52,7 @@ __global__ void seg_fwd_carries(const float* __restrict__ ca,
 __global__ void seg_fwd_correct(const float* __restrict__ a,
     const float* __restrict__ carries,float* __restrict__ states,
     int T,int D,int NC) {
-  int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;
+  int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;
   if(d>=D)return;
   float carry=carries[((int64_t)b*NC+c)*D+d], p=1.f;
   int start=c*AVQ_CHUNK,stop=min(start+AVQ_CHUNK,T);
@@ -69,7 +69,7 @@ __global__ void seg_bwd_local(const float* __restrict__ a,
     const float* __restrict__ ds,float* __restrict__ local_g,
     float* __restrict__ ca,float* __restrict__ cb,
     int T,int D,int NC) {
-  int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;
+  int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;
   if(d>=D)return;
   int begin=c*AVQ_CHUNK,end=min(begin+AVQ_CHUNK,T);
   float carry=0.f,p=1.f;
@@ -100,7 +100,7 @@ __global__ void seg_bwd_correct(const float* __restrict__ a,
     const float* __restrict__ local_g,const float* __restrict__ carries,
     float* __restrict__ ga,float* __restrict__ gv,float* __restrict__ g0,
     int T,int D,int NC) {
-  int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;
+  int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;
   if(d>=D)return;
   int begin=c*AVQ_CHUNK,end=min(begin+AVQ_CHUNK,T);
   float carry=carries[((int64_t)b*NC+c)*D+d],p=1.f;
@@ -120,7 +120,7 @@ static void check_inputs(const torch::Tensor& a,const torch::Tensor& v,const tor
   TORCH_CHECK(a.scalar_type()==torch::kFloat32 && v.scalar_type()==torch::kFloat32 && s0.scalar_type()==torch::kFloat32,"FP32 tensors required");
   TORCH_CHECK(a.is_contiguous()&&v.is_contiguous()&&s0.is_contiguous(),"contiguous required");
   TORCH_CHECK(a.dim()==3 && v.sizes()==a.sizes(),"a,v must be [B,T,D]");
-  TORCH_CHECK(a.size(1)>0 && a.size(2)>0 && a.size(2)<=THREADS,"T positive; state dimension <=256");
+  TORCH_CHECK(a.size(0)>0 && a.size(0)<=65535 && a.size(1)>0 && a.size(2)>0 && a.size(2)<=int64_t(THREADS)*65535,"B in 1..65535, T>0, channel-tiled D");
   TORCH_CHECK(s0.dim()==2 && s0.size(0)==a.size(0) && s0.size(1)==a.size(2),"s0 must be [B,D]");
   TORCH_CHECK(a.device()==v.device()&&a.device()==s0.device(),"device mismatch");
 }
@@ -133,7 +133,7 @@ torch::Tensor avq_segmented_forward(torch::Tensor a,torch::Tensor v,torch::Tenso
   auto ca=summaries.select(0,0),cb=summaries.select(0,1);
   auto carries=torch::empty({B,NC,D},a.options());
   auto stream=at::cuda::getCurrentCUDAStream().stream();
-  dim3 blocks(NC,B);
+  dim3 blocks(NC,B,(D+THREADS-1)/THREADS);
   seg_fwd_local<<<blocks,THREADS,0,stream>>>(a.data_ptr<float>(),v.data_ptr<float>(),states.data_ptr<float>(),ca.data_ptr<float>(),cb.data_ptr<float>(),T,D,NC);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   seg_fwd_carries<<<dim3((D+THREADS-1)/THREADS,B),THREADS,0,stream>>>(ca.data_ptr<float>(),cb.data_ptr<float>(),s0.data_ptr<float>(),carries.data_ptr<float>(),D,NC);
@@ -152,7 +152,7 @@ std::vector<torch::Tensor> avq_segmented_backward(torch::Tensor a,torch::Tensor 
   auto ca=summaries.select(0,0),cb=summaries.select(0,1);
   auto carries=torch::empty({B,NC,D},a.options());
   auto stream=at::cuda::getCurrentCUDAStream().stream();
-  dim3 blocks(NC,B);
+  dim3 blocks(NC,B,(D+THREADS-1)/THREADS);
   seg_bwd_local<<<blocks,THREADS,0,stream>>>(a.data_ptr<float>(),ds.data_ptr<float>(),local_g.data_ptr<float>(),ca.data_ptr<float>(),cb.data_ptr<float>(),T,D,NC);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   seg_bwd_carries<<<dim3((D+THREADS-1)/THREADS,B),THREADS,0,stream>>>(ca.data_ptr<float>(),cb.data_ptr<float>(),carries.data_ptr<float>(),D,NC);

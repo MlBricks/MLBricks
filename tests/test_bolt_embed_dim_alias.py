@@ -13,7 +13,7 @@ def test_embed_dim_keyword_builds_identical_default_preset_and_checkpoint():
     original = Bolt(48, 6, device="cpu", precision="fp32")
     alias = Bolt(embed_dim=48, num_heads=6, device="cpu", precision="fp32")
     alias.load_state_dict(original.state_dict(), strict=True)
-    assert (alias.embed_dim, alias.d_model, alias.num_heads, alias.latent_dim, alias.avq_dim) == (48, 48, 6, 32, 198)
+    assert (alias.embed_dim, alias.d_model, alias.num_heads, alias.latent_dim, alias.avq_dim) == (48, 48, 6, 32, 192)
     x = torch.randn(2, 5, 48)
     torch.testing.assert_close(original(x), alias(x))
     assert alias.resolved_backend().startswith("pytorch")

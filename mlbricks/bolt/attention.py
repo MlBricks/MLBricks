@@ -599,7 +599,7 @@ class Bolt(nn.Module):
         *,
         embed_dim: int | None = None,
         latent_dim: int | None = None,
-        # Two independent controls: quality (AVQ-198) / fast (BOLT),
+        # Two independent controls: quality (matched-width AVQ) / fast (BOLT),
         # normal (32-feature cache) / tight (16-feature cache).
         mode: str | None = None,
         cache: str = "normal",
@@ -676,11 +676,13 @@ class Bolt(nn.Module):
         if self.is_modern:
             from .presets import BoltPreset
             target_mode = 'quality' if mode is None else str(mode)
-            # New compact 12-head layers default to the validated 192-wide
-            # state. Other existing presets keep their 198-wide default.
+            # Match AVQ memory to total attention width by default. This
+            # selects Identity for the AVQ return: no 192/384 projection.
+            latent_width = 16 if cache == 'tight' else 32
+            full_attention_width = int(num_heads) * latent_width
             compact_12 = cache == 'tight' and int(num_heads) == 12 and profile == 'compact'
             if avq_dim is None:
-                avq_dim = 192 if compact_12 else 198
+                avq_dim = full_attention_width
             if compact_12 and int(avq_dim) == 192:
                 # Match the reference attention denominator and AVQ gate
                 # initialization without exposing a research-named factory.
@@ -700,9 +702,6 @@ class Bolt(nn.Module):
                 avq_return_map=avq_return_map,
                 avq_norm_eps=avq_norm_eps,
             )
-            # Automatic optimization only in eval + inference_mode/no_grad.
-            # It does not replace any Parameter or change optimizer state.
-            self._modern._enable_folded_query_inference()
             self.d_model=int(d_model)
             self.num_heads=int(num_heads)
             self.head_dim=self.d_model//self.num_heads

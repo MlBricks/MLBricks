@@ -21,12 +21,14 @@ def test_default_and_opt_out_are_genuine_architecture_choices(profile, latent):
     off = _config(profile=profile, state_memory=False)
     assert default.state_memory is True and default.bolt_mode == 'quality'
     assert off.state_memory is False and off.bolt_mode == 'fast'
-    assert off.state_dim == default.state_dim == 198  # configured width
+    expected_width = 4 * latent
+    assert off.state_dim == default.state_dim == expected_width
 
     with_memory = BoltModel(default)
     without_memory = BoltModel(off)
     assert sum(p.numel() for p in without_memory.parameters()) < sum(p.numel() for p in with_memory.parameters())
-    assert all(b.attn.state_memory and b.attn.avq_dim == 198 for b in with_memory.blocks)
+    assert all(b.attn.state_memory and b.attn.avq_dim == expected_width for b in with_memory.blocks)
+    assert all(isinstance(b.attn._modern.avq.back, torch.nn.Identity) for b in with_memory.blocks)
     assert all(not b.attn.state_memory and b.attn.avq_dim == 0 for b in without_memory.blocks)
     assert all(b.attn.latent_dim == latent for b in without_memory.blocks)
     assert all(b.attn._modern.avq is None for b in without_memory.blocks)

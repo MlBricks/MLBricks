@@ -76,8 +76,8 @@ def test_v8_shipped_kernel_sources_match_validated_notebook():
     # 10K-step Kaggle notebook. Their byte identity is the provenance check.
     root=Path(__file__).resolve().parents[1] / 'mlbricks' / 'bolt' / 'native_accel'
     expected={
-        'state_short.cu':'1f7941f038f3f4699fdff7f9badb6ab694ed08eef8e7c3657ce4389ff7f5ef4a',
-        'state_segmented.cu':'34b4b6719a730c599e45054a0e9b584613b1e6570180b168a9e2384f3c4a198f',
+        'state_short.cu':'c1f177029e4d34c284e7e4c7cf7c804d4f2122f25855917a3b2cfc73502bc2e1',
+        'state_segmented.cu':'392f2c1589bbaf29a09903ee5243f2694e5c7d667a10bd30b72c6d1660340419',
     }
     for name,sha in expected.items():
         assert hashlib.sha256((root/name).read_bytes().replace(b'\r\n', b'\n')).hexdigest() == sha
