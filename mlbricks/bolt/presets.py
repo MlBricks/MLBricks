@@ -1,14 +1,13 @@
 """Configurable BOLT and post-softmax AVQ presets.
 
-Two INDEPENDENT controls:
-    mode='quality' -> BOLT plus AVQ width 198 (default)
+Two independent controls:
+    mode='quality' -> BOLT plus AVQ matched to total attention width (default)
     mode='fast'    -> BOLT without AVQ
     cache='normal'-> 32 latent features/head (default)
     cache='tight' -> 16 latent features/head
 
-The new optional native BOLT feature/AVQ CUDA extension is separate from legacy
-normalized-latent BOLT; those checkpoints are NOT compatible. The AVQ=198 preset is
-new and has not been validated on the user's benchmark (which used AVQ=192).
+The modern Direct-Q CUDA feature kernel contains no learned query-scale P.
+The independent legacy rho-normalized BOLT path remains available in legacy mode.
 """
 from __future__ import annotations
 
@@ -321,7 +320,6 @@ class BoltPreset(nn.Module):
                     state_dict[prefix + name + '.bias'] = packed_bias[index*width:(index+1)*width].clone()
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
-        self._folded_q_cache = None
 
     def _scale(self):
         dimension = self.latent_dim if self.attention_scale == 'latent' else self.head_dim
@@ -386,7 +384,7 @@ class BoltPreset(nn.Module):
         """Direct-Q BOLT features: no separately learned query scaling P.
 
         Training and inference share the same trainable Q projection. The
-        native no-P feature kernel may accelerate inference when available.
+        native Direct-Q feature kernel may accelerate inference when available.
         """
         b, t, _ = x.shape
         if self.projection == 'packed':
@@ -401,8 +399,8 @@ class BoltPreset(nn.Module):
         g = g.reshape(shape).transpose(1, 2)
         inference = not self.training and not torch.is_grad_enabled()
         native = self._native_enabled(x)
-        if inference and native and _native.supports_folded_features(q, u, g):
-            q, c = _native.features_folded(
+        if inference and native and _native.supports_features(q, u, g):
+            q, c = _native.features(
                 q.contiguous(), u.contiguous(), g.contiguous()
             )
         else:

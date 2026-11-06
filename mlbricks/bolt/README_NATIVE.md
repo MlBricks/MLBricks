@@ -52,13 +52,13 @@ m.set_backend('native')
 - `backend='pytorch'`: use the original all-PyTorch modern BOLT equations.
 - `backend='native'`: require the new modern extension; this does not call legacy BOLT native code.
 - Native cached-decode currently supports `position=None` and latent widths **16/32**. `position='rope'` uses PyTorch cached-decode for `auto`; forcing `native` with RoPE decoding raises.
-- The complete full-sequence attention uses PyTorch SDPA regardless of backend; backward still flows through the fused BOLT features and CUDA AVQ scan.
+- The complete full-sequence attention uses PyTorch SDPA regardless of backend. During training, Q/U/G and their gradients use PyTorch autograd; the optional native feature kernel is inference-only. The native AVQ scan supports backward.
 - Modern BOLT trains Q directly and does not allocate a P parameter. Use freshly trained checkpoints for the new parameterization; it is not interchangeable with checkpoints from the prior learned-P implementation.
 
 ## Verification before deployment
 
 ```bash
-python -m pytest tests/test_bolt_native_cuda.py -v
+python -m pytest tests/test_bolt_modern_native_cuda.py tests/test_bolt_directq_native_cleanup.py -v
 python examples/bolt_native_benchmark.py
 ```
 

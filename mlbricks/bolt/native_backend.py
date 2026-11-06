@@ -43,37 +43,27 @@ def get_extension():
     return _EXTENSION
 
 
-def supports_features(q,u,g,p):
-    return (get_extension() is not None and q.is_cuda and u.is_cuda and g.is_cuda and p.is_cuda
-            and q.dtype in (torch.float16,torch.float32) and q.dtype == u.dtype == g.dtype
-            and p.dtype==torch.float32)
-
-class _Features(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, u, g, p):
-        ext=get_extension()
-        if ext is None:
-            raise RuntimeError('BOLT CUDA extension is not installed')
-        # q/u/g: [B,H,T,R] p: [H,R]
-        qc, c = ext.features_forward(q.contiguous(),u.contiguous(),g.contiguous(),p.contiguous())
-        ctx.save_for_backward(q, u, g, p)
-        return qc, c
-
-    @staticmethod
-    def backward(ctx, grad_q, grad_c):
-        q,u,g,p=ctx.saved_tensors
-        ext=get_extension()
-        if grad_q is None:
-            grad_q=torch.zeros(q.shape,device=q.device,dtype=torch.float32)
-        if grad_c is None:
-            grad_c=torch.zeros_like(u)
-        dq,du,dg,dp=ext.features_backward(grad_q.contiguous().float(), grad_c.contiguous().to(u.dtype),
-                                           q.contiguous(),u.contiguous(),g.contiguous(),p.contiguous())
-        return dq,du,dg,dp
+def supports_features(q, u, g):
+    """True for the Direct-Q no-P inference kernel on supported CUDA tensors."""
+    ext = get_extension()
+    return (ext is not None and hasattr(ext, 'features_forward')
+            and q.is_cuda and u.is_cuda and g.is_cuda
+            and q.device == u.device == g.device
+            and q.dtype in (torch.float16, torch.float32)
+            and q.dtype == u.dtype == g.dtype
+            and q.ndim == 4 and q.shape == u.shape == g.shape
+            and not any(t.requires_grad for t in (q, u, g)))
 
 
-def features(q,u,g,p):
-    return _Features.apply(q,u,g,p)
+def features(q, u, g):
+    """Inference-only fused Direct-Q and gated C transform; gradients use PyTorch."""
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, u, g)):
+        raise RuntimeError('Native Direct-Q features are inference-only; use the PyTorch autograd training path')
+    ext = get_extension()
+    if ext is None or not hasattr(ext, 'features_forward'):
+        raise RuntimeError('Rebuild the modern BOLT Direct-Q CUDA extension')
+    return ext.features_forward(q.contiguous(), u.contiguous(), g.contiguous())
+
 
 class _Scan(torch.autograd.Function):
     @staticmethod
@@ -103,20 +93,3 @@ def decode_append(q,c_now,cache,scratch,position,scale):
     return get_extension().decode_append(q.contiguous(),c_now.contiguous(),cache,scratch, int(position),float(scale))
 
 __all__=['get_extension','supports_features','features','avq_scan','avq_step','decode_append']
-
-
-def supports_folded_features(q, u, g):
-    """True only for rebuilt CUDA extensions with a no-P feature kernel."""
-    ext = get_extension()
-    return (ext is not None and hasattr(ext, 'features_forward_folded')
-            and q.is_cuda and u.is_cuda and g.is_cuda
-            and q.dtype in (torch.float16, torch.float32)
-            and q.dtype == u.dtype == g.dtype)
-
-
-def features_folded(q, u, g):
-    """Inference-only native Q/C feature transform: no P input or multiply."""
-    ext = get_extension()
-    if ext is None or not hasattr(ext, 'features_forward_folded'):
-        raise RuntimeError('Rebuild BOLT modern CUDA to enable folded feature kernel')
-    return ext.features_forward_folded(q.contiguous(), u.contiguous(), g.contiguous())

@@ -77,7 +77,7 @@ def test_bolt_native_preallocated_cache(mode):
         with torch.no_grad():m._modern.avq.gamma.fill_(.18)
     from mlbricks import BoltPresetCache
     x=torch.randn(1,64,384,device='cuda')
-    cache=BoltPresetCache.allocate(1,12,72,32,198 if mode=='quality' else 0,device='cuda',dtype=torch.float16)
+    cache=BoltPresetCache.allocate(1,12,72,m._modern.latent_dim,m._modern.avq_dim,device='cuda',dtype=torch.float16)
     with torch.no_grad(),torch.autocast('cuda',dtype=torch.float16):
         pre,(c,s)=m.prefill(x[:,:48])
         cache.load_prefix(c,s)

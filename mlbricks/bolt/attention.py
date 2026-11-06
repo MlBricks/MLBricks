@@ -599,7 +599,7 @@ class Bolt(nn.Module):
         *,
         embed_dim: int | None = None,
         latent_dim: int | None = None,
-        # Two independent controls: quality (AVQ-198) / fast (BOLT),
+        # Two independent controls: quality (matched-width AVQ) / fast (BOLT),
         # normal (32-feature cache) / tight (16-feature cache).
         mode: str | None = None,
         cache: str = "normal",

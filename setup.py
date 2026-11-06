@@ -151,7 +151,7 @@ if enabled("MLBRICKS_BUILD_BOLT_NATIVE") and has_cuda_toolkit:
         )
     )
 
-# Optional modern BOLT-32/16 and AVQ-198/other widths CUDA extension.
+# Optional modern Direct-Q BOLT-32/16 and matched-width AVQ CUDA extension.
 # This is a separate implementation from legacy rho-normalized BOLT.
 if enabled("MLBRICKS_BUILD_BOLT_MODERN_NATIVE") and has_cuda_toolkit:
     csrc = ROOT / "mlbricks" / "bolt" / "native_modern"

@@ -129,7 +129,7 @@ Modern BOLT uses causal attention and a differentiable affine recurrence. On sup
 
 ## Native modern BOLT CUDA kernels
 
-The new **modern BOLT-32/16 + width-matched AVQ native extension** (`mlbricks._bolt_modern_cuda`) is optional and independent of the historical `_gauss_cuda` kernels. Build using `MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1` and a CUDA-enabled PyTorch/toolkit. It accelerates the BOLT gated-feature projection and AVQ recurrent scan (including backward), and provides fused CUDA cached decode without RoPE. Training/prefill attention still uses CUDA SDPA. See [README_NATIVE.md](README_NATIVE.md) for build commands, supported paths, parity tests and limitations. On machines without the extension, `backend='auto'` falls back to PyTorch, while `backend='native'` gives an explicit build error.
+The new **modern BOLT-32/16 + width-matched AVQ native extension** (`mlbricks._bolt_modern_cuda`) is optional and independent of the historical `_gauss_cuda` kernels. Build using `MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1` and a CUDA-enabled PyTorch/toolkit. It accelerates the BOLT gated-feature transform in inference and the AVQ recurrent scan (including backward), and provides fused CUDA cached decode without RoPE. Training/prefill attention still uses CUDA SDPA. See [README_NATIVE.md](README_NATIVE.md) for build commands, supported paths, parity tests and limitations. On machines without the extension, `backend='auto'` falls back to PyTorch, while `backend='native'` gives an explicit build error.
 
 ### BOLT-owned implementation
 

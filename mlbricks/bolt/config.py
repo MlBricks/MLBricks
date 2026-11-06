@@ -15,7 +15,7 @@ class BoltModelSettings:
     dim: int = 384
     heads: int = 6
     latent_dim: int = 32  # legacy-only when bolt_mode='legacy'
-    bolt_mode: str = "quality"  # quality (AVQ-198), fast (BOLT), legacy
+    bolt_mode: str = "quality"  # quality (matched-width AVQ), fast (BOLT), legacy
     bolt_cache: str = "normal"  # normal=32, tight=16
     avq_dim: int | None = None
     position: str = "none"
