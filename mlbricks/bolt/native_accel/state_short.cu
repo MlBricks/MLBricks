@@ -1,7 +1,7 @@
 // BOLT AVQ v7 experimental: no all-FP32 [A,V,R] promotion, no full-width dz zeros.
 // A = sigmoid(za), V = 0.1*tanh(zv), E[t] = A[t]*E[t-1] + V[t].
 // Two execution paths: SWQR-inspired single CTA short scan (T<=512) and
-// 256-token multi-CTA segmented scan. Both have exact reverse-time gradients.
+// 256-token multi-CTA segmented scan with 256-channel tiling. Both have exact reverse-time gradients.
 // FP32 recurrent states; FP16/FP32 input logits and output gradients.
 // No torch.compile. No Triton. Native CUDA C++.
 #include <torch/extension.h>
@@ -76,7 +76,7 @@ __global__ void short_bwd(const scalar_t* __restrict__ za,const scalar_t* __rest
 template<typename scalar_t>
 __global__ void seg_fwd_local(const scalar_t* za,const scalar_t* zv,float* states,float* ca,float* cb,
  int T,int D,int NC,int64_t asb,int64_t ast,int64_t vsb,int64_t vst){
- int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
+ int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
  float p=1.f,s=0.f;int stop=min((c+1)*CHUNK,T);
  for(int t=c*CHUNK;t<stop;++t){float a=gate(za,b,t,d,asb,ast);s=a*s+upd(zv,b,t,d,vsb,vst);p*=a;states[((int64_t)b*T+t)*D+d]=s;}
  int64_t i=((int64_t)b*NC+c)*D+d;ca[i]=p;cb[i]=s;
@@ -87,14 +87,14 @@ __global__ void seg_fwd_carry(const float* ca,const float* cb,const float* s0,fl
 }
 template<typename scalar_t>
 __global__ void seg_fwd_correct(const scalar_t* za,const float* inc,float* states,int T,int D,int NC,int64_t asb,int64_t ast){
- int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
+ int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
  float s=inc[((int64_t)b*NC+c)*D+d],p=1.f;
  for(int t=c*CHUNK;t<min((c+1)*CHUNK,T);++t){int64_t k=((int64_t)b*T+t)*D+d;p*=gate(za,b,t,d,asb,ast);states[k]+=p*s;}
 }
 template<typename scalar_t>
 __global__ void seg_bwd_local(const scalar_t* za,const float* de,float* local,float* ca,float* cb,
  int T,int D,int NC,int64_t asb,int64_t ast){
- int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
+ int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
  int start=c*CHUNK,stop=min((c+1)*CHUNK,T);float p=1.f,carry=0.f;
  for(int t=stop-1;t>=start;--t){int64_t k=((int64_t)b*T+t)*D+d;float gt=de[k]+carry;local[k]=gt;float a=gate(za,b,t,d,asb,ast);carry=gt*a;p*=a;}
  int64_t i=((int64_t)b*NC+c)*D+d;ca[i]=p;cb[i]=carry;
@@ -107,7 +107,7 @@ template<typename scalar_t>
 __global__ void seg_bwd_correct(const scalar_t* za,const scalar_t* zv,const float* states,const float* s0,
  const float* local,const float* inc,scalar_t* dza,scalar_t* dzv,float* d0,
  int T,int D,int NC,int64_t asb,int64_t ast,int64_t vsb,int64_t vst){
- int d=threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
+ int d=blockIdx.z*blockDim.x+threadIdx.x,b=blockIdx.y,c=blockIdx.x;if(d>=D)return;
  float carry=inc[((int64_t)b*NC+c)*D+d],p=1.f;
  for(int t=min((c+1)*CHUNK,T)-1;t>=c*CHUNK;--t){
   int64_t k=((int64_t)b*T+t)*D+d;
@@ -128,7 +128,7 @@ static void valid(const torch::Tensor& a,const torch::Tensor& v,const torch::Ten
  TORCH_CHECK(a.scalar_type()==torch::kFloat16 || a.scalar_type()==torch::kFloat32,"A/V logits must be FP16 or FP32");
  TORCH_CHECK(s0.scalar_type()==torch::kFloat32 && s0.is_contiguous(),"state0 must be contiguous FP32");
  TORCH_CHECK(a.dim()==3 && v.sizes()==a.sizes(),"A/V logits [B,T,D]");
- TORCH_CHECK(a.size(1)>0 && a.size(2)>0 && a.size(2)<=THREADS,"T>0, D in 1..256");
+ TORCH_CHECK(a.size(0)>0 && a.size(0)<=65535 && a.size(1)>0 && a.size(2)>0 && a.size(2)<=int64_t(THREADS)*65535,"B in 1..65535, T>0, channel-tiled D");
  TORCH_CHECK(a.stride(2)==1 && v.stride(2)==1,"last-dimension contiguous required");
  TORCH_CHECK(s0.dim()==2 && s0.size(0)==a.size(0) && s0.size(1)==a.size(2),"state0 [B,D]");
  TORCH_CHECK(a.device()==v.device() && a.device()==s0.device(),"device mismatch");
@@ -148,7 +148,7 @@ static torch::Tensor launch_fwd(torch::Tensor a,torch::Tensor v,torch::Tensor s0
   else short_fwd<scalar_t,16><<<grid,512,0,st>>>(pa,pv,p0,po,T,D,a.stride(0),a.stride(1),v.stride(0),v.stride(1));
  }else{
   auto summary=torch::empty({2,B,NC,D},s0.options());auto ca=summary.select(0,0),cb=summary.select(0,1);
-  auto carries=torch::empty({B,NC,D},s0.options());dim3 grid(NC,B);
+  auto carries=torch::empty({B,NC,D},s0.options());dim3 grid(NC,B,(D+THREADS-1)/THREADS);
   seg_fwd_local<scalar_t><<<grid,THREADS,0,st>>>(pa,pv,po,ca.data_ptr<float>(),cb.data_ptr<float>(),T,D,NC,a.stride(0),a.stride(1),v.stride(0),v.stride(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   seg_fwd_carry<<<dim3((D+THREADS-1)/THREADS,B),THREADS,0,st>>>(ca.data_ptr<float>(),cb.data_ptr<float>(),p0,carries.data_ptr<float>(),D,NC);
@@ -170,7 +170,7 @@ static std::vector<torch::Tensor> launch_bwd(torch::Tensor a,torch::Tensor v,tor
   else short_bwd<scalar_t,16><<<grid,512,0,st>>>(pa,pv,states.data_ptr<float>(),s0.data_ptr<float>(),de.data_ptr<float>(),da.data_ptr<scalar_t>(),dv.data_ptr<scalar_t>(),d0.data_ptr<float>(),T,D,a.stride(0),a.stride(1),v.stride(0),v.stride(1));
  }else{
   auto summary=torch::empty({2,B,NC,D},s0.options());auto ca=summary.select(0,0),cb=summary.select(0,1);
-  auto carries=torch::empty({B,NC,D},s0.options());auto local=torch::empty_like(states);dim3 grid(NC,B);
+  auto carries=torch::empty({B,NC,D},s0.options());auto local=torch::empty_like(states);dim3 grid(NC,B,(D+THREADS-1)/THREADS);
   seg_bwd_local<scalar_t><<<grid,THREADS,0,st>>>(pa,de.data_ptr<float>(),local.data_ptr<float>(),ca.data_ptr<float>(),cb.data_ptr<float>(),T,D,NC,a.stride(0),a.stride(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   seg_bwd_carry<<<dim3((D+THREADS-1)/THREADS,B),THREADS,0,st>>>(ca.data_ptr<float>(),cb.data_ptr<float>(),carries.data_ptr<float>(),D,NC);
