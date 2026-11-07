@@ -177,6 +177,17 @@ if enabled("MLBRICKS_BUILD_BOLT_V2_STRICT"):
         cuda_source=csrc / "kernel.cu", lineinfo=True, disable_fma=True,
     ))
 
+# MLBRICKS_BOLT_DYNAMIC_GRAPH_BRANCH_INTEGRATION_V1
+# Experimental single-token, GPU-position dynamic BOLT reader. Always opt-in.
+if enabled("MLBRICKS_BUILD_BOLT_DYNAMIC_GRAPH"):
+    if not has_cuda_toolkit:
+        raise RuntimeError("MLBRICKS_BUILD_BOLT_DYNAMIC_GRAPH=1 requires a compatible CUDA toolkit and CUDA PyTorch")
+    csrc = ROOT / "mlbricks" / "bolt" / "native_dynamic"
+    extensions.append(_extension(
+        "mlbricks._bolt_dynamic_cuda", [csrc / "bindings.cpp"],
+        cuda_source=csrc / "kernel.cu", lineinfo=True, disable_fma=True,
+    ))
+
 # Optional accelerated BOLT state-memory kernels (production source build).
 # The original modern/native extension and its ABI remain unchanged.
 if enabled("MLBRICKS_BUILD_BOLT_ACCEL"):

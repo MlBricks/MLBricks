@@ -9,3 +9,7 @@ from .model import BoltModel
 from .presets import BoltStateMemory, BoltCache
 
 __all__ = ["Attention", "Bolt", "BoltAttention", "BoltModel", "BoltConfig", "BoltStateMemory", "BoltCache", "BoltPreset", "BoltPresetCache", "PostSoftmaxAVQ"]
+
+# MLBRICKS_BOLT_DYNAMIC_GRAPH_EXPORT_V1
+from .graph_engine import BoltGraphEngine
+__all__.append("BoltGraphEngine")
