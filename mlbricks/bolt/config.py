@@ -115,7 +115,7 @@ class BoltConfig(BoltModelSettings):
     state_memory: bool = True
     state_dim: int | None = None
     device: str = 'auto'
-    precision: str = 'auto'
+    precision: str = 'fp32'
     attention_scale: str | None = None
     memory_init: str | None = None
     projection: str = 'packed'

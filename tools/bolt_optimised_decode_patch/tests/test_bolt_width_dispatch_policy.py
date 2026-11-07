@@ -146,6 +146,16 @@ class TestPatchV2StrictCompatibility(unittest.TestCase):
     def test_v2_method_signature_keeps_amp_wrapping_native_strict_update(self):
         import ast, subprocess
         source = subprocess.check_output(['git','-C',str(REPO),'show','HEAD:mlbricks/bolt/presets.py'],text=True)
+        # MLBRICKS_COMMITTED_V2_TEST_FIX
+        # HEAD is already patched on optimised-decode; check idempotency there.
+        if '# MLBRICKS_BOLT_INFERENCE_AMP_V2' in source:
+            scripts=REPO/'tools/bolt_optimised_decode_patch/scripts'
+            sys.path.insert(0,str(scripts))
+            from apply_bolt_dispatch_patch import locate_presets
+            self.assertIn('_v2_strict.maybe_step',source)
+            self.assertEqual(source,locate_presets(source))
+            ast.parse(source)
+            return
         source=source.replace('def step(self,o,state):',
                               'def step(self,o,state,*,_v2_cache_inplace=False):',1)
         needle='        a,v,r=self.components(o)\n        if self.use_native and o.is_cuda'
@@ -155,7 +165,7 @@ class TestPatchV2StrictCompatibility(unittest.TestCase):
             if candidate is not None:return candidate
         a,v,r=self.components(o)
         if self.use_native and o.is_cuda""",1)
-        scripts=Path(__file__).resolve().parents[1]/'scripts'
+        scripts=REPO/'tools/bolt_optimised_decode_patch/scripts'
         sys.path.insert(0,str(scripts))
         from apply_bolt_dispatch_patch import locate_presets
         after=locate_presets(source)
@@ -164,5 +174,14 @@ class TestPatchV2StrictCompatibility(unittest.TestCase):
         self.assertLess(after.index('MLBRICKS_BOLT_INFERENCE_AMP_V2'),
                         after.index('_v2_strict.maybe_step'))
         self.assertEqual(after,locate_presets(after))
+
+
+
+class TestBOLTPrecisionDefault(unittest.TestCase):
+    def test_public_default_fp32_and_explicit_auto_supported(self):
+        from mlbricks import BoltConfig
+        self.assertEqual(BoltConfig(vocab_size=50257).precision,'fp32')
+        self.assertEqual(BoltConfig(vocab_size=50257,precision='auto').precision,'auto')
+        self.assertEqual(BoltConfig(vocab_size=50257,precision='fp16').precision,'fp16')
 
 if __name__=='__main__': unittest.main()
