@@ -12,6 +12,8 @@ The independent legacy rho-normalized BOLT path remains available in legacy mode
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
+# MLBRICKS_BOLT_NATIVE_FP16_CACHE_DTYPE_FIX_V1
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -181,8 +183,9 @@ class BoltStateMemory(nn.Module):
     def step(self,o,state,*,_v2_cache_inplace=False):
         # MLBRICKS_BOLT_INFERENCE_AMP_V2
         # FP16 projection GEMMs only; FP32 V2 Strict state/residual unchanged.
-        with torch.autocast(device_type=o.device.type, dtype=torch.float16,
-                            enabled=(self.project.weight.dtype == torch.float16 and o.device.type in ('cuda','cpu'))):
+        with (torch.autocast(device_type=o.device.type, dtype=torch.float16)
+              if self.project.weight.dtype == torch.float16 and o.device.type in ('cuda', 'cpu')
+              else nullcontext()):
             if o.device != self.project.weight.device:
                 o = o.to(self.project.weight.device, non_blocking=True)
             if state.device != o.device:
@@ -520,8 +523,9 @@ class BoltPreset(nn.Module):
     def decode_step(self,x,cache):
         # MLBRICKS_BOLT_INFERENCE_AMP_V2
         # FP16 projection GEMMs only; FP32 V2 Strict state/residual unchanged.
-        with torch.autocast(device_type=x.device.type, dtype=torch.float16,
-                            enabled=(self.out_proj.weight.dtype == torch.float16 and x.device.type in ('cuda','cpu'))):
+        with (torch.autocast(device_type=x.device.type, dtype=torch.float16)
+              if self.out_proj.weight.dtype == torch.float16 and x.device.type in ('cuda', 'cpu')
+              else nullcontext()):
             if x.ndim==2:x=x[:,None,:]
             if x.ndim!=3 or x.size(1)!=1 or x.size(-1)!=self.d_model:
                 raise ValueError('decode_step expects [B,1,D]')
@@ -534,6 +538,11 @@ class BoltPreset(nn.Module):
                 raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
             if self.avq is not None:self.avq.use_native=native
             q,k_now,c_now=self._project(x,start_pos=t)
+            # Native append stores C in the caller-selected cache precision.
+            if native and self.position is None and c_now.dtype != c_past.dtype:
+                if c_now.dtype not in (torch.float16, torch.float32) or c_past.dtype not in (torch.float16, torch.float32):
+                    raise TypeError('native BOLT cache requires FP16/FP32 current values')
+                c_now=c_now.to(dtype=c_past.dtype)
             c=torch.cat((c_past,c_now),dim=2)
             if self.position is not None:
                 # Stored unrotated C; rotate all historical Keys with their absolute positions.
@@ -556,8 +565,9 @@ class BoltPreset(nn.Module):
     def decode_with_cache(self,x,cache:BoltPresetCache,*,position:int):
         # MLBRICKS_BOLT_INFERENCE_AMP_V2
         # FP16 projection GEMMs only; FP32 V2 Strict state/residual unchanged.
-        with torch.autocast(device_type=x.device.type, dtype=torch.float16,
-                            enabled=(self.out_proj.weight.dtype == torch.float16 and x.device.type in ('cuda','cpu'))):
+        with (torch.autocast(device_type=x.device.type, dtype=torch.float16)
+              if self.out_proj.weight.dtype == torch.float16 and x.device.type in ('cuda', 'cpu')
+              else nullcontext()):
             if x.ndim==2:x=x[:,None,:]
             pos=int(position)
             if not isinstance(cache,BoltPresetCache):
@@ -571,6 +581,11 @@ class BoltPreset(nn.Module):
                 raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
             if self.avq is not None:self.avq.use_native=native
             q,_,c_now=self._project(x,start_pos=pos)
+            # Native C input must match the stored cache dtype; never cast Q.
+            if native and self.position is None and c_now.dtype != cache.c.dtype:
+                if c_now.dtype not in (torch.float16, torch.float32) or cache.c.dtype not in (torch.float16, torch.float32):
+                    raise TypeError('native BOLT cache requires FP16/FP32 current values')
+                c_now=c_now.to(dtype=cache.c.dtype)
             if not (native and _native.get_extension() is not None and self.position is None):
                 cache.c[:,:,pos:pos+1,:].copy_(c_now)
             c=cache.c[:,:,:pos+1,:]
