@@ -1,0 +1,330 @@
+diff --git a/mlbricks/bolt/README_NATIVE.md b/mlbricks/bolt/README_NATIVE.md
+index b65b997..ed4ef52 100644
+--- a/mlbricks/bolt/README_NATIVE.md
++++ b/mlbricks/bolt/README_NATIVE.md
+@@ -118,3 +118,24 @@ multiply and final residual addition in FP32; the FP16 path is unchanged.
+ This fixes the previously observed `selected=0` fallback during full-model
+ T4 qualification. A new GPU qualification is required; successful compilation
+ and direct FP16 tests alone are not sufficient.
++
++
++### Experimental split-context Direct-Q decode
++
++Set `MLBRICKS_BOLT_SPLIT_CONTEXT_READ=1` only after building the modern native
++CUDA extension (`MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1`) and completing device
++parity tests. The original `decode_append` remains the default. Optional
++`MLBRICKS_BOLT_SPLIT_MIN_TOKENS=4096` and
++`MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS=512` control the context crossover.
++
++The split path preserves FP32 Q and FP32 attention output, supports FP16/FP32
++compact-C caches and R=16/32, and uses the existing FP32 scratch allocation
++for online-softmax partials. A dedicated cache-append kernel precedes the
++multi-CTA read to avoid a cross-CTA append/read race. A final merge combines
++partial denominators and unnormalized weighted sums. It uses **three CUDA
++launches per attention layer**, so short-context latency may be worse.
++No Triton or new dependency. No change to training, model state formats,
++PyTorch fallback, public BOLT constructors, or V2 strict AVQ update.
++
++For reproducibility: benchmark and confirm long-context numerical tolerance
++and trained-checkpoint generation before enabling in a production release.
+diff --git a/mlbricks/bolt/native_backend.py b/mlbricks/bolt/native_backend.py
+index 23ac957..fd2e6e8 100644
+--- a/mlbricks/bolt/native_backend.py
++++ b/mlbricks/bolt/native_backend.py
+@@ -89,7 +89,35 @@ def avq_step(a,v,previous):
+     return get_extension().avq_decode_state(a.contiguous(),v.contiguous(),previous.contiguous())
+ 
+ 
++_SPLIT_READ_CALLS = 0
++
++def split_read_calls() -> int:
++    """Diagnostic counter for actual split CUDA calls in this Python process."""
++    return _SPLIT_READ_CALLS
++
++
+ def decode_append(q,c_now,cache,scratch,position,scale):
+-    return get_extension().decode_append(q.contiguous(),c_now.contiguous(),cache,scratch, int(position),float(scale))
++    """Native attention read; split CUDA enabled explicitly for long contexts.
++
++    Set MLBRICKS_BOLT_SPLIT_CONTEXT_READ=1, optional MIN_TOKENS and CHUNK.
++    No change to default behavior or PyTorch reference path.
++    """
++    global _SPLIT_READ_CALLS
++    ext = get_extension()
++    position = int(position)
++    scale = float(scale)
++    use_split = os.getenv("MLBRICKS_BOLT_SPLIT_CONTEXT_READ", "0").lower() in ("1","true","yes","on")
++    if use_split:
++        min_tokens = int(os.getenv("MLBRICKS_BOLT_SPLIT_MIN_TOKENS", "4096"))
++        chunk = int(os.getenv("MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS", "512"))
++        if position + 1 >= min_tokens:
++            # Fail closed: never silently fall back when explicitly requesting split.
++            if ext is None or not hasattr(ext, "decode_append_split"):
++                raise RuntimeError("Native split-context BOLT CUDA extension unavailable")
++            y = ext.decode_append_split(q.contiguous(), c_now.contiguous(), cache,
++                                        scratch, position, scale, chunk)
++            _SPLIT_READ_CALLS += 1
++            return y
++    return ext.decode_append(q.contiguous(),c_now.contiguous(),cache,scratch,position,scale)
+ 
+ __all__=['get_extension','supports_features','features','avq_scan','avq_step','decode_append']
+diff --git a/mlbricks/bolt/native_modern/bindings.cpp b/mlbricks/bolt/native_modern/bindings.cpp
+index 30c78f3..2591da6 100644
+--- a/mlbricks/bolt/native_modern/bindings.cpp
++++ b/mlbricks/bolt/native_modern/bindings.cpp
+@@ -10,10 +10,15 @@ torch::Tensor avq_decode_state_cuda(torch::Tensor a, torch::Tensor v, torch::Ten
+ torch::Tensor bolt_decode_append_cuda(torch::Tensor q, torch::Tensor c_new, torch::Tensor cache,
+                                        torch::Tensor scores, int64_t position, double scale);
+ 
++torch::Tensor bolt_decode_append_split_cuda(torch::Tensor q,torch::Tensor c_new,
++    torch::Tensor cache,torch::Tensor scores,int64_t position,double scale,int64_t chunk_tokens);
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("features_forward", &bolt_features_forward_cuda, "Direct-Q gated BOLT features CUDA (no learned P)");
+     m.def("avq_scan_forward", &avq_scan_forward_cuda, "AVQ recurrent scan forward CUDA");
+     m.def("avq_scan_backward", &avq_scan_backward_cuda, "AVQ recurrent scan backward CUDA");
+     m.def("avq_decode_state", &avq_decode_state_cuda, "AVQ recurrent decode step CUDA");
+     m.def("decode_append", &bolt_decode_append_cuda, "BOLT fused cache append and attention decode CUDA");
++    m.def("decode_append_split", &bolt_decode_append_split_cuda,
++          "Opt-in split-context online-softmax BOLT decode CUDA (separate append)");
+ }
+diff --git a/mlbricks/bolt/native_modern/kernels.cu b/mlbricks/bolt/native_modern/kernels.cu
+index 300cbe1..f710f72 100644
+--- a/mlbricks/bolt/native_modern/kernels.cu
++++ b/mlbricks/bolt/native_modern/kernels.cu
+@@ -120,6 +120,106 @@ __global__ void bolt_decode_kernel(const float *__restrict__ q,
+         output[now+d]=weighted*inv_denom;
+     }
+ }
++
++// Opt-in split-context exact online-softmax attention read for the existing
++// Direct-Q cache. It preserves the public decode_append API and FP32 O output.
++// Cross-CTA safety: append MUST launch separately on the same CUDA stream.
++// Cache and scratch are reused; the split path allocates no extra GPU tensors.
++// The source model and AVQ mathematics are unchanged.
++template <typename scalar_t>
++__global__ void bolt_split_append_kernel(const scalar_t* __restrict__ c_now,
++                                         scalar_t* __restrict__ cache,
++                                         int64_t capacity, int64_t width,
++                                         int64_t position) {
++    const int bh=blockIdx.x;
++    const int lane=threadIdx.x;
++    if (lane<width)
++        cache[(int64_t(bh)*capacity+position)*width+lane]=c_now[int64_t(bh)*width+lane];
++}
++
++// Each CTA works on one (batch,head,chunk). Eight warps work on independent
++// tokens, maintaining online-softmax (max, denominator, weighted accumulator).
++// Scratch stores [max, denominator, weighted NUMERATOR] for every chunk.
++template <int R, typename scalar_t>
++__global__ void bolt_split_read_kernel(
++    const float* __restrict__ q,
++    const scalar_t* __restrict__ cache,
++    float* __restrict__ partial,
++    int64_t capacity, int64_t length, int chunks,
++    int chunk_tokens, float scale) {
++    constexpr int NW=8;
++    const int chunk_id=int(blockIdx.x)%chunks;
++    const int bh=int(blockIdx.x)/chunks;
++    const int warp=threadIdx.x/32;
++    const int lane=threadIdx.x%32;
++    const int64_t start=int64_t(chunk_id)*chunk_tokens;
++    const int64_t last=start+int64_t(chunk_tokens);
++    const int64_t end=(last<length)?last:length;
++    const int64_t base=int64_t(bh)*capacity*R;
++    const float qv=(lane<R)?q[int64_t(bh)*R+lane]:0.f;
++    float local_m=-INFINITY;
++    float local_z=0.f;
++    float local_a=0.f;
++    for(int64_t t=start+warp;t<end;t+=NW){
++        float val=(lane<R)?static_cast<float>(cache[base+t*R+lane]):0.f;
++        float dot=qv*val;
++#pragma unroll
++        for(int off=16;off>0;off/=2)
++            dot+=__shfl_down_sync(0xffffffff,dot,off);
++        const float score=__shfl_sync(0xffffffff,dot,0)*scale;
++        const float mm=fmaxf(local_m,score);
++        const float fa=(local_m==-INFINITY)?0.f:expf(local_m-mm);
++        const float fb=expf(score-mm);
++        local_z=local_z*fa+fb;
++        local_a=local_a*fa+fb*val;
++        local_m=mm;
++    }
++    __shared__ float warp_m[NW],warp_z[NW],warp_a[NW][32];
++    __shared__ float weights[NW];
++    __shared__ float max_m, total_z;
++    if(lane==0){warp_m[warp]=local_m;warp_z[warp]=local_z;}
++    warp_a[warp][lane]=local_a;
++    __syncthreads();
++    if(threadIdx.x==0){
++        float m=-INFINITY;
++        for(int w=0;w<NW;++w) m=fmaxf(m,warp_m[w]);
++        float z=0.f;
++        for(int w=0;w<NW;++w){
++            const float f=(warp_m[w]==-INFINITY)?0.f:expf(warp_m[w]-m);
++            weights[w]=f;
++            z+=f*warp_z[w];
++        }
++        max_m=m;total_z=z;
++    }
++    __syncthreads();
++    float* dst=partial+int64_t(bh)*capacity+int64_t(chunk_id)*(R+2);
++    if(threadIdx.x==0){dst[0]=max_m;dst[1]=total_z;}
++    if(threadIdx.x<R){
++        float weighted=0.f;
++        for(int w=0;w<NW;++w)weighted+=weights[w]*warp_a[w][threadIdx.x];
++        dst[2+threadIdx.x]=weighted;
++    }
++}
++
++template <int R>
++__global__ void bolt_split_merge_kernel(const float* __restrict__ partial,
++                                        float* __restrict__ output,
++                                        int64_t capacity,int chunks){
++    const int bh=blockIdx.x;
++    const int lane=threadIdx.x;
++    const float* src=partial+int64_t(bh)*capacity;
++    float m=-INFINITY;
++    for(int k=0;k<chunks;++k)m=fmaxf(m,src[int64_t(k)*(R+2)]);
++    float denom=0.f, numerator=0.f;
++    for(int k=0;k<chunks;++k){
++        const float mk=src[int64_t(k)*(R+2)];
++        const float f=(mk==-INFINITY)?0.f:expf(mk-m);
++        denom+=f*src[int64_t(k)*(R+2)+1];
++        if(lane<R)numerator+=f*src[int64_t(k)*(R+2)+2+lane];
++    }
++    if(lane<R)output[int64_t(bh)*R+lane]=numerator/fmaxf(denom,1.0e-30f);
++}
++
+ }
+ 
+ // No P, no query folding, and no native P-gradient kernel.
+@@ -207,3 +307,66 @@ torch::Tensor bolt_decode_append_cuda(torch::Tensor q,torch::Tensor current,torc
+     });
+     C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
+ }
++
++
++// Separate entry point: default decode_append remains untouched.
++// scratch [B,H,capacity] FP32 is repurposed as chunk partials only in this path.
++torch::Tensor bolt_decode_append_split_cuda(torch::Tensor q, torch::Tensor current,
++    torch::Tensor cache, torch::Tensor scores, int64_t position,
++    double scale, int64_t chunk_tokens) {
++    c10::cuda::CUDAGuard device_guard(q.device());
++    check_cuda_contig(q,"q"); check_cuda_contig(current,"current");
++    check_cuda_contig(cache,"cache"); check_cuda_contig(scores,"scratch");
++    TORCH_CHECK(q.device()==current.device() && q.device()==cache.device() &&
++                q.device()==scores.device(),"split decode inputs must share device");
++    TORCH_CHECK(q.scalar_type()==torch::kFloat32,"split decode query must be FP32");
++    check_f16_f32(cache,"cache");
++    TORCH_CHECK(current.scalar_type()==cache.scalar_type(),"current and cache dtype mismatch");
++    TORCH_CHECK(q.dim()==4 && q.size(2)==1 && q.sizes()==current.sizes(),
++                "split decode q/current require matching [B,H,1,R]");
++    TORCH_CHECK(cache.dim()==4 && cache.size(0)==q.size(0) &&
++                cache.size(1)==q.size(1) && cache.size(3)==q.size(3),
++                "split decode cache dimension mismatch");
++    TORCH_CHECK(scores.dim()==3 && scores.size(0)==q.size(0) &&
++                scores.size(1)==q.size(1) && scores.size(2)==cache.size(2) &&
++                scores.scalar_type()==torch::kFloat32,"scratch requires FP32 [B,H,capacity]");
++    TORCH_CHECK(position>=0 && position<cache.size(2),"position outside cache");
++    TORCH_CHECK(q.size(3)==16 || q.size(3)==32,"split decode requires BOLT-16/32");
++    TORCH_CHECK(chunk_tokens>=128 && chunk_tokens<=4096 && chunk_tokens%8==0,
++                "chunk must be 128..4096 and divisible by 8");
++    const int64_t length=position+1;
++    const int64_t chunks=(length+chunk_tokens-1)/chunk_tokens;
++    TORCH_CHECK(chunks*(q.size(3)+2)<=scores.size(2),
++                "scratch capacity insufficient for chunk partials");
++    TORCH_CHECK(q.size(0)*q.size(1)*chunks<=2147483647LL,"too many CUDA blocks");
++    auto output=torch::empty(q.sizes(),q.options().dtype(torch::kFloat32));
++    const int bh=int(q.size(0)*q.size(1));
++    const int R=int(q.size(3));
++    const int64_t capacity=cache.size(2);
++    cudaStream_t stream=at::cuda::getCurrentCUDAStream().stream();
++    AT_DISPATCH_FLOATING_TYPES_AND_HALF(cache.scalar_type(),"bolt_split_decode",[&]{
++        // Cross-block memory dependency requires this independent kernel launch.
++        bolt_split_append_kernel<scalar_t><<<bh,32,0,stream>>>(
++            current.data_ptr<scalar_t>(),cache.data_ptr<scalar_t>(),capacity,R,position);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        if(R==16){
++            bolt_split_read_kernel<16,scalar_t><<<bh*chunks,256,0,stream>>>(
++                q.data_ptr<float>(),cache.data_ptr<scalar_t>(),scores.data_ptr<float>(),
++                capacity,length,int(chunks),int(chunk_tokens),float(scale));
++        }else{
++            bolt_split_read_kernel<32,scalar_t><<<bh*chunks,256,0,stream>>>(
++                q.data_ptr<float>(),cache.data_ptr<scalar_t>(),scores.data_ptr<float>(),
++                capacity,length,int(chunks),int(chunk_tokens),float(scale));
++        }
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    });
++    if(R==16){
++        bolt_split_merge_kernel<16><<<bh,32,0,stream>>>(
++            scores.data_ptr<float>(),output.data_ptr<float>(),capacity,int(chunks));
++    }else{
++        bolt_split_merge_kernel<32><<<bh,32,0,stream>>>(
++            scores.data_ptr<float>(),output.data_ptr<float>(),capacity,int(chunks));
++    }
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    return output;
++}
+diff --git a/tests/test_bolt_split_context_cuda.py b/tests/test_bolt_split_context_cuda.py
+new file mode 100644
+index 0000000..e1b56f0
+--- /dev/null
++++ b/tests/test_bolt_split_context_cuda.py
+@@ -0,0 +1,56 @@
++"""Opt-in multi-CTA native BOLT split-context regression suite."""
++import os
++import pytest
++import torch
++from mlbricks.bolt import native_backend
++
++
++def test_split_opt_in_off_by_default(monkeypatch):
++    monkeypatch.delenv("MLBRICKS_BOLT_SPLIT_CONTEXT_READ", raising=False)
++    assert not os.getenv("MLBRICKS_BOLT_SPLIT_CONTEXT_READ")
++    assert isinstance(native_backend.split_read_calls(), int)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("width", [16, 32])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
++@pytest.mark.parametrize("length", [512, 4096, 8192, 32768])
++def test_split_read_matches_float32_reference(width, dtype, length):
++    ext = native_backend.get_extension()
++    assert ext is not None and hasattr(ext, "decode_append_split"), "Build modern native CUDA with split"
++    torch.manual_seed(2000+width+length)
++    device="cuda:0"
++    capacity=length+4
++    cache=(torch.randn((1,12,capacity,width),device=device,dtype=dtype)*0.02).contiguous()
++    q=(torch.randn((1,12,1,width),device=device,dtype=torch.float32)*0.2).contiguous()
++    c_new=(torch.randn((1,12,1,width),device=device,dtype=dtype)*0.02).contiguous()
++    scratch=torch.empty((1,12,capacity),device=device,dtype=torch.float32)
++    scale=width**(-0.5)
++    out=ext.decode_append_split(q,c_new,cache,scratch,length,scale,512)
++    torch.cuda.synchronize()
++    assert out.dtype==torch.float32 and out.shape==q.shape
++    torch.testing.assert_close(cache[:,:,length:length+1,:],c_new,rtol=0,atol=0)
++    scores=torch.einsum('bhqd,bhkd->bhqk',q.float(),cache[:,:,:length+1,:].float())*scale
++    weights=torch.softmax(scores,dim=-1)
++    expected=torch.einsum('bhqk,bhkd->bhqd',weights,cache[:,:,:length+1,:].float())
++    torch.testing.assert_close(out,expected,rtol=0.003,atol=0.0003)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("width", [16,32])
++def test_split_read_matches_existing_native(width):
++    ext = native_backend.get_extension()
++    assert ext is not None and hasattr(ext, "decode_append_split")
++    torch.manual_seed(7500+width)
++    context=8192
++    q=torch.randn((1,12,1,width),device='cuda',dtype=torch.float32)*.2
++    new=torch.randn((1,12,1,width),device='cuda',dtype=torch.float16)*.03
++    src=torch.randn((1,12,context+1,width),device='cuda',dtype=torch.float16)*.03
++    src0=src.clone();src1=src.clone()
++    scratch0=torch.empty((1,12,context+1),device='cuda',dtype=torch.float32)
++    scratch1=torch.empty_like(scratch0)
++    scale=width**(-0.5)
++    y0=ext.decode_append(q.contiguous(),new.contiguous(),src0,scratch0,context,scale)
++    y1=ext.decode_append_split(q.contiguous(),new.contiguous(),src1,scratch1,context,scale,512)
++    torch.testing.assert_close(y1,y0,rtol=0.003,atol=0.0003)
++    torch.testing.assert_close(src1,src0,rtol=0,atol=0)

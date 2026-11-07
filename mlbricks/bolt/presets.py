@@ -179,26 +179,30 @@ class BoltStateMemory(nn.Module):
         return (enhanced,s[:,-1,:].contiguous()) if return_state else enhanced
 
     def step(self,o,state,*,_v2_cache_inplace=False):
-        if o.device != self.project.weight.device:
-            o = o.to(self.project.weight.device, non_blocking=True)
-        if state.device != o.device:
-            state = state.to(o.device, non_blocking=True)
-        # Optional V2 strict native one-token path. Keep the original torch
-        # projection; do not substitute the V3 GEMV reduction. This path is
-        # inference-only and never alters checkpoint/state-dict schemas.
-        candidate = _v2_strict.maybe_step(
-            self, o, state, inplace_cache=_v2_cache_inplace
-        )
-        if candidate is not None:
-            return candidate
-        a,v,r=self.components(o)
-        if self.use_native and o.is_cuda and _native.get_extension() is not None:
-            s=_native.avq_step(a[:,0,:],v[:,0,:],state.float())
-        else:
-            s=a[:,0,:]*state.float()+v[:,0,:]
-        h=(self.norm(s)*(1.+r[:,0,:]))[:,None,:]
-        update=self.back(h).to(o.dtype)
-        return o+self.gamma.to(o.dtype)*update, s
+        # MLBRICKS_BOLT_INFERENCE_AMP_V2
+        # FP16 projection GEMMs only; FP32 V2 Strict state/residual unchanged.
+        with torch.autocast(device_type=o.device.type, dtype=torch.float16,
+                            enabled=(self.project.weight.dtype == torch.float16 and o.device.type in ('cuda','cpu'))):
+            if o.device != self.project.weight.device:
+                o = o.to(self.project.weight.device, non_blocking=True)
+            if state.device != o.device:
+                state = state.to(o.device, non_blocking=True)
+            # Optional V2 strict native one-token path. Keep the original torch
+            # projection; do not substitute the V3 GEMV reduction. This path is
+            # inference-only and never alters checkpoint/state-dict schemas.
+            candidate = _v2_strict.maybe_step(
+                self, o, state, inplace_cache=_v2_cache_inplace
+            )
+            if candidate is not None:
+                return candidate
+            a,v,r=self.components(o)
+            if self.use_native and o.is_cuda and _native.get_extension() is not None:
+                s=_native.avq_step(a[:,0,:],v[:,0,:],state.float())
+            else:
+                s=a[:,0,:]*state.float()+v[:,0,:]
+            h=(self.norm(s)*(1.+r[:,0,:]))[:,None,:]
+            update=self.back(h).to(o.dtype)
+            return o+self.gamma.to(o.dtype)*update, s
 
 
 class BoltPreset(nn.Module):
@@ -514,72 +518,80 @@ class BoltPreset(nn.Module):
 
     @torch.no_grad()
     def decode_step(self,x,cache):
-        if x.ndim==2:x=x[:,None,:]
-        if x.ndim!=3 or x.size(1)!=1 or x.size(-1)!=self.d_model:
-            raise ValueError('decode_step expects [B,1,D]')
-        if not isinstance(cache,(tuple,list)) or len(cache)!=2:
-            raise TypeError('modern Bolt cache must be (c_history, avq_state)')
-        c_past,state=cache
-        t=int(c_past.size(2))
-        native=self._native_enabled(x)
-        if native and self.position is not None and self.backend=='native':
-            raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
-        if self.avq is not None:self.avq.use_native=native
-        q,k_now,c_now=self._project(x,start_pos=t)
-        c=torch.cat((c_past,c_now),dim=2)
-        if self.position is not None:
-            # Stored unrotated C; rotate all historical Keys with their absolute positions.
-            keys=self.position(c,start_pos=0)
-        else:keys=c
-        if native and _native.get_extension() is not None and self.position is None:
-            scratch=torch.empty((*c.shape[:2], c.shape[2]),device=c.device,dtype=torch.float32)
-            o=_native.decode_append(q.contiguous(),c_now.contiguous(),c.contiguous(),scratch,t,self._scale())
-        else:
-            if native and self.backend == 'native' and self.position is not None:
-                raise RuntimeError('Native cached BOLT decode does not yet support RoPE; use backend=auto')
-            o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
-        o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
-        if self.avq is not None:
-            if state is None:raise ValueError('missing AVQ state')
-            o,state=self.avq.step(o,state)
-        return self.out_proj(o),(c,state)
+        # MLBRICKS_BOLT_INFERENCE_AMP_V2
+        # FP16 projection GEMMs only; FP32 V2 Strict state/residual unchanged.
+        with torch.autocast(device_type=x.device.type, dtype=torch.float16,
+                            enabled=(self.out_proj.weight.dtype == torch.float16 and x.device.type in ('cuda','cpu'))):
+            if x.ndim==2:x=x[:,None,:]
+            if x.ndim!=3 or x.size(1)!=1 or x.size(-1)!=self.d_model:
+                raise ValueError('decode_step expects [B,1,D]')
+            if not isinstance(cache,(tuple,list)) or len(cache)!=2:
+                raise TypeError('modern Bolt cache must be (c_history, avq_state)')
+            c_past,state=cache
+            t=int(c_past.size(2))
+            native=self._native_enabled(x)
+            if native and self.position is not None and self.backend=='native':
+                raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
+            if self.avq is not None:self.avq.use_native=native
+            q,k_now,c_now=self._project(x,start_pos=t)
+            c=torch.cat((c_past,c_now),dim=2)
+            if self.position is not None:
+                # Stored unrotated C; rotate all historical Keys with their absolute positions.
+                keys=self.position(c,start_pos=0)
+            else:keys=c
+            if native and _native.get_extension() is not None and self.position is None:
+                scratch=torch.empty((*c.shape[:2], c.shape[2]),device=c.device,dtype=torch.float32)
+                o=_native.decode_append(q.contiguous(),c_now.contiguous(),c.contiguous(),scratch,t,self._scale())
+            else:
+                if native and self.backend == 'native' and self.position is not None:
+                    raise RuntimeError('Native cached BOLT decode does not yet support RoPE; use backend=auto')
+                o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
+            o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
+            if self.avq is not None:
+                if state is None:raise ValueError('missing AVQ state')
+                o,state=self.avq.step(o,state)
+            return self.out_proj(o),(c,state)
 
     @torch.no_grad()
     def decode_with_cache(self,x,cache:BoltPresetCache,*,position:int):
-        if x.ndim==2:x=x[:,None,:]
-        pos=int(position)
-        if not isinstance(cache,BoltPresetCache):
-            raise TypeError('expected BoltPresetCache')
-        if pos !=cache.length:
-            raise ValueError('position must match cache.length')
-        if pos<0 or pos>=cache.capacity:
-            raise ValueError('decode position exceeds cache capacity')
-        native=self._native_enabled(x)
-        if native and self.position is not None and self.backend=='native':
-            raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
-        if self.avq is not None:self.avq.use_native=native
-        q,_,c_now=self._project(x,start_pos=pos)
-        if not (native and _native.get_extension() is not None and self.position is None):
-            cache.c[:,:,pos:pos+1,:].copy_(c_now)
-        c=cache.c[:,:,:pos+1,:]
-        keys=self.position(c,start_pos=0) if self.position is not None else c
-        if native and _native.get_extension() is not None and self.position is None:
-            if cache.scratch is None:
-                cache.scratch=torch.empty((*cache.c.shape[:2],cache.capacity),device=x.device,dtype=torch.float32)
-            o=_native.decode_append(q.contiguous(),c_now.contiguous(),cache.c,cache.scratch,pos,self._scale())
-        else:
-            if native and self.backend == 'native' and self.position is not None:
-                raise RuntimeError('Native cached BOLT decode does not yet support RoPE; use backend=auto')
-            o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
-        o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
-        if self.avq is not None:
-            # Reuse the already owned cache.state in the optional V2 strict
-            # path, without a second GPU copy. The fallback remains functional.
-            o,s=self.avq.step(o,cache.state,_v2_cache_inplace=True)
-            if s.data_ptr() != cache.state.data_ptr():
-                cache.state.copy_(s)
-        cache.length=pos+1
-        return self.out_proj(o)
+        # MLBRICKS_BOLT_INFERENCE_AMP_V2
+        # FP16 projection GEMMs only; FP32 V2 Strict state/residual unchanged.
+        with torch.autocast(device_type=x.device.type, dtype=torch.float16,
+                            enabled=(self.out_proj.weight.dtype == torch.float16 and x.device.type in ('cuda','cpu'))):
+            if x.ndim==2:x=x[:,None,:]
+            pos=int(position)
+            if not isinstance(cache,BoltPresetCache):
+                raise TypeError('expected BoltPresetCache')
+            if pos !=cache.length:
+                raise ValueError('position must match cache.length')
+            if pos<0 or pos>=cache.capacity:
+                raise ValueError('decode position exceeds cache capacity')
+            native=self._native_enabled(x)
+            if native and self.position is not None and self.backend=='native':
+                raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
+            if self.avq is not None:self.avq.use_native=native
+            q,_,c_now=self._project(x,start_pos=pos)
+            if not (native and _native.get_extension() is not None and self.position is None):
+                cache.c[:,:,pos:pos+1,:].copy_(c_now)
+            c=cache.c[:,:,:pos+1,:]
+            keys=self.position(c,start_pos=0) if self.position is not None else c
+            if native and _native.get_extension() is not None and self.position is None:
+                if cache.scratch is None:
+                    cache.scratch=torch.empty((*cache.c.shape[:2],cache.capacity),device=x.device,dtype=torch.float32)
+                o=_native.decode_append(q.contiguous(),c_now.contiguous(),cache.c,cache.scratch,pos,self._scale())
+            else:
+                if native and self.backend == 'native' and self.position is not None:
+                    raise RuntimeError('Native cached BOLT decode does not yet support RoPE; use backend=auto')
+                o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
+            o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
+            if self.avq is not None:
+                # Reuse the already owned cache.state in the optional V2 strict
+                # path, without a second GPU copy. The fallback remains functional.
+                o,s=self.avq.step(o,cache.state,_v2_cache_inplace=True)
+                if s.data_ptr() != cache.state.data_ptr():
+                    cache.state.copy_(s)
+            cache.length=pos+1
+            return self.out_proj(o)
 
     lightning_prefill=prefill_with_cache
     lightning_step=decode_step

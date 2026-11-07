@@ -118,3 +118,24 @@ multiply and final residual addition in FP32; the FP16 path is unchanged.
 This fixes the previously observed `selected=0` fallback during full-model
 T4 qualification. A new GPU qualification is required; successful compilation
 and direct FP16 tests alone are not sufficient.
+
+
+### Experimental split-context Direct-Q decode
+
+Set `MLBRICKS_BOLT_SPLIT_CONTEXT_READ=1` only after building the modern native
+CUDA extension (`MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1`) and completing device
+parity tests. The original `decode_append` remains the default. Optional
+`MLBRICKS_BOLT_SPLIT_MIN_TOKENS=4096` and
+`MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS=512` control the context crossover.
+
+The split path preserves FP32 Q and FP32 attention output, supports FP16/FP32
+compact-C caches and R=16/32, and uses the existing FP32 scratch allocation
+for online-softmax partials. A dedicated cache-append kernel precedes the
+multi-CTA read to avoid a cross-CTA append/read race. A final merge combines
+partial denominators and unnormalized weighted sums. It uses **three CUDA
+launches per attention layer**, so short-context latency may be worse.
+No Triton or new dependency. No change to training, model state formats,
+PyTorch fallback, public BOLT constructors, or V2 strict AVQ update.
+
+For reproducibility: benchmark and confirm long-context numerical tolerance
+and trained-checkpoint generation before enabling in a production release.

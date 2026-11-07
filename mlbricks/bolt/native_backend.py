@@ -89,7 +89,75 @@ def avq_step(a,v,previous):
     return get_extension().avq_decode_state(a.contiguous(),v.contiguous(),previous.contiguous())
 
 
-def decode_append(q,c_now,cache,scratch,position,scale):
-    return get_extension().decode_append(q.contiguous(),c_now.contiguous(),cache,scratch, int(position),float(scale))
+_SPLIT_READ_CALLS = 0
+
+def split_read_calls() -> int:
+    """Diagnostic counter for actual split CUDA calls in this Python process."""
+    return _SPLIT_READ_CALLS
+
+
+# MLBRICKS_BOLT_WIDTH_DISPATCH_V1
+# Conservative experimental policy from two-GPU synthetic + Wikipedia runs.
+# These widths are PER HEAD latent dimensions, not total attention/AVQ width.
+_BOLT_SPLIT_THRESHOLDS = {16: 1536, 32: 896}
+
+
+def split_read_threshold(latent_dim: int) -> int:
+    """Resolve native split-reader crossover; explicit env override wins.
+
+    MLBRICKS_BOLT_SPLIT_MIN_TOKENS='auto' or unset: measured per-width policy.
+    Any positive integer: manual global threshold for controlled benchmarking.
+    Unknown dimensions keep the old 8192-token conservative threshold.
+    """
+    latent_dim = int(latent_dim)
+    setting = os.getenv('MLBRICKS_BOLT_SPLIT_MIN_TOKENS', 'auto').strip().lower()
+    if setting in ('auto', ''):
+        return _BOLT_SPLIT_THRESHOLDS.get(latent_dim, 8192)
+    try:
+        n = int(setting)
+    except ValueError as exc:
+        raise ValueError('MLBRICKS_BOLT_SPLIT_MIN_TOKENS must be auto or a positive integer') from exc
+    if n <= 0:
+        raise ValueError('MLBRICKS_BOLT_SPLIT_MIN_TOKENS must be positive')
+    return n
+
+
+def decode_append(q, c_now, cache, scratch, position, scale):
+    """Decode with existing native kernels; optionally use per-width split read.
+
+    Default remains LEGACY when MLBRICKS_BOLT_SPLIT_CONTEXT_READ is unset/0.
+    With opt-in 1, R=16 -> split from 1536; R=32 -> split from 896.
+    Does not alter AVQ recurrence, CUDA kernels, cache dtype, or public API.
+    """
+    global _SPLIT_READ_CALLS
+    ext = get_extension()
+    position = int(position)
+    scale = float(scale)
+    enabled = os.getenv('MLBRICKS_BOLT_SPLIT_CONTEXT_READ', '0').strip().lower()
+    if enabled in ('1', 'true', 'yes', 'on'):
+        # Q shape in the native Direct-Q reader is [B, H, 1, R].
+        # R is the 16/32 cache latent width, NOT the AVQ state width.
+        if q.ndim != 4 or q.shape[-2] != 1:
+            raise ValueError('split attention requires query [batch, heads, 1, latent_dim]')
+        threshold = split_read_threshold(q.shape[-1])
+        if position + 1 >= threshold:
+            if ext is None or not hasattr(ext, 'decode_append_split'):
+                raise RuntimeError('Native split-context BOLT CUDA extension unavailable')
+            try:
+                chunk = int(os.getenv('MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS', '512'))
+            except ValueError as exc:
+                raise ValueError('MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS must be a positive integer') from exc
+            if chunk <= 0:
+                raise ValueError('MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS must be positive')
+            # Backend already checks capacity, cache type, and supported R.
+            result = ext.decode_append_split(q.contiguous(), c_now.contiguous(),
+                                             cache, scratch, position, scale, chunk)
+            _SPLIT_READ_CALLS += 1
+            return result
+    if ext is None or not hasattr(ext, 'decode_append'):
+        raise RuntimeError('Native BOLT decode extension unavailable')
+    return ext.decode_append(q.contiguous(), c_now.contiguous(),
+                             cache, scratch, position, scale)
+
 
 __all__=['get_extension','supports_features','features','avq_scan','avq_step','decode_append']
