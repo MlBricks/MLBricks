@@ -13,6 +13,7 @@ from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
 from ..position import RoPE
 from .precision import native_bf16_supported
+from .graph_policy import normalize_graph_policy, layer_graph_permission
 
 from .._backend import (
     WORKSPACES,
@@ -613,6 +614,7 @@ class Bolt(nn.Module):
         use_sdpa: bool = True,
         position=None,
         native_full_sequence: bool = False,
+        graph: str | bool = "auto",
         profile: str | None = None,
         state_memory: bool = True,
         device: str = 'auto',
@@ -641,6 +643,7 @@ class Bolt(nn.Module):
                 raise ValueError('profile cannot be used with legacy mode')
             mode = 'quality' if mode is None else mode
         self.profile = profile
+        self.graph = normalize_graph_policy(graph)
         self.precision = str(precision).lower()
         if self.precision not in ('auto','fp16','bf16','fp32'):
             raise ValueError('precision must be auto, fp16, bf16 or fp32')
@@ -695,7 +698,7 @@ class Bolt(nn.Module):
             self._modern = BoltPreset(
                 d_model, num_heads, mode=target_mode, cache=cache, avq_dim=avq_dim,
                 bias=bias, dropout=dropout, causal=causal, backend=backend,
-                position=position,
+                graph=self.graph, position=position,
                 projection=projection or ('packed' if profile is not None else 'separate'),
                 attention_scale=attention_scale or ('latent' if profile is not None else 'head'),
                 memory_init=memory_init or ('balanced' if profile is not None else 'legacy'),
@@ -761,6 +764,53 @@ class Bolt(nn.Module):
         self.backend = _validate_backend(backend)
         EXECUTION_PLANNER.clear_owner_routes(self)
         return self
+
+    def set_graph(self, graph: str | bool):
+        """Configure BOLT-owned graph replay; does not constrain an outer model graph."""
+        self.graph = normalize_graph_policy(graph)
+        if self.is_modern:
+            self._modern.set_graph(self.graph)
+        return self
+
+    def graph_allowed(self) -> bool:
+        return layer_graph_permission(self.graph, self.backend, training=self.training)
+
+    def execution_info(self) -> dict:
+        if self.is_modern:
+            return self._modern.execution_info()
+        return {'backend': 'legacy_eager', 'reason': 'legacy BOLT'}
+
+    def allocate_cache(self, *, batch_size: int, capacity: int, device=None, dtype=None):
+        """Allocate a fixed-capacity, independent BOLT cached-decode session."""
+        if not self.is_modern:
+            raise NotImplementedError('allocate_cache is available for modern BOLT only')
+        from .presets import BoltCache
+        weight = next(self.parameters())
+        device = weight.device if device is None else torch.device(device)
+        if dtype is None:
+            dtype = weight.dtype
+            # Match BoltModel's existing automatic GPU cache policy. Explicit
+            # dtype overrides always win. On T4, auto uses FP16, allowing the
+            # experimentally qualified layer graph; BF16 hardware keeps BF16
+            # and uses native/PyTorch eager until its graph path is qualified.
+            if device.type == 'cuda' and self.precision != 'fp32':
+                if self.precision == 'bf16' or (self.precision == 'auto' and native_bf16_supported(device)):
+                    dtype = torch.bfloat16
+                else:
+                    dtype = torch.float16
+        return BoltCache.allocate(batch_size, self.num_heads, int(capacity),
+                                  self.latent_dim, self.avq_dim if self.state_memory else 0,
+                                  device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def decode_with_cache(self, x: torch.Tensor, cache, *, position: int):
+        """Decode one hidden-state token using the best eligible BOLT path."""
+        if not self.is_modern:
+            raise NotImplementedError('Legacy BOLT uses decode_step or decode_append_projected')
+        if x.device != next(self.parameters()).device:
+            x = x.to(next(self.parameters()).device, non_blocking=True)
+        with self._precision_context():
+            return self._modern.decode_with_cache(x, cache, position=position)
 
     def resolved_backend(self) -> str:
         if self.is_modern:

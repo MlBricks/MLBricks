@@ -91,7 +91,7 @@ class BoltBlock(nn.Module):
         if legacy:
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, eps=cfg.eps, position=rotary,
+                             backend=cfg.backend, graph=cfg.graph, eps=cfg.eps, position=rotary,
                              precision=getattr(cfg, 'precision', 'fp32'),
                              device='cpu')
         else:
@@ -99,7 +99,7 @@ class BoltBlock(nn.Module):
             self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
                              cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, position=rotary,
+                             backend=cfg.backend, graph=cfg.graph, position=rotary,
                              profile=cfg.profile if is_bolt_config else None,
                              attention_scale=getattr(cfg,'attention_scale',None),
                              memory_init=getattr(cfg,'memory_init',None),
@@ -235,6 +235,7 @@ class BoltModelCore(nn.Module):
             raise TypeError("Pass either config=... or keyword configuration, not both")
         self.config = config
         self.backend = config.backend
+        self.graph = config.graph
 
         additive, rotary = make_position(
             config.position, dim=config.dim, max_seq_len=config.context
@@ -301,6 +302,16 @@ class BoltModelCore(nn.Module):
                         setter(value, recursive=False)
                     except TypeError:
                         setter(value)
+        return self
+
+    def set_graph(self, graph: str | bool, *, recursive: bool = True):
+        """Configure graph preference for every BOLT mixer in the model."""
+        from .graph_policy import normalize_graph_policy
+        self.graph = normalize_graph_policy(graph)
+        self.config.graph = self.graph
+        if recursive:
+            for block in self.blocks:
+                block.attn.set_graph(self.graph)
         return self
 
     def backend_report(self):
@@ -566,8 +577,41 @@ class BoltModel(BoltModelCore):
         with self._autocast():
             return super().decode_step(self._on_device(input_ids),caches,position=position)
 
+    def model_graph_status(self) -> dict:
+        """Status of last public greedy generation request's whole-model graph."""
+        return dict(getattr(self, '_mlbricks_model_graph_status', {
+            'using_graph': False, 'fallback_reason': 'generation not yet called'
+        }))
+
     @torch.no_grad()
     def generate(self,input_ids,max_new_tokens,*,temperature=1.,top_k=None):
-        # Parent implementation calls self.prefill/decode_step, which handle autocast.
-        return super().generate(self._on_device(input_ids),max_new_tokens,
+        # Experimental whole-model graph policy. Ineligible combinations keep
+        # the existing eager / V5 per-layer path without any graph capture.
+        # V5 users can select graph='off'/'auto'/'on' through BoltConfig.
+        from .model_graph import BoltModelGraphEngine
+        ids = self._on_device(input_ids)
+        self._mlbricks_model_graph_status = {
+            'using_graph': False,
+            'fallback_reason': 'whole-model graph not selected for this request',
+        }
+        graph_policy = str(getattr(self, 'graph', getattr(self.config, 'graph', 'off'))).lower()
+        allow_model = graph_policy not in ('off', 'false', '0')
+        minimum = 2 if graph_policy in ('on', 'true', '1') else 64
+        if (allow_model and max_new_tokens >= minimum and temperature <= 0
+                and not self.training and BoltModelGraphEngine.supports(
+                    self, ids, int(max_new_tokens))):
+            # No outer CUDA graph exists here: the engine calls the BOLT CUDA
+            # dynamic decoder directly, *never* its per-layer graph wrapper.
+            engine = BoltModelGraphEngine.from_prompt(
+                self, ids, max_new_tokens=int(max_new_tokens),
+                enable_graph=True, strict_graph=False,
+            )
+            if engine.using_graph:
+                new_ids = engine.generate_tensor(int(max_new_tokens))
+                self._mlbricks_model_graph_status = engine.status()
+                return torch.cat((ids, new_ids), dim=1)
+            self._mlbricks_model_graph_status = engine.status()
+        # Preserve arbitrary sampling, training mode, CPU/ROCm/MPS, RoPE,
+        # unsupported FFN variants and explicit graph=off behavior.
+        return super().generate(ids,max_new_tokens,
                                 temperature=temperature,top_k=top_k)

@@ -817,3 +817,27 @@ MLBricks Kit is distributed under the repository-level PolyForm Noncommercial Li
 ### Compatibility and complete BOLT exports
 
 `Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `BoltStateMemory`, `BoltCache`, `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`
+
+### Experimental BOLT per-layer automatic decode (optimised-decode branch)
+
+`Bolt(d_model, num_heads)` defaults to `backend="auto", graph="auto"`. For
+models on supported NVIDIA CUDA devices, this enables automatic native BOLT
+kernels during cached decode and optionally a session-owned CUDA Graph after
+eligibility checks. Both controls are independent; `graph=False` disables only
+BOLT-owned graphs, not external `torch.compile()` or enclosing CUDA capture.
+
+```python
+from mlbricks import Bolt
+bolt = Bolt(384, 12)                        # auto native + auto graph preference
+cache = bolt.allocate_cache(batch_size=1, capacity=2048)
+# ... supply each layer input tensor x of shape [1,1,384] ...
+# y = bolt.decode_with_cache(x, cache, position=cache.length)
+bolt.set_backend('pytorch').set_graph(False)  # reference fallback
+```
+
+`bolt.execution_info()` reports the actual last cached-decode selection.
+A cache owns its graph session; a separate cache owns a separate graph.
+`BoltGraphEngine` remains an explicit, experimental whole-model engine for
+qualified WikiLM-style BOLT layouts; it is not automatically used by an
+arbitrary `BoltModel` or hybrid model. GPU qualification is required before
+production use of the new automatic per-layer graph route.

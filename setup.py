@@ -164,6 +164,30 @@ if enabled("MLBRICKS_BUILD_BOLT_MODERN_NATIVE") and has_cuda_toolkit:
         )
     )
 
+# Optional, independently packaged BOLT V2 strict one-token AVQ decode.
+# Does not replace the existing modern native extension or its ABI. This kernel
+# relies on torch.nn.Linear for the projection and maintains the FP32 recurrence
+# with explicit separate multiply/add rounding. It is inference-only.
+if enabled("MLBRICKS_BUILD_BOLT_V2_STRICT"):
+    if not has_cuda_toolkit:
+        raise RuntimeError("MLBRICKS_BUILD_BOLT_V2_STRICT=1 requires CUDA toolkit and CUDA PyTorch")
+    csrc = ROOT / "mlbricks" / "bolt" / "native_v2_strict"
+    extensions.append(_extension(
+        "mlbricks._bolt_avq_v2_strict", [csrc / "bindings.cpp"],
+        cuda_source=csrc / "kernel.cu", lineinfo=True, disable_fma=True,
+    ))
+
+# MLBRICKS_BOLT_DYNAMIC_GRAPH_BRANCH_INTEGRATION_V1
+# Experimental single-token, GPU-position dynamic BOLT reader. Always opt-in.
+if enabled("MLBRICKS_BUILD_BOLT_DYNAMIC_GRAPH"):
+    if not has_cuda_toolkit:
+        raise RuntimeError("MLBRICKS_BUILD_BOLT_DYNAMIC_GRAPH=1 requires a compatible CUDA toolkit and CUDA PyTorch")
+    csrc = ROOT / "mlbricks" / "bolt" / "native_dynamic"
+    extensions.append(_extension(
+        "mlbricks._bolt_dynamic_cuda", [csrc / "bindings.cpp"],
+        cuda_source=csrc / "kernel.cu", lineinfo=True, disable_fma=True,
+    ))
+
 # Optional accelerated BOLT state-memory kernels (production source build).
 # The original modern/native extension and its ABI remain unchanged.
 if enabled("MLBRICKS_BUILD_BOLT_ACCEL"):

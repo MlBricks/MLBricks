@@ -120,6 +120,106 @@ __global__ void bolt_decode_kernel(const float *__restrict__ q,
         output[now+d]=weighted*inv_denom;
     }
 }
+
+// Opt-in split-context exact online-softmax attention read for the existing
+// Direct-Q cache. It preserves the public decode_append API and FP32 O output.
+// Cross-CTA safety: append MUST launch separately on the same CUDA stream.
+// Cache and scratch are reused; the split path allocates no extra GPU tensors.
+// The source model and AVQ mathematics are unchanged.
+template <typename scalar_t>
+__global__ void bolt_split_append_kernel(const scalar_t* __restrict__ c_now,
+                                         scalar_t* __restrict__ cache,
+                                         int64_t capacity, int64_t width,
+                                         int64_t position) {
+    const int bh=blockIdx.x;
+    const int lane=threadIdx.x;
+    if (lane<width)
+        cache[(int64_t(bh)*capacity+position)*width+lane]=c_now[int64_t(bh)*width+lane];
+}
+
+// Each CTA works on one (batch,head,chunk). Eight warps work on independent
+// tokens, maintaining online-softmax (max, denominator, weighted accumulator).
+// Scratch stores [max, denominator, weighted NUMERATOR] for every chunk.
+template <int R, typename scalar_t>
+__global__ void bolt_split_read_kernel(
+    const float* __restrict__ q,
+    const scalar_t* __restrict__ cache,
+    float* __restrict__ partial,
+    int64_t capacity, int64_t length, int chunks,
+    int chunk_tokens, float scale) {
+    constexpr int NW=8;
+    const int chunk_id=int(blockIdx.x)%chunks;
+    const int bh=int(blockIdx.x)/chunks;
+    const int warp=threadIdx.x/32;
+    const int lane=threadIdx.x%32;
+    const int64_t start=int64_t(chunk_id)*chunk_tokens;
+    const int64_t last=start+int64_t(chunk_tokens);
+    const int64_t end=(last<length)?last:length;
+    const int64_t base=int64_t(bh)*capacity*R;
+    const float qv=(lane<R)?q[int64_t(bh)*R+lane]:0.f;
+    float local_m=-INFINITY;
+    float local_z=0.f;
+    float local_a=0.f;
+    for(int64_t t=start+warp;t<end;t+=NW){
+        float val=(lane<R)?static_cast<float>(cache[base+t*R+lane]):0.f;
+        float dot=qv*val;
+#pragma unroll
+        for(int off=16;off>0;off/=2)
+            dot+=__shfl_down_sync(0xffffffff,dot,off);
+        const float score=__shfl_sync(0xffffffff,dot,0)*scale;
+        const float mm=fmaxf(local_m,score);
+        const float fa=(local_m==-INFINITY)?0.f:expf(local_m-mm);
+        const float fb=expf(score-mm);
+        local_z=local_z*fa+fb;
+        local_a=local_a*fa+fb*val;
+        local_m=mm;
+    }
+    __shared__ float warp_m[NW],warp_z[NW],warp_a[NW][32];
+    __shared__ float weights[NW];
+    __shared__ float max_m, total_z;
+    if(lane==0){warp_m[warp]=local_m;warp_z[warp]=local_z;}
+    warp_a[warp][lane]=local_a;
+    __syncthreads();
+    if(threadIdx.x==0){
+        float m=-INFINITY;
+        for(int w=0;w<NW;++w) m=fmaxf(m,warp_m[w]);
+        float z=0.f;
+        for(int w=0;w<NW;++w){
+            const float f=(warp_m[w]==-INFINITY)?0.f:expf(warp_m[w]-m);
+            weights[w]=f;
+            z+=f*warp_z[w];
+        }
+        max_m=m;total_z=z;
+    }
+    __syncthreads();
+    float* dst=partial+int64_t(bh)*capacity+int64_t(chunk_id)*(R+2);
+    if(threadIdx.x==0){dst[0]=max_m;dst[1]=total_z;}
+    if(threadIdx.x<R){
+        float weighted=0.f;
+        for(int w=0;w<NW;++w)weighted+=weights[w]*warp_a[w][threadIdx.x];
+        dst[2+threadIdx.x]=weighted;
+    }
+}
+
+template <int R>
+__global__ void bolt_split_merge_kernel(const float* __restrict__ partial,
+                                        float* __restrict__ output,
+                                        int64_t capacity,int chunks){
+    const int bh=blockIdx.x;
+    const int lane=threadIdx.x;
+    const float* src=partial+int64_t(bh)*capacity;
+    float m=-INFINITY;
+    for(int k=0;k<chunks;++k)m=fmaxf(m,src[int64_t(k)*(R+2)]);
+    float denom=0.f, numerator=0.f;
+    for(int k=0;k<chunks;++k){
+        const float mk=src[int64_t(k)*(R+2)];
+        const float f=(mk==-INFINITY)?0.f:expf(mk-m);
+        denom+=f*src[int64_t(k)*(R+2)+1];
+        if(lane<R)numerator+=f*src[int64_t(k)*(R+2)+2+lane];
+    }
+    if(lane<R)output[int64_t(bh)*R+lane]=numerator/fmaxf(denom,1.0e-30f);
+}
+
 }
 
 // No P, no query folding, and no native P-gradient kernel.
@@ -206,4 +306,67 @@ torch::Tensor bolt_decode_append_cuda(torch::Tensor q,torch::Tensor current,torc
           scores.data_ptr<float>(),out.data_ptr<float>(),q.size(1),cache.size(2),q.size(3),position,float(scale));
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
+}
+
+
+// Separate entry point: default decode_append remains untouched.
+// scratch [B,H,capacity] FP32 is repurposed as chunk partials only in this path.
+torch::Tensor bolt_decode_append_split_cuda(torch::Tensor q, torch::Tensor current,
+    torch::Tensor cache, torch::Tensor scores, int64_t position,
+    double scale, int64_t chunk_tokens) {
+    c10::cuda::CUDAGuard device_guard(q.device());
+    check_cuda_contig(q,"q"); check_cuda_contig(current,"current");
+    check_cuda_contig(cache,"cache"); check_cuda_contig(scores,"scratch");
+    TORCH_CHECK(q.device()==current.device() && q.device()==cache.device() &&
+                q.device()==scores.device(),"split decode inputs must share device");
+    TORCH_CHECK(q.scalar_type()==torch::kFloat32,"split decode query must be FP32");
+    check_f16_f32(cache,"cache");
+    TORCH_CHECK(current.scalar_type()==cache.scalar_type(),"current and cache dtype mismatch");
+    TORCH_CHECK(q.dim()==4 && q.size(2)==1 && q.sizes()==current.sizes(),
+                "split decode q/current require matching [B,H,1,R]");
+    TORCH_CHECK(cache.dim()==4 && cache.size(0)==q.size(0) &&
+                cache.size(1)==q.size(1) && cache.size(3)==q.size(3),
+                "split decode cache dimension mismatch");
+    TORCH_CHECK(scores.dim()==3 && scores.size(0)==q.size(0) &&
+                scores.size(1)==q.size(1) && scores.size(2)==cache.size(2) &&
+                scores.scalar_type()==torch::kFloat32,"scratch requires FP32 [B,H,capacity]");
+    TORCH_CHECK(position>=0 && position<cache.size(2),"position outside cache");
+    TORCH_CHECK(q.size(3)==16 || q.size(3)==32,"split decode requires BOLT-16/32");
+    TORCH_CHECK(chunk_tokens>=128 && chunk_tokens<=4096 && chunk_tokens%8==0,
+                "chunk must be 128..4096 and divisible by 8");
+    const int64_t length=position+1;
+    const int64_t chunks=(length+chunk_tokens-1)/chunk_tokens;
+    TORCH_CHECK(chunks*(q.size(3)+2)<=scores.size(2),
+                "scratch capacity insufficient for chunk partials");
+    TORCH_CHECK(q.size(0)*q.size(1)*chunks<=2147483647LL,"too many CUDA blocks");
+    auto output=torch::empty(q.sizes(),q.options().dtype(torch::kFloat32));
+    const int bh=int(q.size(0)*q.size(1));
+    const int R=int(q.size(3));
+    const int64_t capacity=cache.size(2);
+    cudaStream_t stream=at::cuda::getCurrentCUDAStream().stream();
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(cache.scalar_type(),"bolt_split_decode",[&]{
+        // Cross-block memory dependency requires this independent kernel launch.
+        bolt_split_append_kernel<scalar_t><<<bh,32,0,stream>>>(
+            current.data_ptr<scalar_t>(),cache.data_ptr<scalar_t>(),capacity,R,position);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if(R==16){
+            bolt_split_read_kernel<16,scalar_t><<<bh*chunks,256,0,stream>>>(
+                q.data_ptr<float>(),cache.data_ptr<scalar_t>(),scores.data_ptr<float>(),
+                capacity,length,int(chunks),int(chunk_tokens),float(scale));
+        }else{
+            bolt_split_read_kernel<32,scalar_t><<<bh*chunks,256,0,stream>>>(
+                q.data_ptr<float>(),cache.data_ptr<scalar_t>(),scores.data_ptr<float>(),
+                capacity,length,int(chunks),int(chunk_tokens),float(scale));
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    });
+    if(R==16){
+        bolt_split_merge_kernel<16><<<bh,32,0,stream>>>(
+            scores.data_ptr<float>(),output.data_ptr<float>(),capacity,int(chunks));
+    }else{
+        bolt_split_merge_kernel<32><<<bh,32,0,stream>>>(
+            scores.data_ptr<float>(),output.data_ptr<float>(),capacity,int(chunks));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
 }

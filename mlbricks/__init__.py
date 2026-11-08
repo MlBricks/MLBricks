@@ -189,3 +189,7 @@ __all__ = [
     "TrainingIntervalTimer",
     "cuda_telemetry",
 ]
+
+# MLBRICKS_BOLT_DYNAMIC_GRAPH_ROOT_EXPORT_V1
+from .bolt.graph_engine import BoltGraphEngine
+__all__.append("BoltGraphEngine")

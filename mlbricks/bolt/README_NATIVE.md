@@ -65,3 +65,77 @@ python examples/bolt_native_benchmark.py
 The GPU test suite should verify the direct-Q `native` and `pytorch` **forward, backward, prefill and progressive decoding** behavior with nonzero AVQ gamma. No GPU tests could be run during patch creation in the CPU-only environment; don't treat the kernels as production-validated until the test suite passes on your target GPU.
 
 For CUDA builds, work with `torch.autocast('cuda', dtype=torch.float16)` or FP32. BF16 takes PyTorch fallback under `auto`, and is not a supported native feature dtype in this version. Generated cache and recurrent state are separate; AVQ recurrent state uses FP32.
+
+
+## Experimental BOLT V2 strict one-token AVQ decode (opt-in)
+
+This source also includes the independently compiled `mlbricks._bolt_avq_v2_strict`
+CUDA extension. **It is disabled by default** and does not replace the modern
+BOLT native kernels or change the public API, training, or checkpoint format.
+The V2 state update retains an FP32 recurrence with separate-rounding
+`__fmul_rn`/`__fadd_rn`, and **preserves PyTorch `avq.project(o)`** rather than
+using the numerically different V3 custom GEMV.
+
+Build on a CUDA-enabled development environment:
+
+```bash
+MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1 MLBRICKS_BUILD_BOLT_V2_STRICT=1 \
+  python -m pip install -v --no-build-isolation .
+```
+
+Opt in for supported *inference-only* decode workloads:
+
+```bash
+MLBRICKS_BOLT_V2_STRICT_DECODE=1 python your_inference_script.py
+```
+
+Eligibility: `Bolt`/`BoltPreset` modern quality mode, Identity AVQ return,
+FP16 or FP32 contiguous attention output, FP32 state, batch 1, one token, widths
+192/384, no gradients. Unsupported shapes use the existing code path. The
+compiled extension and compatible CUDA/PyTorch stack are required when
+explicitly selecting a native backend with V2 enabled. The optional speedup
+has **not** been validated on every GPU or against every current release;
+run the tests below before enabling in a production deployment:
+
+```bash
+python -m pytest tests/test_bolt_avq_v2_strict.py \
+  tests/test_bolt_modern_native_cuda.py -v
+```
+
+The strict V2 path is *not* an end-to-end compiled Transformer, and it does
+not modify native cached attention. Do not merge into a released `main` branch
+without matched GPU parity and performance qualifications.
+
+### FP32 output from the native attention decoder
+
+`mlbricks._bolt_modern_cuda.decode_append` returns FP32 attention output even
+when the compact C cache is FP16. The V2 Strict eligibility gate and compiled
+kernel therefore support FP16 **and** FP32 residual inputs. Both use PyTorch's
+original FP16 autocast projection (`avq.project(o)`), FP32 recurrent state and
+the Identity AVQ return. FP32 residual inputs keep the AVQ readout, gamma
+multiply and final residual addition in FP32; the FP16 path is unchanged.
+
+This fixes the previously observed `selected=0` fallback during full-model
+T4 qualification. A new GPU qualification is required; successful compilation
+and direct FP16 tests alone are not sufficient.
+
+
+### Experimental split-context Direct-Q decode
+
+Set `MLBRICKS_BOLT_SPLIT_CONTEXT_READ=1` only after building the modern native
+CUDA extension (`MLBRICKS_BUILD_BOLT_MODERN_NATIVE=1`) and completing device
+parity tests. The original `decode_append` remains the default. Optional
+`MLBRICKS_BOLT_SPLIT_MIN_TOKENS=4096` and
+`MLBRICKS_BOLT_SPLIT_CHUNK_TOKENS=512` control the context crossover.
+
+The split path preserves FP32 Q and FP32 attention output, supports FP16/FP32
+compact-C caches and R=16/32, and uses the existing FP32 scratch allocation
+for online-softmax partials. A dedicated cache-append kernel precedes the
+multi-CTA read to avoid a cross-CTA append/read race. A final merge combines
+partial denominators and unnormalized weighted sums. It uses **three CUDA
+launches per attention layer**, so short-context latency may be worse.
+No Triton or new dependency. No change to training, model state formats,
+PyTorch fallback, public BOLT constructors, or V2 strict AVQ update.
+
+For reproducibility: benchmark and confirm long-context numerical tolerance
+and trained-checkpoint generation before enabling in a production release.
