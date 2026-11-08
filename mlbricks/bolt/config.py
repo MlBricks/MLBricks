@@ -5,6 +5,7 @@ All active model settings live in the BOLT namespace.
 from __future__ import annotations
 from dataclasses import dataclass
 from ..runtime import normalize_backend
+from .graph_policy import normalize_graph_policy
 
 
 @dataclass
@@ -28,6 +29,7 @@ class BoltModelSettings:
     bias: bool = False
     tie_embeddings: bool = True
     backend: str = "auto"
+    graph: str = "auto"
     eps: float = 1e-6
     ffn_state_dim: int = 256
     ffn_depth_embedding_dim: int = 64
@@ -47,6 +49,7 @@ class BoltModelSettings:
         if self.dim % self.heads:
             raise ValueError("dim must be divisible by heads")
         self.backend = normalize_backend(self.backend, warn_legacy=True)
+        self.graph = normalize_graph_policy(self.graph)
         self.bolt_mode = str(self.bolt_mode).strip().lower()
         self.bolt_cache = str(self.bolt_cache).strip().lower()
         if self.bolt_mode not in ("quality", "fast", "legacy"):

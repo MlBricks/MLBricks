@@ -91,7 +91,7 @@ class BoltBlock(nn.Module):
         if legacy:
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, eps=cfg.eps, position=rotary,
+                             backend=cfg.backend, graph=cfg.graph, eps=cfg.eps, position=rotary,
                              precision=getattr(cfg, 'precision', 'fp32'),
                              device='cpu')
         else:
@@ -99,7 +99,7 @@ class BoltBlock(nn.Module):
             self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
                              cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, position=rotary,
+                             backend=cfg.backend, graph=cfg.graph, position=rotary,
                              profile=cfg.profile if is_bolt_config else None,
                              attention_scale=getattr(cfg,'attention_scale',None),
                              memory_init=getattr(cfg,'memory_init',None),
@@ -235,6 +235,7 @@ class BoltModelCore(nn.Module):
             raise TypeError("Pass either config=... or keyword configuration, not both")
         self.config = config
         self.backend = config.backend
+        self.graph = config.graph
 
         additive, rotary = make_position(
             config.position, dim=config.dim, max_seq_len=config.context
@@ -301,6 +302,16 @@ class BoltModelCore(nn.Module):
                         setter(value, recursive=False)
                     except TypeError:
                         setter(value)
+        return self
+
+    def set_graph(self, graph: str | bool, *, recursive: bool = True):
+        """Configure graph preference for every BOLT mixer in the model."""
+        from .graph_policy import normalize_graph_policy
+        self.graph = normalize_graph_policy(graph)
+        self.config.graph = self.graph
+        if recursive:
+            for block in self.blocks:
+                block.attn.set_graph(self.graph)
         return self
 
     def backend_report(self):

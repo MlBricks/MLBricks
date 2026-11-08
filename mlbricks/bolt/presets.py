@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from . import native_backend as _native
 from . import accelerated as _accelerated
 from . import v2_strict as _v2_strict
+from .graph_policy import normalize_graph_policy, layer_graph_permission
 
 
 @dataclass
@@ -45,6 +46,8 @@ class BoltCache:
         self.length = 0
         if self.state is not None:
             self.state.zero_()
+        self._mlbricks_graph_calls = 0
+        self.__dict__.pop("_mlbricks_graph_unavailable", None)
         return self
 
     def load_prefix(self, c, state):
@@ -59,6 +62,8 @@ class BoltCache:
                 raise ValueError('BOLT cache AVQ state shape mismatch')
             self.state.copy_(state)
         self.length=n
+        self._mlbricks_graph_calls = 0
+        self.__dict__.pop("_mlbricks_graph_unavailable", None)
         return self
 
 
@@ -218,7 +223,7 @@ class BoltPreset(nn.Module):
     The old rho-normalized BOLT extension is mathematically incompatible.
     """
     def __init__(self,d_model,num_heads,*,mode='quality',cache='normal',avq_dim=None,
-                 bias=False,dropout=0.,causal=True,backend='auto',position=None,
+                 bias=False,dropout=0.,causal=True,backend='auto',graph='auto',position=None,
                  projection='separate', attention_scale='head', memory_init='legacy',
                  avq_return_map='auto', avq_norm_eps=None):
         super().__init__()
@@ -265,6 +270,8 @@ class BoltPreset(nn.Module):
         self.cache_mode=cache
         self.avq_dim=int(avq_dim) if mode=='quality' else 0
         self.backend=backend
+        self.graph=normalize_graph_policy(graph)
+        self._mlbricks_graph_status = None
         self.causal=bool(causal)
         self.dropout=float(dropout)
         # RoPE is supported on the latent Query/Key vectors.
@@ -359,6 +366,28 @@ class BoltPreset(nn.Module):
             raise ValueError('backend must be auto, pytorch, or native')
         self.backend=backend
         return self
+
+    def set_graph(self, graph: str | bool):
+        """Set BOLT-owned graph preference without altering tensors or weights."""
+        self.graph = normalize_graph_policy(graph)
+        return self
+
+    def graph_allowed(self) -> bool:
+        """Graph policy permission, not a claim that graph capture succeeded."""
+        return layer_graph_permission(self.graph, self.backend, training=self.training)
+
+    def execution_info(self) -> dict:
+        status = self._mlbricks_graph_status
+        if status is None:
+            return {'backend': 'not_observed', 'reason': 'no cached decode executed'}
+        return {
+            'backend': status.backend,
+            'reason': status.reason,
+            'captures': status.captures,
+            'replays': status.replays,
+            'capture_seconds': status.capture_seconds,
+            'variants': status.variants,
+        }
 
     def resolved_backend(self):
         if self.backend == 'pytorch':
@@ -576,7 +605,15 @@ class BoltPreset(nn.Module):
                 raise ValueError('position must match cache.length')
             if pos<0 or pos>=cache.capacity:
                 raise ValueError('decode position exceeds cache capacity')
+            from .layer_graph import try_auto_layer_graph, LayerGraphStatus
+            graph_output = try_auto_layer_graph(self, x, cache, pos)
+            if graph_output is not None:
+                return graph_output
             native=self._native_enabled(x)
+            # This eager path intentionally retains the uploaded native cache
+            # dtype fix and opt-in V2 Strict inplace AVQ state update.
+            if self._mlbricks_graph_status is None:
+                self._mlbricks_graph_status = LayerGraphStatus('eager', 'non-graph cached decode')
             if native and self.position is not None and self.backend=='native':
                 raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
             if self.avq is not None:self.avq.use_native=native
@@ -613,7 +650,7 @@ class BoltPreset(nn.Module):
 
     def extra_repr(self):
         return (f'mode={self.mode}, cache={self.cache_mode}, latent={self.latent_dim}, '
-                f'avq_dim={self.avq_dim}, backend={self.backend}')
+                f'avq_dim={self.avq_dim}, backend={self.backend}, graph={self.graph}')
 
 
 # Compatibility names: stable imports, professionally named canonical components.
