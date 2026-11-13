@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from .attention import Bolt
 from .presets import BoltPresetCache
+from .enhanced_mqa import EnhancedMQA, EnhancedMQACache
 from .config import BoltConfig, BoltModelSettings
 from .precision import native_bf16_supported
 from ..cache import BoltLegacyCache
@@ -87,7 +88,9 @@ class BoltBlock(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.norm1 = _norm(cfg.norm, cfg.dim, cfg.bias)
-        legacy = cfg.bolt_mode == "legacy" or cfg.latent_dim not in (16, 32)
+        layer_mode = (cfg.layer_modes[layer_index] if getattr(cfg, 'layer_modes', None)
+                      else cfg.bolt_mode)
+        legacy = layer_mode == "legacy"
         if legacy:
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
@@ -96,8 +99,13 @@ class BoltBlock(nn.Module):
                              device='cpu')
         else:
             is_bolt_config = hasattr(cfg,'profile')
-            self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
-                             cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
+            # Each hybrid layer uses its own natural AVQ width by default.
+            avq_dim = cfg.avq_dim
+            if (getattr(cfg, 'layer_modes', None) and layer_mode == 'keyless'
+                    and getattr(cfg, 'state_dim', None) == cfg.dim):
+                avq_dim = cfg.heads * 32
+            self.attn = Bolt(cfg.dim, cfg.heads, mode=layer_mode,
+                             cache=cfg.bolt_cache, avq_dim=avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
                              backend=cfg.backend, position=rotary,
                              profile=cfg.profile if is_bolt_config else None,
@@ -107,6 +115,10 @@ class BoltBlock(nn.Module):
                              avq_return_map=getattr(cfg,'avq_return_map','auto'),
                              avq_norm_eps=getattr(cfg,'avq_norm_eps',None),
                              precision=getattr(cfg,'precision','fp32'),
+                             state_memory=getattr(cfg,'state_memory',True),
+                             avq=getattr(cfg,'avq',None),
+                             forget_gate_init=getattr(cfg,'forget_gate_init',.95),
+                             head_output_gate=getattr(cfg,'head_output_gate',True),
                              device='cpu')
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
@@ -168,10 +180,15 @@ class BoltBlock(nn.Module):
         start_pos: int = 0, cache_buffer: BoltLegacyCache | None = None,
     ):
         normalized = self.norm1(x)
-        mixer_update, (c, rho) = self.attn.prefill_with_cache(
+        mixer_update, state = self.attn.prefill_with_cache(
             normalized, start_pos=start_pos
         )
-        cache = cache_buffer.load_prefix(c, rho) if cache_buffer is not None else (c, rho)
+        if isinstance(cache_buffer, EnhancedMQACache):
+            cache = cache_buffer.load_prefix(*state)
+        elif cache_buffer is not None:
+            cache = cache_buffer.load_prefix(*state)
+        else:
+            cache = state
         x, mixer_update, next_state = self.finish(
             x, mixer_update, previous_mixer, previous_state
         )
@@ -181,7 +198,11 @@ class BoltBlock(nn.Module):
     def step(self, x, cache, previous_mixer=None, previous_state=None, *, position: int):
         normalized = self.norm1(x)
         if self.attn.is_modern:
-            if isinstance(cache, BoltPresetCache):
+            if isinstance(cache, EnhancedMQACache):
+                mixer_update = self.attn._modern.decode_with_cache(
+                    normalized, cache, position=position)
+                next_cache = cache
+            elif isinstance(cache, BoltPresetCache):
                 mixer_update = self.attn._modern.decode_with_cache(
                     normalized, cache, position=position)
                 next_cache = cache
@@ -353,7 +374,10 @@ class BoltModelCore(nn.Module):
         caches = []
         for block in self.blocks:
             a=block.attn
-            if a.is_modern:
+            if a.is_modern and isinstance(a._modern, EnhancedMQA):
+                caches.append(a._modern.allocate_cache(
+                    batch_size=batch_size, capacity=capacity, device=device, dtype=dtype))
+            elif a.is_modern:
                 caches.append(BoltPresetCache.allocate(
                     batch_size,a.num_heads,capacity,a.latent_dim,a.avq_dim,
                     device=device,dtype=dtype))

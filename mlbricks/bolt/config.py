@@ -15,7 +15,7 @@ class BoltModelSettings:
     dim: int = 384
     heads: int = 6
     latent_dim: int = 32  # legacy-only when bolt_mode='legacy'
-    bolt_mode: str = "quality"  # quality (matched-width AVQ), fast (BOLT), legacy
+    bolt_mode: str = "quantised"  # default Enhanced MQA; Keyless=BOLT32; base=MHA
     bolt_cache: str = "normal"  # normal=32, tight=16
     avq_dim: int | None = None
     position: str = "none"
@@ -49,8 +49,11 @@ class BoltModelSettings:
         self.backend = normalize_backend(self.backend, warn_legacy=True)
         self.bolt_mode = str(self.bolt_mode).strip().lower()
         self.bolt_cache = str(self.bolt_cache).strip().lower()
-        if self.bolt_mode not in ("quality", "fast", "legacy"):
-            raise ValueError("bolt_mode must be quality, fast or legacy")
+        modes = {'enhanced_mqa': 'quantised', 'bolt32': 'keyless',
+                 'bolt': 'keyless', 'classic': 'base'}
+        self.bolt_mode = modes.get(self.bolt_mode, self.bolt_mode)
+        if self.bolt_mode not in ('quantised', 'keyless', 'base', 'quality', 'fast', 'legacy'):
+            raise ValueError('bolt_mode must be quantised, Keyless, or base')
         if self.bolt_cache not in ("normal", "tight"):
             raise ValueError("bolt_cache must be normal or tight")
         # Default AVQ memory to the complete internal attention representation.
@@ -108,7 +111,12 @@ class BoltConfig(BoltModelSettings):
     return is Identity, without a learned return projection.
     """
     heads: int = 12  # validated BOLT attention layout by default
-    avq_dim: int | None = None  # default = heads * (16 compact or 32 standard)
+    avq_dim: int | None = None  # default = dim for quantised/base, heads * 32 for Keyless
+    bolt_mode: str = 'quantised'
+    layer_modes: tuple[str, ...] | None = None
+    avq: str | None = None
+    forget_gate_init: float = 0.95
+    head_output_gate: bool = True
     profile: str | None = None  # None keeps legacy `bolt_cache` keywords usable
     # Enabled by default in new BOLT models. Setting False constructs an
     # attention-only model with no AVQ modules, parameters, or recurrent cache.
@@ -123,36 +131,46 @@ class BoltConfig(BoltModelSettings):
     avq_norm_eps: float | None = None
 
     def __post_init__(self):
-        if self.profile is None:
-            self.profile = 'compact' if self.bolt_cache == 'tight' else 'standard'
-        if self.profile not in ('standard', 'compact'):
-            raise ValueError('profile must be standard or compact')
         if not isinstance(self.state_memory, bool):
             raise TypeError('state_memory must be True or False')
-        # Historical callers can still use bolt_mode='fast' / 'legacy'.
-        # A False state_memory flag always disables AVQ for modern BOLT.
-        # If a legacy mode is provided, it retains its historical meaning.
-        if self.bolt_mode == 'fast':
+        if self.avq is not None:
+            if not isinstance(self.avq, str) or self.avq.strip().lower() not in ('enable', 'disable'):
+                raise ValueError('avq must be "enable" or "disable"')
+            self.avq = self.avq.strip().lower()
+            self.state_memory = self.avq == 'enable'
+        aliases = {'enhanced_mqa':'quantised', 'classic':'base',
+                   'bolt':'keyless', 'bolt32':'keyless',
+                   'quality':'keyless', 'fast':'keyless'}
+        original_mode = str(self.bolt_mode).strip().lower()
+        self.bolt_mode = aliases.get(original_mode, original_mode)
+        if original_mode in ('fast', 'legacy') and self.avq is None:
             self.state_memory = False
-        elif self.bolt_mode == 'legacy':
-            self.state_memory = False
-        else:
-            self.bolt_mode = 'quality' if self.state_memory else 'fast'
+        if self.bolt_mode not in ('quantised','keyless','base','legacy'):
+            raise ValueError('bolt_mode must be quantised, Keyless, or base')
+        if self.layer_modes is not None:
+            self.layer_modes = tuple(aliases.get(str(m).strip().lower(), str(m).strip().lower())
+                                     for m in self.layer_modes)
+            if len(self.layer_modes) != self.layers or any(m not in ('quantised','keyless','base') for m in self.layer_modes):
+                raise ValueError('layer_modes must have one valid mode per layer')
+        if not (0. < float(self.forget_gate_init) < 1.):
+            raise ValueError('forget_gate_init must be between 0 and 1')
+        if self.profile is None:
+            self.profile = 'standard'
+        if self.profile != 'standard' or self.bolt_cache == 'tight' or self.latent_dim == 16:
+            raise ValueError('BOLT16 is removed: use the 32D Keyless cache')
+        self.bolt_cache = 'normal'
         if self.state_dim is not None:
             self.avq_dim = int(self.state_dim)
         elif self.avq_dim is None:
-            self.avq_dim = int(self.heads) * (16 if self.profile == 'compact' else 32)
-        compact_192 = self.profile == 'compact' and self.heads == 12 and self.avq_dim == 192
-        # None means omitted: explicit older settings must remain intact.
+            self.avq_dim = int(self.heads) * 32 if self.bolt_mode == 'keyless' else int(self.dim)
+        # Defaults match the research width, while custom AVQ widths use a
+        # learned return projection to preserve the general-purpose API.
         if self.attention_scale is None:
-            self.attention_scale = 'head' if compact_192 else 'latent'
+            self.attention_scale = 'latent'
         if self.memory_init is None:
-            self.memory_init = 'legacy' if compact_192 else 'balanced'
+            self.memory_init = 'balanced'
         if self.avq_return_map not in ('auto', 'linear', 'identity'):
-            raise ValueError('avq_return_map must be auto, linear or identity')
-        if self.bolt_mode != 'legacy' and self.latent_dim in (16,32):
-            self.bolt_cache = 'normal' if self.profile == 'standard' else 'tight'
-            self.latent_dim = 32 if self.profile == 'standard' else 16
+            raise ValueError('avq_return_map must be auto, linear, or identity')
         if self.attention_scale not in ('head', 'latent'):
             raise ValueError('attention_scale must be head or latent')
         if self.memory_init not in ('legacy', 'balanced'):
@@ -164,4 +182,3 @@ class BoltConfig(BoltModelSettings):
             raise ValueError('precision must be auto, fp16, bf16, fp32')
         super().__post_init__()
         self.state_dim = self.avq_dim
-        self.state_memory = self.bolt_mode == 'quality'

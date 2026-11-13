@@ -4,6 +4,18 @@ MLBricks Kit is a modular neural-network toolkit for building and experimenting 
 
 It provides unified `auto`, `native`, and `pytorch` backend dispatch together with reusable components and architectures including **ESA, Bolt, BoltModel, VisionBolt, VESA, Bricks, FFNBrick, ResController, SOUP, and ElasticBit**. MLBricks also includes native C++/CUDA execution paths, adaptive runtime planning, model lifecycle utilities, and production-oriented inference/training APIs.
 
+## BOLT API: Enhanced MQA default / Keyless BOLT32 / base MHA
+
+```python
+from mlbricks import Bolt
+mqa = Bolt(384, 12)                         # quantised (default), AVQ + head gates
+keyless = Bolt(384, 12, mode="Keyless")      # BOLT32, 50% smaller attention cache
+classic = Bolt(384, 12, mode="base")        # MHA, AVQ + head gates by default
+without_avq = Bolt(384, 12, avq="disable")  # removes AVQ only
+```
+
+See [API.md](API.md) and [BOLT_72E15CF0_INTEGRATION.md](BOLT_72E15CF0_INTEGRATION.md).
+
 ## Core components
 
 - **ESA** — Entangled State Attention for recurrent/state-based sequence processing.

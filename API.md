@@ -79,36 +79,45 @@ print(backend_report(layer))
 print(build_execution_plan(layer))
 ```
 
-## BOLT model configuration and optional state memory
+## BOLT model configuration: three public modes (72e15cf0 integration)
 
-`BoltConfig` and `BoltModel` are the production BOLT language-model API.
-`device="auto"` selects CUDA when available. BOLT enables AVQ memory by default;
-set `state_memory=False` to construct compact attention without AVQ modules or
-recurrent-state cache. The optional memory state is recorded in the configuration
-and changes checkpoint compatibility.
+`Bolt(dim, heads)` defaults to **`mode="quantised"`** (Enhanced MQA with
+pre-attention AVQ and learnable head-output gates). `mode="Keyless"` selects
+keyless BOLT32 (one 32D C cache **per head**). `mode="base"` selects original
+multi-head QKV attention. The attention architecture and AVQ are independent.
+All modes enable AVQ and learnable head gating by default; `avq="disable"`
+removes the recurrent AVQ state while keeping the selected mode and head gates.
+`head_output_gate=False` disables output gates when an exact plain MHA baseline
+is required. BOLT16 is no longer a public mode.
 
 ```python
 from mlbricks import Bolt, BoltConfig, BoltModel
 
-config = BoltConfig(
-    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard",  # latent width 32
-    # state_memory=True is the default
-    device="auto", backend="auto",  # precision defaults to "fp32"
-)
-model = BoltModel(config)  # CUDA automatically if available
+mqa = Bolt(384, 12)                              # default quantised
+keyless = Bolt(384, 12, mode="Keyless")           # BOLT32
+classic = Bolt(384, 12, mode="base")             # MHA (+ default AVQ/gates)
+plain_mha = Bolt(384, 12, mode="base", avq="disable",
+                 head_output_gate=False)
+mqa_no_avq = Bolt(384, 12, avq="disable")
 
-attention_only = BoltModel(BoltConfig(
-    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard", state_memory=False,
-))
-standalone = Bolt(embed_dim=384, num_heads=12,
-                  profile="compact", state_memory=False)
+config = BoltConfig(vocab_size=50257, context=2048, layers=3,
+                    dim=384, heads=12,
+                    layer_modes=("base", "quantised", "Keyless"),
+                    device="auto", precision="fp32")
+model = BoltModel(config)
 ```
 
-Older `bolt_mode="fast"` and `mode="fast"` calls still select attention-only
-BOLT for compatibility. Switching a checkpoint's AVQ option is not an implicit
-state-dict conversion; save its matching configuration.
+For 384D/12-head FP16 caches, MHA stores 1536 bytes/token/layer;
+`quantised` stores 128 bytes (91.67% saving), and `Keyless` stores
+768 bytes (50% saving). These are **KV/attention cache** figures, not
+end-to-end GPU memory usage. An enabled 384D AVQ also stores a 1536-byte
+FP32 recurrent state **per sequence and layer**.
+
+Enhanced MQA and base MHA use PyTorch SDPA: the BOLT32 native kernels cannot
+implement their different attention equations. The existing V2 Strict
+native decode path is retained for Keyless BOLT32. CUDA performance and quality
+must be independently benchmarked. Changing the mode does not convert old
+checkpoint weights; explicitly select the architecture used to train them.
 
 ## Unified lifecycle API
 
@@ -415,12 +424,10 @@ ids = torch.randint(0, config.vocab_size, (1, 64))  # CPU tensor accepted
 logits = model(ids)
 ```
 
-`profile="standard"` selects latent 32; `profile="compact"` selects latent
-16. New models use attention scaling by latent width and balanced state
-initialization. These were the leading TinyStories quality settings in the
-10K-step model comparisons. Execution and mathematical configuration remain
-independent: `backend="auto"` routes available CUDA state kernels when built,
-with a safe PyTorch fallback; it never changes the mathematical settings.
+`profile="standard"` is supported for the Keyless BOLT32 mode.
+`profile="compact"` (BOLT16) is not supported by the updated public API.
+Enhanced MQA and base MHA use PyTorch SDPA; Keyless BOLT32 retains its
+existing native/PyTorch execution routes.
 
 `device="auto"` prefers CUDA then CPU. Explicit `device="cuda:1"` works, and
 requesting unavailable CUDA raises a clear error. `precision="fp32"` is the default for standalone `Bolt` and `BoltConfig` / `BoltModel`.

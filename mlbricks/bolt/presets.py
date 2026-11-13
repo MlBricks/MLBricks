@@ -213,7 +213,8 @@ class BoltPreset(nn.Module):
     def __init__(self,d_model,num_heads,*,mode='quality',cache='normal',avq_dim=None,
                  bias=False,dropout=0.,causal=True,backend='auto',position=None,
                  projection='separate', attention_scale='head', memory_init='legacy',
-                 avq_return_map='auto', avq_norm_eps=None):
+                 avq_return_map='auto', avq_norm_eps=None,
+                 forget_gate_init=None, head_output_gate=False):
         super().__init__()
         if d_model%num_heads:
             raise ValueError('d_model must be divisible by num_heads')
@@ -221,8 +222,8 @@ class BoltPreset(nn.Module):
         cache=str(cache).lower()
         if mode not in ('quality','fast'):
             raise ValueError("mode must be 'quality' or 'fast'")
-        if cache not in ('normal','tight'):
-            raise ValueError("cache must be 'normal' or 'tight'")
+        if cache != 'normal':
+            raise ValueError('BOLT16 is removed: use cache=normal (BOLT32)')
         if backend not in ('auto','pytorch','native'):
             raise ValueError('backend must be auto/pytorch/native')
         if projection not in ('separate', 'packed'):
@@ -292,7 +293,30 @@ class BoltPreset(nn.Module):
             latent_dim=self.latent_dim, device='cpu', backend=backend,
             return_map=avq_return_map, norm_eps=avq_norm_eps,
         ) if mode == 'quality' else None)
+        if forget_gate_init is not None:
+            if not 0. < float(forget_gate_init) < 1.:
+                raise ValueError('forget_gate_init must be strictly between 0 and 1')
+            if self.avq is not None:
+                with torch.no_grad():
+                    self.avq.project.bias[:self.avq_dim].fill_(
+                        math.log(float(forget_gate_init) / (1. - float(forget_gate_init)))
+                    )
+        self.head_output_gate = bool(head_output_gate)
+        if self.head_output_gate:
+            self.head_gate = nn.Linear(self.d_model, self.num_heads, bias=True)
+            nn.init.zeros_(self.head_gate.weight)
+            nn.init.zeros_(self.head_gate.bias)
+        else:
+            self.head_gate = None
         self.is_modern=True
+
+    def _apply_head_gate(self, o, x):
+        if self.head_gate is None:
+            return o
+        batch, steps, _ = o.shape
+        factor = (2.0 * torch.sigmoid(self.head_gate(x))).to(o.dtype)
+        return (o.reshape(batch, steps, self.num_heads, self.latent_dim)
+                * factor.unsqueeze(-1)).reshape(batch, steps, -1)
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
@@ -327,6 +351,12 @@ class BoltPreset(nn.Module):
             if packed_bias is not None:
                 for index, name in enumerate(names):
                     state_dict[prefix + name + '.bias'] = packed_bias[index*width:(index+1)*width].clone()
+        # Pre-gating BOLT32 checkpoints lack these optional neutral parameters.
+        if self.head_gate is not None:
+            for name in ('weight', 'bias'):
+                key = prefix + 'head_gate.' + name
+                if key not in state_dict:
+                    state_dict[key] = getattr(self.head_gate, name).detach().clone()
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
 
@@ -468,7 +498,7 @@ class BoltPreset(nn.Module):
             # short/segmented recurrence and backward kernels.
             self.avq.use_native = True
             o = self.avq(o)
-        return self.out_proj(o)
+        return self.out_proj(self._apply_head_gate(o, x))
 
     def _attend(self,x,start_pos=0):
         b,t,_=x.shape
@@ -488,7 +518,7 @@ class BoltPreset(nn.Module):
             return self._optimized_train_forward(x)
         o,_=self._attend(x)
         if self.avq is not None:o=self.avq(o)
-        return self.out_proj(o)
+        return self.out_proj(self._apply_head_gate(o, x))
 
     @torch.no_grad()
     def prefill_with_cache(self,x,*,start_pos=0):
@@ -500,7 +530,7 @@ class BoltPreset(nn.Module):
         state=None
         if self.avq is not None:
             o,state=self.avq(o,return_state=True)
-        return self.out_proj(o),(c.contiguous(),state)
+        return self.out_proj(self._apply_head_gate(o, x)),(c.contiguous(),state)
 
     prefill=prefill_with_cache
 
@@ -542,7 +572,7 @@ class BoltPreset(nn.Module):
         if self.avq is not None:
             if state is None:raise ValueError('missing AVQ state')
             o,state=self.avq.step(o,state)
-        return self.out_proj(o),(c,state)
+        return self.out_proj(self._apply_head_gate(o, x)),(c,state)
 
     @torch.no_grad()
     def decode_with_cache(self,x,cache:BoltPresetCache,*,position:int):
@@ -579,7 +609,7 @@ class BoltPreset(nn.Module):
             if s.data_ptr() != cache.state.data_ptr():
                 cache.state.copy_(s)
         cache.length=pos+1
-        return self.out_proj(o)
+        return self.out_proj(self._apply_head_gate(o, x))
 
     lightning_prefill=prefill_with_cache
     lightning_step=decode_step
