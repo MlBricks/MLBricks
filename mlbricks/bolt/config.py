@@ -18,7 +18,7 @@ class BoltModelSettings:
     bolt_mode: str = "quantised"  # default Enhanced MQA; Keyless=BOLT32; base=MHA
     bolt_cache: str = "normal"  # normal=32, tight=16
     avq_dim: int | None = None
-    position: str = "none"
+    position: str = "none"  # optional *input* embedding only; BOLT does not make Q/K encodings
     ffn: str = "standard"
     residual: str = "standard"
     norm: str = "rmsnorm"

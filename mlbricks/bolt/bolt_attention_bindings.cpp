@@ -115,31 +115,9 @@ void gauss_decode_append_out_cuda(
     double scale, int64_t mode, int64_t splits, int64_t position);
 
 
-void gauss_rope_decode_out_used_cuda(
-    torch::Tensor q, torch::Tensor c, torch::Tensor rho,
-    torch::Tensor pm, torch::Tensor pl, torch::Tensor po, torch::Tensor out,
-    double scale, int64_t mode, int64_t splits, int64_t used,
-    double rope_base, int64_t rope_dim);
 
-void gauss_rope_decode_append_out_cuda(
-    torch::Tensor q, torch::Tensor c_now, torch::Tensor rho_now,
-    torch::Tensor c_cache, torch::Tensor rho_cache,
-    torch::Tensor pm, torch::Tensor pl, torch::Tensor po, torch::Tensor out,
-    double scale, int64_t mode, int64_t splits, int64_t position,
-    double rope_base, int64_t rope_dim);
 
-torch::Tensor gauss_rope_decode_project_out_used_cuda(
-    torch::Tensor q, torch::Tensor c, torch::Tensor rho,
-    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
-    torch::Tensor weight, double scale, int64_t mode, int64_t splits, int64_t used,
-    double rope_base, int64_t rope_dim);
 
-torch::Tensor gauss_rope_decode_append_project_out_cuda(
-    torch::Tensor q, torch::Tensor c_now, torch::Tensor rho_now,
-    torch::Tensor c_cache, torch::Tensor rho_cache,
-    torch::Tensor pm, torch::Tensor pl, torch::Tensor po,
-    torch::Tensor weight, double scale, int64_t mode, int64_t splits, int64_t position,
-    double rope_base, int64_t rope_dim);
 
 void gauss_unpack_gate_rho_out_cuda(
     torch::Tensor qcg,
@@ -173,10 +151,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gauss_append_cache", &gauss_append_cache_cuda);
     m.def("baseline_decode_append_out", &baseline_decode_append_out_cuda);
     m.def("gauss_decode_append_out", &gauss_decode_append_out_cuda);
-    m.def("gauss_rope_decode_out_used", &gauss_rope_decode_out_used_cuda);
-    m.def("gauss_rope_decode_append_out", &gauss_rope_decode_append_out_cuda);
-    m.def("gauss_rope_decode_project_out_used", &gauss_rope_decode_project_out_used_cuda);
-    m.def("gauss_rope_decode_append_project_out", &gauss_rope_decode_append_project_out_cuda);
     m.def("gauss_unpack_gate_rho_out", &gauss_unpack_gate_rho_out_cuda);
     m.def("baseline_unpack_qkv_out", &baseline_unpack_qkv_out_cuda);
 }

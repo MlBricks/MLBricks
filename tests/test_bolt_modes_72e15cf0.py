@@ -4,13 +4,14 @@ import pytest
 import torch
 from mlbricks import Bolt, BoltConfig, BoltModel
 from mlbricks.bolt.enhanced_mqa import EnhancedMQA
+from bolt_external_transform import ExternalQK
 
 
 @pytest.mark.parametrize('mode,bytes_per_token', [(None, 128), ('quantised', 128), ('Keyless', 768), ('base', 1536)])
 @pytest.mark.parametrize('avq', [None, 'disable'])
 def test_modes_memory_and_gradients(mode, bytes_per_token, avq):
     torch.manual_seed(12)
-    layer = Bolt(384, 12, mode=mode, avq=avq, backend='pytorch', device='cpu', position='rope')
+    layer = Bolt(384, 12, mode=mode, avq=avq, backend='pytorch', device='cpu', position=ExternalQK())
     expected = 'quantised' if mode is None else mode.lower()
     assert layer.mode == expected
     assert layer.head_dim == 32
@@ -35,7 +36,7 @@ def test_modes_memory_and_gradients(mode, bytes_per_token, avq):
 @pytest.mark.parametrize('avq', [None, 'disable'])
 def test_prefill_and_incremental_decode(mode, avq):
     torch.manual_seed(4)
-    model = Bolt(64, 2, mode=mode, avq=avq, position='rope', backend='pytorch', device='cpu').eval()
+    model = Bolt(64, 2, mode=mode, avq=avq, position=ExternalQK(), backend='pytorch', device='cpu').eval()
     x = torch.randn(1, 5, 64)
     with torch.no_grad():
         full = model(x)
@@ -50,9 +51,9 @@ def test_prefill_and_incremental_decode(mode, avq):
 def test_full_lm_prefill_and_cache(mode, avq):
     torch.manual_seed(3)
     cfg = BoltConfig(vocab_size=70, context=20, layers=2, dim=64, heads=2,
-                     bolt_mode=mode, position='rope', backend='pytorch',
+                     bolt_mode=mode, position='none', backend='pytorch',
                      device='cpu', avq=avq)
-    m = BoltModel(cfg).eval()
+    m = BoltModel(cfg).set_qk_transform(ExternalQK()).eval()
     ids = torch.randint(0, 70, (1, 6))
     with torch.no_grad():
         full = m(ids)
@@ -67,9 +68,9 @@ def test_full_lm_prefill_and_cache(mode, avq):
 
 def test_three_layer_hybrid_and_per_layer_avq_widths():
     cfg = BoltConfig(vocab_size=73, context=24, layers=3,
-                     dim=96, heads=2, position='rope', backend='pytorch',
+                     dim=96, heads=2, position='none', backend='pytorch',
                      layer_modes=('base', 'quantised', 'Keyless'), device='cpu')
-    model = BoltModel(cfg).eval()
+    model = BoltModel(cfg).set_qk_transform(ExternalQK()).eval()
     assert [layer.attn.mode for layer in model.blocks] == ['base','quantised','keyless']
     assert [layer.attn.avq_dim for layer in model.blocks] == [96,96,64]
     ids = torch.randint(0, 73, (1, 6))

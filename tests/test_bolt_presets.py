@@ -5,11 +5,12 @@ import pytest
 import torch
 
 from mlbricks import Bolt, BoltModel, BoltPreset, BoltPresetCache
+from bolt_external_transform import ExternalQK
 
 
 @pytest.mark.parametrize('mode', ['quality', 'fast'])
 @pytest.mark.parametrize('cache', ['normal', 'tight'])
-@pytest.mark.parametrize('position', [None, 'rope'])
+@pytest.mark.parametrize('position', [None, ExternalQK()])
 def test_preset_forward_cached_parity_with_nonzero_avq(mode, cache, position):
     torch.manual_seed(12)
     layer=Bolt(32,4,mode=mode,cache=cache,position=position,backend='pytorch',device='cpu',precision='fp32').eval()

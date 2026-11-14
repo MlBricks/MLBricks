@@ -37,7 +37,7 @@ def test_set_backend_override():
 
 def test_bolt_model_forward_all_positions():
     ids = torch.randint(0, 97, (2, 8))
-    for position in ("none", "learned", "sinusoidal", "rope"):
+    for position in ("none", "learned", "sinusoidal"):
         model = BoltModel(
             vocab_size=97,
             context=32,

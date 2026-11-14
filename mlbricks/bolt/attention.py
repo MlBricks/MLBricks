@@ -11,14 +11,13 @@ from torch import nn
 from .._reference import attention_forward_reference, gauss_forward_reference
 from ..runtime import normalize_backend
 from ..planner import EXECUTION_PLANNER
-from ..position import RoPE
+from ._qk_transform import resolve_qk_transform
 from .precision import native_bf16_supported
 
 from .._backend import (
     WORKSPACES,
     KernelConfig,
     autotune,
-    autotune_gauss_rope,
     heuristic_config,
     r16_no_o_config,
     load_cuda_extension,
@@ -50,18 +49,6 @@ def _planner_native_decode(
         owner, op, tensor, requested_backend="auto", native_available=True,
         native_supports_training=False, training=False, extra=extra,
     ) == "native"
-
-
-def _resolve_rope(position, width: int):
-    if position is None:
-        return None
-    if isinstance(position, RoPE):
-        return position
-    if isinstance(position, str) and position.strip().lower() in {"rope", "rotary"}:
-        return RoPE(width)
-    if isinstance(position, str) and position.strip().lower() in {"none", "off"}:
-        return None
-    raise ValueError("Attention position must be None, 'rope', or RoPE(...)")
 
 
 def _sdpa(
@@ -184,7 +171,7 @@ class Attention(nn.Module):
         self.causal = bool(causal)
         self.backend = _validate_backend(backend)
         self.autotune_kernels = bool(autotune_kernels)
-        self.position = _resolve_rope(position, self.head_dim)
+        self.position = resolve_qk_transform(position)
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
@@ -203,7 +190,7 @@ class Attention(nn.Module):
         return "planner(auto forward) + native-decode"
 
     def set_position(self, position):
-        self.position = _resolve_rope(position, self.head_dim)
+        self.position = resolve_qk_transform(position)
         return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -779,7 +766,7 @@ class Bolt(nn.Module):
         self.autotune_kernels = bool(autotune_kernels)
         self.eps = float(eps)
         self.use_sdpa = bool(use_sdpa)
-        self.position = _resolve_rope(position, self.latent_dim)
+        self.position = resolve_qk_transform(position)
         self.native_full_sequence = bool(native_full_sequence)
 
         hr = self.num_heads * self.latent_dim
@@ -825,7 +812,7 @@ class Bolt(nn.Module):
             self._modern.set_position(position)
             self.position=self._modern.position
             return self
-        self.position = _resolve_rope(position, self.latent_dim)
+        self.position = resolve_qk_transform(position)
         return self
 
     @property
@@ -1168,8 +1155,7 @@ class Bolt(nn.Module):
         # Stream2 path is involved. ``use_sdpa=False`` remains the strict
         # explicit-order reference/debug route.
         if self.use_sdpa:
-            # Key-only normalization. With RoPE, only the key view rotates;
-            # raw C remains the value so the shared latent cache stays compact.
+            # Transform only the key view; retain raw C as the cached value.
             k = (key_c.float() * rho.unsqueeze(-1)).to(c.dtype)
             y = _sdpa(
                 q, k, c,
@@ -1378,21 +1364,11 @@ class Bolt(nn.Module):
             and self.latent_dim <= 64 and self.head_dim <= 64
             and q.is_contiguous() and c_cache.is_contiguous() and rho_cache.is_contiguous()
         )
-        rope_width = 0
-        if isinstance(self.position, RoPE):
-            rope_width = self.latent_dim if self.position.dim is None else min(
-                int(self.position.dim), self.latent_dim
-            )
-            rope_width -= rope_width % 2
         ext = load_cuda_extension() if _planner_native_decode(
             self, "bolt_decode", q, self.backend, tensor_eligible,
             extra=(self.num_heads, used, self.latent_dim, self.head_dim, "projected"),
         ) else None
         plain_native = self.position is None and ext is not None
-        rope_native = (
-            rope_width >= 2 and ext is not None
-            and hasattr(ext, "gauss_rope_decode_out_used")
-        )
         # Inference fast path: exact split C+rho decode is merged directly into
         # W_O.  The head output O exists only on-chip and is never materialized
         # as a global tensor. Bias=True keeps the historical path because the
@@ -1404,45 +1380,14 @@ class Bolt(nn.Module):
             and hasattr(ext, "gauss_r16_scan_supported")
             and bool(ext.gauss_r16_scan_supported())
         )
-        no_o_rope = bool(
-            rope_native and self.out_proj.bias is None
-            and hasattr(ext, "gauss_rope_decode_project_out_used")
-        )
         if plain_native and used != capacity and not hasattr(ext, "gauss_decode_out_used"):
             plain_native = False
-        if self.backend == "native" and not (plain_native or rope_native):
+        if self.backend == "native" and not plain_native:
             raise RuntimeError(
                 "backend='native' requested but native projected Gauss decode is unavailable"
             )
 
-        if rope_native:
-            if self.autotune_kernels:
-                cfg = autotune_gauss_rope(
-                    q=q, c=c_cache, rho=rho_cache, head_dim=self.head_dim, ext=ext,
-                    rope_base=self.position.base, rope_dim=rope_width,
-                    force=force_retune, used_length=used,
-                )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss_rope", B=B, H=self.num_heads, T=used, W=self.latent_dim
-                )
-            ws = WORKSPACES.get(
-                "gauss_rope", B, self.num_heads, self.latent_dim, cfg.splits, q.device
-            )
-            if no_o_rope:
-                return ext.gauss_rope_decode_project_out_used(
-                    q, c_cache, rho_cache, ws.pm, ws.pl, ws.po,
-                    self.out_proj.weight.contiguous(),
-                    1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, used,
-                    float(self.position.base), rope_width,
-                )
-            ext.gauss_rope_decode_out_used(
-                q, c_cache, rho_cache, ws.pm, ws.pl, ws.po, ws.out,
-                1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, used,
-                float(self.position.base), rope_width,
-            )
-            y = ws.out
-        elif plain_native:
+        if plain_native:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
             if cfg is None:
                 if self.autotune_kernels:
@@ -1526,9 +1471,9 @@ class Bolt(nn.Module):
     ) -> torch.Tensor:
         """Append current C/rho and decode with minimal launch overhead.
 
-        FP16 CUDA Gauss and Gauss+RoPE both use native fused append+decode.
-        RoPE rotates only the key view inside CUDA; raw C remains the compact
-        cache and value tensor, so no rotated-cache allocation is created.
+        Native fused append+decode is used only for the untransformed core.
+        With a user-supplied Q/K transform, the PyTorch path retains raw C
+        as cache and reapplies the transform when scoring historical keys.
         """
         B = q.size(0)
         pos = int(position)
@@ -1562,19 +1507,9 @@ class Bolt(nn.Module):
             self, "bolt_decode", q, self.backend, append_eligible,
             extra=(self.num_heads, pos + 1, self.latent_dim, self.head_dim, "append"),
         ) else None
-        rope_width = 0
-        if isinstance(self.position, RoPE):
-            rope_width = self.latent_dim if self.position.dim is None else min(
-                int(self.position.dim), self.latent_dim
-            )
-            rope_width -= rope_width % 2
         plain_fused = bool(
             self.position is None and ext is not None
             and hasattr(ext, "gauss_decode_append_out")
-        )
-        rope_fused = bool(
-            rope_width >= 2 and ext is not None
-            and hasattr(ext, "gauss_rope_decode_append_out")
         )
         used = pos + 1
         no_o_plain = bool(
@@ -1584,44 +1519,10 @@ class Bolt(nn.Module):
             and hasattr(ext, "gauss_r16_scan_supported")
             and bool(ext.gauss_r16_scan_supported())
         )
-        no_o_rope = bool(
-            rope_fused and self.out_proj.bias is None
-            and hasattr(ext, "gauss_rope_decode_append_project_out")
-        )
-        if self.backend == "native" and not (plain_fused or rope_fused):
+        if self.backend == "native" and not plain_fused:
             raise RuntimeError(
                 "backend='native' requested but native Gauss decode is unavailable"
             )
-
-        if rope_fused:
-            if self.autotune_kernels:
-                cfg = autotune_gauss_rope(
-                    q=q, c=c_cache, rho=rho_cache, head_dim=self.head_dim, ext=ext,
-                    rope_base=self.position.base, rope_dim=rope_width,
-                    force=force_retune, used_length=used,
-                )
-            else:
-                cfg = heuristic_config(
-                    kind="gauss_rope", B=B, H=self.num_heads, T=used, W=self.latent_dim
-                )
-            ws = WORKSPACES.get(
-                "gauss_rope", B, self.num_heads, self.latent_dim, cfg.splits, q.device
-            )
-            if no_o_rope:
-                return ext.gauss_rope_decode_append_project_out(
-                    q, c_now3, rho_now2, c_cache, rho_cache,
-                    ws.pm, ws.pl, ws.po, self.out_proj.weight.contiguous(),
-                    1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, pos,
-                    float(self.position.base), rope_width,
-                )
-            ext.gauss_rope_decode_append_out(
-                q, c_now3, rho_now2, c_cache, rho_cache,
-                ws.pm, ws.pl, ws.po, ws.out,
-                1.0 / math.sqrt(float(self.head_dim)), cfg.mode, cfg.splits, pos,
-                float(self.position.base), rope_width,
-            )
-            y = ws.out
-            return self.out_proj(y.reshape(B, self.num_heads * self.latent_dim))
 
         if plain_fused:
             cfg = self._standalone_no_o_config(batch=B, used=used) if no_o_plain else None
@@ -1823,7 +1724,7 @@ class Bolt(nn.Module):
             f"d_model={self.d_model}, num_heads={self.num_heads}, "
             f"head_dim={self.head_dim}, latent_dim={self.latent_dim}, "
             f"cache_saving={self.cache_saving_percent:.2f}%, backend={self.backend!r}, "
-            f"position={'rope' if self.position is not None else 'none'}"
+            f"qk_transform={'external' if self.position is not None else 'none'}"
         )
 
 

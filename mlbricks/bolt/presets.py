@@ -11,6 +11,8 @@ The independent legacy rho-normalized BOLT path remains available in legacy mode
 """
 from __future__ import annotations
 
+from ._qk_transform import resolve_qk_transform
+
 import math
 from dataclasses import dataclass
 import torch
@@ -261,16 +263,7 @@ class BoltPreset(nn.Module):
         self.backend=backend
         self.causal=bool(causal)
         self.dropout=float(dropout)
-        # RoPE is supported on the latent Query/Key vectors.
-        from ..position import RoPE
-        if position is None or position=='none':
-            self.position=None
-        elif position=='rope' or position=='rotary':
-            self.position=RoPE(self.latent_dim)
-        elif isinstance(position,RoPE):
-            self.position=position
-        else:
-            raise ValueError('position must be none, rope or a RoPE instance')
+        self.position = resolve_qk_transform(position)
         width=self.num_heads*self.latent_dim
         # Separate parameters simplify inspection; benchmark used one packed Q/U/G projection.
         self.q_proj=nn.Linear(d_model,width,bias=bias)
@@ -412,11 +405,7 @@ class BoltPreset(nn.Module):
         return True
 
     def set_position(self,position):
-        from ..position import RoPE
-        if position is None or position=='none':self.position=None
-        elif position in ('rope','rotary'):self.position=RoPE(self.latent_dim)
-        elif isinstance(position,RoPE):self.position=position
-        else:raise ValueError('invalid position')
+        self.position = resolve_qk_transform(position)
         return self
 
     def _project(self, x, start_pos=0):
@@ -540,7 +529,7 @@ class BoltPreset(nn.Module):
         if x.ndim!=3 or x.size(1)!=1 or x.size(-1)!=self.d_model:
             raise ValueError('decode expects [B,1,D]')
         q,k,c=self._project(x,start_pos)
-        return q,c  # k is obtained by rotating the cached C when RoPE is enabled
+        return q,c  # cached C remains raw; K is transformed when scoring
 
     @torch.no_grad()
     def decode_step(self,x,cache):
@@ -553,12 +542,12 @@ class BoltPreset(nn.Module):
         t=int(c_past.size(2))
         native=self._native_enabled(x)
         if native and self.position is not None and self.backend=='native':
-            raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
+            raise RuntimeError('Native cached BOLT decode does not support external Q/K transforms')
         if self.avq is not None:self.avq.use_native=native
         q,k_now,c_now=self._project(x,start_pos=t)
         c=torch.cat((c_past,c_now),dim=2)
         if self.position is not None:
-            # Stored unrotated C; rotate all historical Keys with their absolute positions.
+            # Keep raw cached C and transform historical keys by absolute position.
             keys=self.position(c,start_pos=0)
         else:keys=c
         if native and _native.get_extension() is not None and self.position is None:
@@ -566,7 +555,7 @@ class BoltPreset(nn.Module):
             o=_native.decode_append(q.contiguous(),c_now.contiguous(),c.contiguous(),scratch,t,self._scale())
         else:
             if native and self.backend == 'native' and self.position is not None:
-                raise RuntimeError('Native cached BOLT decode does not yet support RoPE; use backend=auto')
+                raise RuntimeError('Native cached BOLT decode does not support external Q/K transforms; use backend=auto')
             o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
         o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
         if self.avq is not None:
@@ -586,7 +575,7 @@ class BoltPreset(nn.Module):
             raise ValueError('decode position exceeds cache capacity')
         native=self._native_enabled(x)
         if native and self.position is not None and self.backend=='native':
-            raise RuntimeError('Native cached BOLT decode does not yet support RoPE')
+            raise RuntimeError('Native cached BOLT decode does not support external Q/K transforms')
         if self.avq is not None:self.avq.use_native=native
         q,_,c_now=self._project(x,start_pos=pos)
         if not (native and _native.get_extension() is not None and self.position is None):
@@ -599,7 +588,7 @@ class BoltPreset(nn.Module):
             o=_native.decode_append(q.contiguous(),c_now.contiguous(),cache.c,cache.scratch,pos,self._scale())
         else:
             if native and self.backend == 'native' and self.position is not None:
-                raise RuntimeError('Native cached BOLT decode does not yet support RoPE; use backend=auto')
+                raise RuntimeError('Native cached BOLT decode does not support external Q/K transforms; use backend=auto')
             o=F.scaled_dot_product_attention(q,keys,c,is_causal=False,dropout_p=0.,scale=self._scale())
         o=o.transpose(1,2).contiguous().reshape(x.size(0),1,-1)
         if self.avq is not None:

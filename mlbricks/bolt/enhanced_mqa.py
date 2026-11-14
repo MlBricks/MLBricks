@@ -20,13 +20,13 @@ from torch import nn
 import torch.nn.functional as F
 
 from .presets import BoltStateMemory
-from ..position import RoPE
+from ._qk_transform import resolve_qk_transform
 
 
 @dataclass
 class EnhancedMQACache:
     """Fixed-capacity, separate K and V cache plus FP32 pre-AVQ state."""
-    k: torch.Tensor  # [batch, 1, capacity, head_dim] (RoPE already applied)
+    k: torch.Tensor  # [batch, 1, capacity, head_dim] (user Q/K transform already applied)
     v: torch.Tensor  # [batch, 1, capacity, head_dim]
     state: torch.Tensor  # [batch, d_model] FP32, one state per sequence
     length: int = 0
@@ -86,13 +86,7 @@ class EnhancedMQA(nn.Module):
             raise ValueError('forget_gate_init must be strictly between 0 and 1')
         if backend not in ('auto', 'pytorch', 'native'):
             raise ValueError('backend must be auto, pytorch or native')
-        if position is not None and not isinstance(position, RoPE):
-            if isinstance(position, str) and position.lower() in ('rope', 'rotary'):
-                position = RoPE(d_model // num_heads)
-            elif isinstance(position, str) and position.lower() == 'none':
-                position = None
-            else:
-                raise ValueError('position must be none, rope or a RoPE instance')
+        position = resolve_qk_transform(position)
 
         self.d_model = int(d_model)
         self.num_heads = int(num_heads)
@@ -165,13 +159,8 @@ class EnhancedMQA(nn.Module):
         return False
 
     def set_position(self, position):
-        if isinstance(position, str) and position.lower() in ('rope', 'rotary'):
-            position = RoPE(self.head_dim)
-        elif isinstance(position, str) and position.lower() == 'none':
-            position = None
-        if position is not None and not isinstance(position, RoPE):
-            raise ValueError('position must be none or RoPE')
-        self.position = position
+        """Attach an external Q/K transform (legacy method name)."""
+        self.position = resolve_qk_transform(position)
         return self
 
     def extra_repr(self):
@@ -304,7 +293,7 @@ class EnhancedMQA(nn.Module):
 class ClassicMHA(EnhancedMQA):
     """Original multi-head Q/K/V attention, with optional pre-attention AVQ.
 
-    With state_memory=False this is standard causal MHA + RoPE with no AVQ.
+    With state_memory=False this is standard causal MHA without AVQ.
     The optional AVQ is independent of the attention K/V representation.
     """
     def __init__(self, d_model, num_heads, *, state_memory=True,

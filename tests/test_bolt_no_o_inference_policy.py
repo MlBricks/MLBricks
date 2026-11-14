@@ -71,8 +71,7 @@ def test_no_o_second_stage_planner_is_r16_only():
     root = Path(__file__).resolve().parents[1]
     backend = (root / "mlbricks" / "_backend.py").read_text()
     start = backend.index("def autotune_gauss_no_o(")
-    end = backend.index("def autotune_gauss_rope(", start)
-    section = backend[start:end]
+    section = backend[start:]  # RoPE-specific autotuner no longer exists
 
     # Compatibility entry point remains, but it no longer races modes 0/1/2/3.
     assert "for mode in" not in section

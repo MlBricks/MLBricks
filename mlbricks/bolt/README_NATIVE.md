@@ -9,7 +9,7 @@ This patch adds a new, independent `mlbricks._bolt_modern_cuda` C++/CUDA extensi
 | Direct-Q BOLT, gated latent `U*(1+tanh G)` | No-P native gated-feature kernel during inference (when built), PyTorch for training | Training uses autograd through Q/U/G |
 | Causal attention during training/prefill | PyTorch optimized CUDA SDPA | Yes (native PyTorch C++/CUDA) |
 | AVQ recurrence `S[t]=A[t]*S[t-1]+V[t]` | Native CUDA serial-per-channel fused scan + backward | Yes |
-| Cached BOLT attention with C-only cache | Native CUDA fused cache append + stable softmax decode, no RoPE | Inference only |
+| Cached BOLT attention with C-only cache | Native CUDA fused cache append + stable softmax decode; no external Q/K transform | Inference only |
 | AVQ recurrent one-token update | Native CUDA state kernel | Inference only |
 | BOLT-16 / AVQ widths 64/96/192/384 | Same native kernels; default preset is P32 + AVQ384 | Yes |
 
@@ -51,7 +51,7 @@ m.set_backend('native')
 - `backend='auto'`: use the modern native kernels only if the extension is installed and inputs are supported CUDA tensors; otherwise fall back to PyTorch.
 - `backend='pytorch'`: use the original all-PyTorch modern BOLT equations.
 - `backend='native'`: require the new modern extension; this does not call legacy BOLT native code.
-- Native cached-decode currently supports `position=None` and latent widths **16/32**. `position='rope'` uses PyTorch cached-decode for `auto`; forcing `native` with RoPE decoding raises.
+- Native cached decode supports only the untransformed BOLT core; caller-supplied Q/K transforms use PyTorch cached decode with `backend='auto'`. `backend='native'` rejects an unsupported transform instead of silently changing mathematics.
 - The complete full-sequence attention uses PyTorch SDPA regardless of backend. During training, Q/U/G and their gradients use PyTorch autograd; the optional native feature kernel is inference-only. The native AVQ scan supports backward.
 - Modern BOLT trains Q directly and does not allocate a P parameter. Use freshly trained checkpoints for the new parameterization; it is not interchangeable with checkpoints from the prior learned-P implementation.
 

@@ -2,11 +2,12 @@ import torch
 
 from mlbricks import Attention, Brick, Bricks, Bolt, BoltModel
 from mlbricks.cache import BoltLegacyCache, KVCache
+from bolt_external_transform import ExternalQK
 
 
 def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
     torch.manual_seed(101)
-    attn = Attention(32, 4, backend="pytorch", position="rope").eval()
+    attn = Attention(32, 4, backend="pytorch", position=ExternalQK()).eval()
     hist = torch.randn(2, 5, 32)
     x = torch.randn(2, 32)
     k, v = attn.project_cache_state(hist, start_pos=0)
@@ -33,9 +34,9 @@ def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
     torch.testing.assert_close(got_v[:, :, :6], ref_v[:, :, :6])
 
 
-def test_bolt_decode_append_projected_matches_append_then_decode_pytorch_rope():
+def test_bolt_decode_append_projected_matches_append_then_decode_pytorch_custom_qk():
     torch.manual_seed(102)
-    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", position="rope", device="cpu", precision="fp32").eval()
+    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", position=ExternalQK(), device="cpu", precision="fp32").eval()
     hist = torch.randn(2, 5, 32)
     x = torch.randn(2, 32)
     c, rho = gauss.project_cache_state(hist)
@@ -113,8 +114,6 @@ def test_native_source_exports_fused_cache_apis():
         "gauss_append_cache",
         "baseline_decode_append_out",
         "gauss_decode_append_out",
-        "gauss_rope_decode_out_used",
-        "gauss_rope_decode_append_out",
     ):
         assert name in bindings
         assert name in cuda

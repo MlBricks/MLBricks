@@ -84,7 +84,7 @@ def _ffn(cfg: BoltModelSettings, layer_index: int):
 
 
 class BoltBlock(nn.Module):
-    def __init__(self, cfg: BoltModelSettings, layer_index: int, rotary=None) -> None:
+    def __init__(self, cfg: BoltModelSettings, layer_index: int) -> None:
         super().__init__()
         self.cfg = cfg
         self.norm1 = _norm(cfg.norm, cfg.dim, cfg.bias)
@@ -94,7 +94,7 @@ class BoltBlock(nn.Module):
         if legacy:
             self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, eps=cfg.eps, position=rotary,
+                             backend=cfg.backend, eps=cfg.eps, position=None,
                              precision=getattr(cfg, 'precision', 'fp32'),
                              device='cpu')
         else:
@@ -107,7 +107,7 @@ class BoltBlock(nn.Module):
             self.attn = Bolt(cfg.dim, cfg.heads, mode=layer_mode,
                              cache=cfg.bolt_cache, avq_dim=avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, position=rotary,
+                             backend=cfg.backend, position=None,
                              profile=cfg.profile if is_bolt_config else None,
                              attention_scale=getattr(cfg,'attention_scale',None),
                              memory_init=getattr(cfg,'memory_init',None),
@@ -257,14 +257,21 @@ class BoltModelCore(nn.Module):
         self.config = config
         self.backend = config.backend
 
-        additive, rotary = make_position(
+        if isinstance(config.position, str) and config.position.lower() in ("rope", "rotary"):
+            raise ValueError(
+                "BOLT no longer constructs RoPE. Attach an external Q/K "
+                "transform with model.set_qk_transform(...)."
+            )
+        additive, _unused_qk = make_position(
             config.position, dim=config.dim, max_seq_len=config.context
         )
+        if _unused_qk is not None:
+            raise ValueError("BOLT positional encodings must be supplied externally")
         self.position = additive
         self.token_embedding = Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
-            [BoltBlock(config, i, rotary=rotary) for i in range(config.layers)]
+            [BoltBlock(config, i) for i in range(config.layers)]
         )
         self.final_norm = _norm(config.norm, config.dim, config.bias)
         self.lm_head = LMHead(
@@ -276,6 +283,18 @@ class BoltModelCore(nn.Module):
         self._prepared_generation = None
         self._compile_generation_regions = False
         self._generation_compile_mode = "default"
+
+    def set_qk_transform(self, transform):
+        """Install a caller-owned pointwise Q/K transform in every BOLT layer.
+
+        Call before prefill/decoding and reset existing caches when changing it.
+        External callables must support ``(tensor, *, start_pos=int)``.
+        """
+        if isinstance(transform, nn.Module):
+            transform = transform.to(next(self.parameters()).device)
+        for block in self.blocks:
+            block.attn.set_position(transform)
+        return self
 
     def _embed(self, input_ids: torch.Tensor, *, start_pos: int = 0) -> torch.Tensor:
         if input_ids.ndim != 2:

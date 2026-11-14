@@ -71,7 +71,7 @@ __global__ void avq_step_kernel(const float *a,const float *v,const float *last,
 }
 // Each CTA processes one (batch,head). Scores are buffered in scratch, per head.
 // Streaming softmax with a stable max reduction. Exactly 1 append per call.
-// Only supports no-RoPE and no dropout; other paths use SDPA.
+// Only supports untransformed Q/K and no dropout; other paths use SDPA.
 template <typename scalar_t>
 __global__ void bolt_decode_kernel(const float *__restrict__ q,
     const scalar_t *__restrict__ current,scalar_t *__restrict__ history,
