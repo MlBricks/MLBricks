@@ -13,7 +13,6 @@ silently applied to different MQA mathematics.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import torch
 from torch import nn
@@ -63,11 +62,11 @@ class EnhancedMQACache:
 
 
 class EnhancedMQA(nn.Module):
-    """Pre-AVQ384 MQA + learnable sigmoid retention + query-head output gating.
+    """Multi-query attention with fixed per-head AVQ retention and read gating.
 
-    ``forget_gate_init=0.95`` initializes the sigmoid *bias*, not a fixed gate.
-    The project matrix and bias continue learning during training. ``head_gate``
-    is initialized to give a factor of exactly 1, but is also fully trainable.
+    ``forget_gate_init`` remains accepted for configuration compatibility;
+    retention coefficients are derived from the configured head count.
+    ``head_gate`` is initialized to give a factor of exactly 1 and remains trainable.
 
     Training/prefill recurrences are parallel differentiable affine scans;
     cached decode updates the identical recurrent state one token at a time.
@@ -123,10 +122,7 @@ class EnhancedMQA(nn.Module):
                 latent_dim=self.head_dim, device='cpu', backend='pytorch',
                 return_map='auto',
             )
-            with torch.no_grad():
-                self.avq.project.bias[:memory_width].fill_(
-                    math.log(self.forget_gate_init / (1. - self.forget_gate_init))
-                )
+            self.avq._enable_fixed_retention(self.num_heads)
         else:
             self.avq = None
         self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)

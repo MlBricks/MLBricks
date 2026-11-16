@@ -25,8 +25,12 @@ def test_modes_memory_and_gradients(mode, bytes_per_token, avq):
     assert layer._modern.head_gate.weight.grad is not None
     if avq != 'disable':
         assert layer._modern.avq.project.weight.grad is not None
-        forget_bias = layer._modern.avq.project.bias[:layer._modern.avq.width]
-        assert torch.sigmoid(forget_bias).mean().item() == pytest.approx(0.95, abs=.01)
+        if getattr(layer._modern.avq, '_fixed_retention_enabled', False):
+            assert layer._modern.avq.project.out_features == 2 * layer._modern.avq.width
+            assert layer._modern.avq._fixed_retention_coefficients.shape == (layer._modern.avq.width,)
+        else:
+            forget_bias = layer._modern.avq.project.bias[:layer._modern.avq.width]
+            assert torch.sigmoid(forget_bias).mean().item() == pytest.approx(0.95, abs=.01)
     else:
         assert layer._modern.avq is None
 

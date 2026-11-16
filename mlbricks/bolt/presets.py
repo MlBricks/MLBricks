@@ -77,6 +77,23 @@ class _RMSNorm(nn.Module):
                 * self.weight.float()).to(x.dtype)
 
 
+def _head_retention_rates(num_heads: int) -> list[float]:
+    """Return the deterministic per-head retention-rate schedule."""
+    num_heads = int(num_heads)
+    if num_heads < 1:
+        raise ValueError("num_heads must be positive")
+
+    def power_of_two(count: int) -> list[float]:
+        start = 2.0 ** (-2.0 ** (-(math.log2(count) - 3.0)))
+        return [start * (start ** index) for index in range(count)]
+
+    if num_heads & (num_heads - 1) == 0:
+        return power_of_two(num_heads)
+    closest = 2 ** int(math.floor(math.log2(num_heads)))
+    return (power_of_two(closest)
+            + power_of_two(2 * closest)[0::2][:num_heads - closest])
+
+
 def _affine_scan(a, b):
     """Differentiable parallel prefix for S[t]=a[t]*S[t-1]+b[t]."""
     a,b=a.float(),b.float()
@@ -107,6 +124,9 @@ class BoltStateMemory(nn.Module):
         if width < 1:
             raise ValueError('avq_dim must be positive')
         self.width = int(width)
+        self._fixed_retention_enabled = False
+        self._fixed_retention_heads = None
+        self.register_buffer('_fixed_retention_coefficients', None, persistent=False)
         if return_map == 'auto':
             return_map = 'identity' if self.width == int(input_dim) else 'linear'
         if return_map not in ('linear', 'identity'):
@@ -146,19 +166,132 @@ class BoltStateMemory(nn.Module):
             raise RuntimeError('CUDA was explicitly requested but is unavailable')
         self.to(torch.device(device))
 
+    @torch.no_grad()
+    def _enable_fixed_retention(self, num_heads: int):
+        """Switch this memory to fixed per-head retention and a V/R-only projection.
+
+        The active V and R rows are copied from the existing three-branch
+        projection, preserving their initialized values while removing the
+        unused gate rows. This is an internal model-construction operation.
+        """
+        num_heads = int(num_heads)
+        if num_heads < 1:
+            raise ValueError('num_heads must be positive')
+        if self._fixed_retention_enabled:
+            if self._fixed_retention_heads != num_heads:
+                raise RuntimeError('fixed retention is already configured for a different head count')
+            return self
+
+        if self.width <= 0:
+            raise ValueError('AVQ width must be positive')
+
+        old_project = self.project
+        old_weight = old_project.weight.detach()
+        old_bias = old_project.bias.detach() if old_project.bias is not None else None
+        if old_weight.shape[0] != 3 * self.width:
+            raise RuntimeError('expected the original three-branch AVQ projection')
+
+        # Construct the replacement without advancing the caller's RNG stream;
+        # all active rows are copied immediately below.
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(old_weight.device)
+            if old_weight.is_cuda else None
+        )
+        try:
+            new_project = nn.Linear(
+                old_project.in_features, 2 * self.width,
+                bias=old_project.bias is not None,
+                device=old_weight.device, dtype=old_weight.dtype,
+            )
+        finally:
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, old_weight.device)
+
+        new_weight = torch.cat((old_weight[self.width:2 * self.width],
+                                old_weight[2 * self.width:]), dim=0)
+        new_project.weight.copy_(new_weight)
+        if old_bias is not None:
+            new_bias = torch.cat((old_bias[self.width:2 * self.width],
+                                  old_bias[2 * self.width:]), dim=0)
+            new_project.bias.copy_(new_bias)
+        new_project.weight.requires_grad_(old_project.weight.requires_grad)
+        if old_project.bias is not None:
+            new_project.bias.requires_grad_(old_project.bias.requires_grad)
+        self.project = new_project
+
+        rates = torch.tensor(_head_retention_rates(num_heads), dtype=torch.float32)
+        head_indices = torch.div(
+            torch.arange(self.width, dtype=torch.long) * num_heads,
+            self.width, rounding_mode='floor',
+        ).clamp_(max=num_heads - 1)
+        self._fixed_retention_coefficients = torch.exp(-rates[head_indices])
+        self._fixed_retention_heads = num_heads
+        self._fixed_retention_enabled = True
+        return self
+
     def components_from_raw(self, raw):
+        if self._fixed_retention_enabled:
+            v, r = raw.split(self.width, dim=-1)
+            a = self._fixed_retention_coefficients.view(1, 1, -1).expand(
+                raw.shape[0], raw.shape[1], -1
+            )
+            return a, (0.1 * torch.tanh(v)).float(), torch.tanh(r).float()
         a, v, r = raw.split(self.width, dim=-1)
         return torch.sigmoid(a).float(), (0.1 * torch.tanh(v)).float(), torch.tanh(r).float()
 
     def components(self, o):
         return self.components_from_raw(self.project(o))
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        if self._fixed_retention_enabled:
+            weight_key = prefix + 'project.weight'
+            bias_key = prefix + 'project.bias'
+            old_rows = 3 * self.width
+            new_rows = 2 * self.width
+            if weight_key in state_dict and state_dict[weight_key].shape[0] == old_rows:
+                old_weight = state_dict[weight_key]
+                state_dict[weight_key] = torch.cat((
+                    old_weight[self.width:2 * self.width],
+                    old_weight[2 * self.width:]), dim=0
+                )
+            if bias_key in state_dict and state_dict[bias_key].shape[0] == old_rows:
+                old_bias = state_dict[bias_key]
+                state_dict[bias_key] = torch.cat((
+                    old_bias[self.width:2 * self.width],
+                    old_bias[2 * self.width:]), dim=0
+                )
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs
+        )
+
     def forward(self,o,*,return_state=False):
         if o.device != self.project.weight.device:
             o = o.to(self.project.weight.device, non_blocking=True)
-        if self.backend == 'native' and o.is_cuda and not (_accelerated.available() or _native.get_extension()):
-            raise RuntimeError('Native BOLT state memory requires a compiled CUDA extension')
-        if self.use_native and o.is_cuda and _accelerated.available():
+        if self.backend == 'native' and o.is_cuda:
+            if self._fixed_retention_enabled:
+                provider_available = (
+                    _accelerated.fixed_available() or _native.get_extension() is not None
+                )
+            else:
+                provider_available = (
+                    _accelerated.available() or _native.get_extension() is not None
+                )
+            if not provider_available:
+                raise RuntimeError('Native BOLT state memory requires a compiled CUDA extension')
+        if self._fixed_retention_enabled:
+            a, v, r = self.components(o)
+            s = None
+            if self.use_native and o.is_cuda:
+                s = _accelerated.scan_coefficients(a, v, latent_dim=self.latent_dim)
+                if s is None and _native.get_extension() is not None:
+                    s = _native.avq_scan(a.contiguous(), v.contiguous())
+            if s is None:
+                s = _affine_scan(a, v)
+        elif self.use_native and o.is_cuda and _accelerated.available():
             raw = self.project(o)
             za, zv, zr = raw.split(self.width, dim=-1)
             s = _accelerated.scan(za, zv, latent_dim=self.latent_dim)
