@@ -1,3 +1,5 @@
+> **optimised-bolt branch:** The current BOLT architecture has Pre-AVQ for every modern mode, shared-C Keyless, and configurable `retention="decay"/"learned"`. Older BOLT examples below may describe deprecated layouts. See [BOLT_OPTIMISED_BRANCH.md](../../BOLT_OPTIMISED_BRANCH.md) for the authoritative spec.
+
 # MLBricks BOLT
 
 BOLT provides compact causal attention and learned recurrent state memory.

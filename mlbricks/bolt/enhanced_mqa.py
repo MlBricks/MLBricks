@@ -1,14 +1,8 @@
-"""Enhanced multi-query attention with PRE-attention AVQ and output head gates.
+"""Pre-AVQ attention with flexible K/V grouping (MQA, GQA, or full MHA).
 
-Independent architecture from BOLT's shared-C attention. This module keeps
-one separate K and V head, so an FP16 cache costs 4 * head_dim bytes/token/layer
-(128 B for d_model=384, heads=12). The shipped BOLT32 stores one 32D C vector
-PER HEAD and costs 2 * heads * 32 B/token/layer (768 B for 12 heads). These are cache-size statements, not training
-peak-memory or quality guarantees.
-
-Only the PyTorch/SDPA backend is implemented for Enhanced MQA. It is portable
-across CPU and PyTorch-supported accelerators; native BOLT kernels must not be
-silently applied to different MQA mathematics.
+No positional encoding is supplied. External token-local Q/K transforms are
+supported. Attention cache cost = 4 * kv_heads * head_dim bytes/token/layer
+for FP16/BF16, independent of AVQ's FP32 recurrent state.
 """
 from __future__ import annotations
 
@@ -19,7 +13,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .presets import BoltStateMemory
-from ..position import RoPE
+from ._qk_transform import resolve_qk_transform
 
 
 @dataclass
@@ -62,11 +56,11 @@ class EnhancedMQACache:
 
 
 class EnhancedMQA(nn.Module):
-    """Multi-query attention with fixed per-head AVQ retention and read gating.
+    """MQA/GQA attention with optional Pre-AVQ and learned output-head gates.
 
-    ``forget_gate_init`` remains accepted for configuration compatibility;
-    retention coefficients are derived from the configured head count.
-    ``head_gate`` is initialized to give a factor of exactly 1 and remains trainable.
+    ``retention='decay'`` uses fixed per-head group memory timescales;
+    ``retention='learned'`` uses per-token sigmoid retention initialized at
+    ``forget_gate_init``. Attention head gates initialize to factor 1.
 
     Training/prefill recurrences are parallel differentiable affine scans;
     cached decode updates the identical recurrent state one token at a time.
@@ -77,7 +71,7 @@ class EnhancedMQA(nn.Module):
                  head_output_gate: bool = True, bias: bool = False,
                  dropout: float = 0.0, causal: bool = True,
                  backend: str = 'auto', position=None, state_memory: bool = True,
-                 kv_heads: int = 1, avq_dim: int | None = None):
+                 kv_heads: int = 1, avq_dim: int | None = None, retention: str = "decay"):
         super().__init__()
         if d_model < 1 or num_heads < 1 or d_model % num_heads:
             raise ValueError('d_model must be positive and divisible by num_heads')
@@ -85,19 +79,16 @@ class EnhancedMQA(nn.Module):
             raise ValueError('forget_gate_init must be strictly between 0 and 1')
         if backend not in ('auto', 'pytorch', 'native'):
             raise ValueError('backend must be auto, pytorch or native')
-        if position is not None and not isinstance(position, RoPE):
-            if isinstance(position, str) and position.lower() in ('rope', 'rotary'):
-                position = RoPE(d_model // num_heads)
-            elif isinstance(position, str) and position.lower() == 'none':
-                position = None
-            else:
-                raise ValueError('position must be none, rope or a RoPE instance')
+        position = resolve_qk_transform(position)
+        if retention not in ("decay", "learned"):
+            raise ValueError("retention must be decay or learned")
+        self.retention = retention
 
         self.d_model = int(d_model)
         self.num_heads = int(num_heads)
         self.head_dim = self.d_model // self.num_heads
-        if kv_heads not in (1, num_heads):
-            raise ValueError('kv_heads must be 1 (MQA) or num_heads (classic MHA)')
+        if not 1 <= kv_heads <= num_heads or num_heads % kv_heads:
+            raise ValueError("kv_heads must be a positive divisor of num_heads")
         self.kv_heads = int(kv_heads)
         self.latent_dim = self.head_dim  # cache-width compatibility attribute
         memory_width = self.d_model if avq_dim is None else int(avq_dim)
@@ -122,7 +113,13 @@ class EnhancedMQA(nn.Module):
                 latent_dim=self.head_dim, device='cpu', backend='pytorch',
                 return_map='auto',
             )
-            self.avq._enable_fixed_retention(self.num_heads)
+            if retention == "decay":
+                self.avq._enable_fixed_retention(self.num_heads)
+            else:
+                with torch.no_grad():
+                    self.avq.project.bias[:memory_width].fill_(
+                        torch.logit(torch.tensor(self.forget_gate_init)).item()
+                    )
         else:
             self.avq = None
         self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
@@ -161,14 +158,11 @@ class EnhancedMQA(nn.Module):
         return False
 
     def set_position(self, position):
-        if isinstance(position, str) and position.lower() in ('rope', 'rotary'):
-            position = RoPE(self.head_dim)
-        elif isinstance(position, str) and position.lower() == 'none':
-            position = None
-        if position is not None and not isinstance(position, RoPE):
-            raise ValueError('position must be none or RoPE')
-        self.position = position
+        self.position = resolve_qk_transform(position)
         return self
+
+    def set_qk_transform(self, transform):
+        return self.set_position(transform)
 
     def extra_repr(self):
         return (f'd_model={self.d_model}, heads={self.num_heads}, kv_heads={self.kv_heads}, '
@@ -208,11 +202,12 @@ class EnhancedMQA(nn.Module):
         return q, k, v
 
     def _attend(self, q, k, v, *, causal):
-        # Broadcasting the one K/V head avoids materializing a persistent
-        # 12-head KV cache. PyTorch SDPA handles broadcast stride-zero heads.
-        if self.kv_heads == 1:
-            k = k.expand(-1, self.num_heads, -1, -1)
-            v = v.expand(-1, self.num_heads, -1, -1)
+        # Expand to the required query heads for SDPA only; the persistent
+        # K/V cache always stores kv_heads (one for MQA, multiple for GQA).
+        if self.kv_heads != self.num_heads:
+            copies = self.num_heads // self.kv_heads
+            k = k.repeat_interleave(copies, dim=1)
+            v = v.repeat_interleave(copies, dim=1)
         if k.dtype != q.dtype:
             k = k.to(q.dtype)
             v = v.to(q.dtype)
@@ -300,7 +295,7 @@ class EnhancedMQA(nn.Module):
 class ClassicMHA(EnhancedMQA):
     """Original multi-head Q/K/V attention, with optional pre-attention AVQ.
 
-    With state_memory=False this is standard causal MHA + RoPE with no AVQ.
+    With state_memory=False and head gates disabled, this is standard causal MHA.
     The optional AVQ is independent of the attention K/V representation.
     """
     def __init__(self, d_model, num_heads, *, state_memory=True,

@@ -14,13 +14,13 @@ import torch.nn.functional as F
 from .attention import Bolt
 from .presets import BoltPresetCache
 from .enhanced_mqa import EnhancedMQA, EnhancedMQACache
+from .shared_c import SharedCKeyless, SharedCCache
 from .config import BoltConfig, BoltModelSettings
 from .precision import native_bf16_supported
 from ..cache import BoltLegacyCache
 from ..components import Embedding, FFN, LayerNorm, LMHead, RMSNorm, Residual
 from ..ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
 from ..residualbrick import ResController
-from ..position import make_position
 from ..runtime import (
     normalize_backend, backend_report as collect_backend_report,
     build_execution_plan, compile_module, prepare_module_execution,
@@ -101,9 +101,6 @@ class BoltBlock(nn.Module):
             is_bolt_config = hasattr(cfg,'profile')
             # Each hybrid layer uses its own natural AVQ width by default.
             avq_dim = cfg.avq_dim
-            if (getattr(cfg, 'layer_modes', None) and layer_mode == 'keyless'
-                    and getattr(cfg, 'state_dim', None) == cfg.dim):
-                avq_dim = cfg.heads * 32
             self.attn = Bolt(cfg.dim, cfg.heads, mode=layer_mode,
                              cache=cfg.bolt_cache, avq_dim=avq_dim,
                              bias=cfg.bias, dropout=cfg.dropout, causal=True,
@@ -119,6 +116,8 @@ class BoltBlock(nn.Module):
                              avq=getattr(cfg,'avq',None),
                              forget_gate_init=getattr(cfg,'forget_gate_init',.95),
                              head_output_gate=getattr(cfg,'head_output_gate',True),
+                             retention=getattr(cfg,'retention','decay'),
+                             kv_heads=(getattr(cfg,'kv_heads',None) if layer_mode == 'quantised' else None),
                              device='cpu')
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
@@ -198,7 +197,7 @@ class BoltBlock(nn.Module):
     def step(self, x, cache, previous_mixer=None, previous_state=None, *, position: int):
         normalized = self.norm1(x)
         if self.attn.is_modern:
-            if isinstance(cache, EnhancedMQACache):
+            if isinstance(cache, (EnhancedMQACache, SharedCCache)):
                 mixer_update = self.attn._modern.decode_with_cache(
                     normalized, cache, position=position)
                 next_cache = cache
@@ -257,10 +256,10 @@ class BoltModelCore(nn.Module):
         self.config = config
         self.backend = config.backend
 
-        additive, rotary = make_position(
-            config.position, dim=config.dim, max_seq_len=config.context
-        )
-        self.position = additive
+        if config.position not in (None, 'none'):
+            raise ValueError('BOLT has no built-in positional encoding. Use set_qk_transform.')
+        self.position = None
+        rotary = None
         self.token_embedding = Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
@@ -276,6 +275,12 @@ class BoltModelCore(nn.Module):
         self._prepared_generation = None
         self._compile_generation_regions = False
         self._generation_compile_mode = "default"
+
+    def set_qk_transform(self, transform):
+        """Set an external token-local callable for all modern BOLT attention layers."""
+        for block in self.blocks:
+            block.attn.set_qk_transform(transform)
+        return self
 
     def _embed(self, input_ids: torch.Tensor, *, start_pos: int = 0) -> torch.Tensor:
         if input_ids.ndim != 2:
@@ -374,7 +379,7 @@ class BoltModelCore(nn.Module):
         caches = []
         for block in self.blocks:
             a=block.attn
-            if a.is_modern and isinstance(a._modern, EnhancedMQA):
+            if a.is_modern and isinstance(a._modern, (EnhancedMQA, SharedCKeyless)):
                 caches.append(a._modern.allocate_cache(
                     batch_size=batch_size, capacity=capacity, device=device, dtype=dtype))
             elif a.is_modern:

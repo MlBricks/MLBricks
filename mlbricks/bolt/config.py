@@ -59,8 +59,7 @@ class BoltModelSettings:
         # Default AVQ memory to the complete internal attention representation.
         # Explicit nonmatching dimensions are retained only for ablation studies.
         if self.avq_dim is None:
-            cache_width = 16 if self.bolt_cache == "tight" else 32
-            self.avq_dim = int(self.heads) * cache_width
+            self.avq_dim = int(self.dim)
         if int(self.avq_dim) < 1:
             raise ValueError("avq_dim must be positive")
         self.ffn = str(self.ffn).strip().lower().replace("-", "_")
@@ -106,15 +105,16 @@ class BoltModelSettings:
 class BoltConfig(BoltModelSettings):
     """Configuration for :class:`BoltModel`.
 
-    ``profile`` selects the per-head BOLT latent width (32 or 16).
-    By default AVQ width equals ``heads * latent_width``, so the memory
-    return is Identity, without a learned return projection.
+    All modern modes use dynamic head widths and Pre-AVQ. The legacy
+    profile/cache selectors are not used for Shared-C Keyless.
     """
     heads: int = 12  # validated BOLT attention layout by default
-    avq_dim: int | None = None  # default = dim for quantised/base, heads * 32 for Keyless
+    avq_dim: int | None = None  # default dim for all modern BOLT modes
     bolt_mode: str = 'quantised'
     layer_modes: tuple[str, ...] | None = None
-    avq: str | None = None
+    avq: bool | str | None = True
+    retention: str = "decay"
+    kv_heads: int | None = None
     forget_gate_init: float = 0.95
     head_output_gate: bool = True
     profile: str | None = None  # None keeps legacy `bolt_cache` keywords usable
@@ -133,17 +133,21 @@ class BoltConfig(BoltModelSettings):
     def __post_init__(self):
         if not isinstance(self.state_memory, bool):
             raise TypeError('state_memory must be True or False')
-        if self.avq is not None:
-            if not isinstance(self.avq, str) or self.avq.strip().lower() not in ('enable', 'disable'):
-                raise ValueError('avq must be "enable" or "disable"')
+        if isinstance(self.avq, bool):
+            self.state_memory = self.state_memory and self.avq
+        elif isinstance(self.avq, str) and self.avq.strip().lower() in ('enable', 'disable'):
             self.avq = self.avq.strip().lower()
-            self.state_memory = self.avq == 'enable'
+            self.state_memory = self.state_memory and self.avq == 'enable'
+        elif self.avq is not None:
+            raise ValueError('avq must be bool, enable, or disable')
+        if self.retention not in ('decay', 'learned'):
+            raise ValueError('retention must be decay or learned')
         aliases = {'enhanced_mqa':'quantised', 'classic':'base',
                    'bolt':'keyless', 'bolt32':'keyless',
                    'quality':'keyless', 'fast':'keyless'}
         original_mode = str(self.bolt_mode).strip().lower()
         self.bolt_mode = aliases.get(original_mode, original_mode)
-        if original_mode in ('fast', 'legacy') and self.avq is None:
+        if original_mode in ('fast', 'legacy'):
             self.state_memory = False
         if self.bolt_mode not in ('quantised','keyless','base','legacy'):
             raise ValueError('bolt_mode must be quantised, Keyless, or base')
@@ -156,13 +160,20 @@ class BoltConfig(BoltModelSettings):
             raise ValueError('forget_gate_init must be between 0 and 1')
         if self.profile is None:
             self.profile = 'standard'
-        if self.profile != 'standard' or self.bolt_cache == 'tight' or self.latent_dim == 16:
-            raise ValueError('BOLT16 is removed: use the 32D Keyless cache')
+        if self.profile != 'standard' or self.bolt_cache == 'tight':
+            raise ValueError('BOLT16 profiles are not part of the modern architecture')
         self.bolt_cache = 'normal'
+        if self.kv_heads is not None:
+            if self.bolt_mode == 'keyless':
+                raise ValueError('kv_heads is inapplicable to Keyless Shared-C')
+            if self.kv_heads < 1 or self.heads % self.kv_heads:
+                raise ValueError('kv_heads must divide heads')
+            if self.bolt_mode == 'base' and self.kv_heads != self.heads:
+                raise ValueError('base uses full KV; use quantised for GQA')
         if self.state_dim is not None:
             self.avq_dim = int(self.state_dim)
         elif self.avq_dim is None:
-            self.avq_dim = int(self.heads) * 32 if self.bolt_mode == 'keyless' else int(self.dim)
+            self.avq_dim = int(self.dim)
         # Defaults match the research width, while custom AVQ widths use a
         # learned return projection to preserve the general-purpose API.
         if self.attention_scale is None:

@@ -1,3 +1,5 @@
+> **optimised-bolt branch:** The current BOLT architecture has Pre-AVQ for every modern mode, shared-C Keyless, and configurable `retention="decay"/"learned"`. Older BOLT examples below may describe deprecated layouts. See [BOLT_OPTIMISED_BRANCH.md](BOLT_OPTIMISED_BRANCH.md) for the authoritative spec.
+
 # MLBricks Kit
 
 MLBricks Kit is a modular neural-network toolkit for building and experimenting with efficient AI systems across PyTorch and optimized native execution paths.

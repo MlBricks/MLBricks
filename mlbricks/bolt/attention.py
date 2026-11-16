@@ -581,15 +581,12 @@ class Attention(nn.Module):
 
 class Bolt(nn.Module):
     """
-    Routed gated shared-latent Bolt attention.
+    Unified BOLT attention: quantised MQA/GQA, Keyless shared C, or full QKV.
 
-    Mathematics is unchanged:
-        U = X W_C
-        G = X W_G
-        C = U * (1 + tanh(G))
-        rho = rsqrt(mean(C^2) + eps)
-        scores = (Q C^T) * rho / sqrt(head_dim)
-        output = softmax(scores) C
+    The new modern modes all apply optional PRE-attention AVQ, using fixed
+    multi-timescale decay or learned token-wise retention. No positional
+    encodings are built in. A token-local Q/K transform may be provided by
+    callers. The explicit legacy mode is isolated for checkpoint migration.
     """
 
     def __init__(
@@ -599,9 +596,8 @@ class Bolt(nn.Module):
         *,
         embed_dim: int | None = None,
         latent_dim: int | None = None,
-        # Two independent controls: quality (matched-width AVQ) / fast (BOLT),
-        # normal (32-feature cache) / tight (16-feature cache).
-        mode: str | None = None,
+        # Attention choices: quantised (default), Keyless, base, explicit legacy.
+        mode: str = "quantised",
         cache: str = "normal",
         avq_dim: int | None = None,
         bias: bool = False,
@@ -615,7 +611,9 @@ class Bolt(nn.Module):
         native_full_sequence: bool = False,
         profile: str | None = None,
         state_memory: bool = True,
-        avq: str | None = None,
+        avq: bool | str | None = True,
+        retention: str = "decay",
+        kv_heads: int | None = None,
         forget_gate_init: float = 0.95,
         head_output_gate: bool = True,
         device: str = 'auto',
@@ -631,9 +629,15 @@ class Bolt(nn.Module):
             raise TypeError('state_memory must be True or False')
         # An explicit AVQ switch changes recurrent state, not the attention architecture.
         if avq is not None:
-            if not isinstance(avq, str) or avq.strip().lower() not in ('enable', 'disable'):
-                raise ValueError('avq must be "enable" or "disable"')
-            state_memory = avq.strip().lower() == 'enable'
+            if isinstance(avq, bool):
+                state_memory = bool(avq) and state_memory
+            elif isinstance(avq, str) and avq.strip().lower() in ('enable', 'disable'):
+                state_memory = avq.strip().lower() == 'enable' and state_memory
+            else:
+                raise ValueError('avq must be bool, enable, or disable')
+        if retention not in ('decay', 'learned'):
+            raise ValueError('retention must be decay or learned')
+        self.retention = retention
         self.avq_mode = 'enable' if state_memory else 'disable'
         if profile is not None:
             if profile not in ('standard', 'compact'):
@@ -673,94 +677,62 @@ class Bolt(nn.Module):
         # Public alias for compatibility with the naming in torch.nn.MultiheadAttention.
         self.embed_dim = int(d_model)
         # Preserve the public Bolt(d_model, num_heads, ...) API.
-        # quantised/default = Enhanced MQA; Keyless = per-head BOLT32; base = MHA.
-        requested_mode = str(mode).lower().strip() if mode is not None else (
-            'legacy' if latent_dim is not None and profile is None else 'quantised'
-        )
+        # quantised/default = MQA/GQA; Keyless = one shared C; base = full MHA.
+        requested_mode = str(mode).lower().strip() if mode is not None else 'quantised'
         requested_mode = {
             'enhanced_mqa': 'quantised', 'bolt32': 'keyless',
             'bolt': 'keyless', 'classic': 'base',
         }.get(requested_mode, requested_mode)
-        if requested_mode in ('quantised', 'base'):
+        # Version 2 modern BOLT: one Pre-AVQ location for every attention mode.
+        # Legacy per-head-C and post-AVQ kernels remain available only via mode=legacy.
+        if requested_mode in ('quality', 'fast'):
+            if requested_mode == 'fast':
+                state_memory = False
+            requested_mode = 'keyless'
+        if requested_mode in ('quantised', 'base', 'keyless'):
             from .enhanced_mqa import EnhancedMQA, ClassicMHA
+            from .shared_c import SharedCKeyless
             if cache == 'tight' or profile == 'compact' or latent_dim == 16:
-                raise ValueError('BOLT16 is not supported; select 32D Keyless BOLT')
-            cls = EnhancedMQA if requested_mode == 'quantised' else ClassicMHA
-            self._modern = cls(
-                d_model, num_heads, forget_gate_init=forget_gate_init,
-                head_output_gate=head_output_gate, state_memory=state_memory,
-                bias=bias, dropout=dropout, causal=causal,
+                raise ValueError('BOLT16/compact profiles are not part of the new dynamic-head API')
+            if requested_mode == 'keyless' and kv_heads not in (None,):
+                raise ValueError('Keyless has one shared C; kv_heads is not applicable')
+            if requested_mode != 'keyless' and kv_heads is not None:
+                if kv_heads < 1 or num_heads % kv_heads:
+                    raise ValueError('kv_heads must divide num_heads')
+                if requested_mode == 'base' and kv_heads != num_heads:
+                    raise ValueError('base uses full K/V heads; use quantised for GQA')
+            if latent_dim is not None and latent_dim != self.embed_dim // num_heads:
+                raise ValueError('C/head dimensions are derived from d_model // num_heads')
+            cls = {'quantised': EnhancedMQA, 'base': ClassicMHA,
+                   'keyless': SharedCKeyless}[requested_mode]
+            options = dict(
+                forget_gate_init=forget_gate_init, head_output_gate=head_output_gate,
+                state_memory=state_memory, bias=bias, dropout=dropout, causal=causal,
                 backend=backend, position=position, avq_dim=avq_dim,
+                retention=retention,
             )
+            if requested_mode == 'quantised':
+                options['kv_heads'] = 1 if kv_heads is None else kv_heads
+            self._modern = cls(d_model, num_heads, **options)
             self.is_modern = True
             self.mode = requested_mode
             self._modern_architecture = requested_mode
             self.d_model = int(d_model)
             self.num_heads = int(num_heads)
             self.head_dim = self.d_model // self.num_heads
+            self.kv_heads = getattr(self._modern, 'kv_heads', None) if requested_mode != 'keyless' else None
             self.latent_dim = self.head_dim
             self.avq_dim = self._modern.avq_dim
             self.state_memory = self._modern.state_memory
-            self.cache_mode = 'normal'
+            self.cache_mode = 'dynamic'
             self.backend = self._modern.backend
             self.position = self._modern.position
             self.to(resolved_device)
             return
-        if requested_mode == 'keyless':
-            mode = 'quality' if state_memory else 'fast'
-        elif requested_mode in ('quality', 'fast'):
-            mode = 'fast' if (requested_mode == 'fast' or not state_memory) else 'quality'
-        elif requested_mode == 'legacy':
-            mode = 'legacy'
-        else:
-            raise ValueError('mode must be quantised, Keyless, or base')
-        if cache == 'tight' or profile == 'compact' or latent_dim == 16:
-            raise ValueError('BOLT16 is not supported; use BOLT32 (cache=normal)')
-        self.is_modern = mode != 'legacy'
+        if requested_mode != 'legacy':
+            raise ValueError('mode must be quantised, Keyless, base, or explicit legacy')
+        self.is_modern = False
         self._modern = None
-        if self.is_modern:
-            from .presets import BoltPreset
-            target_mode = 'quality' if mode is None else str(mode)
-            # Match AVQ memory to total attention width by default. This
-            # selects Identity for the AVQ return: no 192/384 projection.
-            latent_width = 16 if cache == 'tight' else 32
-            full_attention_width = int(num_heads) * latent_width
-            compact_12 = cache == 'tight' and int(num_heads) == 12 and profile == 'compact'
-            if avq_dim is None:
-                avq_dim = full_attention_width
-            if compact_12 and int(avq_dim) == 192:
-                # Match the reference attention denominator and AVQ gate
-                # initialization without exposing a research-named factory.
-                if attention_scale is None:
-                    attention_scale = 'head'
-                if memory_init is None:
-                    memory_init = 'legacy'
-            if latent_dim is not None and int(latent_dim) != (32 if cache == 'normal' else 16):
-                raise ValueError('Modern BOLT latent_dim must match cache=normal(32) or tight(16)')
-            self._modern = BoltPreset(
-                d_model, num_heads, mode=target_mode, cache=cache, avq_dim=avq_dim,
-                bias=bias, dropout=dropout, causal=causal, backend=backend,
-                position=position,
-                projection=projection or ('packed' if profile is not None else 'separate'),
-                attention_scale=attention_scale or ('latent' if profile is not None else 'head'),
-                memory_init=memory_init or ('balanced' if profile is not None else 'legacy'),
-                avq_return_map=avq_return_map,
-                avq_norm_eps=avq_norm_eps,
-                forget_gate_init=forget_gate_init,
-                head_output_gate=head_output_gate,
-            )
-            self.d_model=int(d_model)
-            self.num_heads=int(num_heads)
-            self.head_dim=self.d_model//self.num_heads
-            self.latent_dim=self._modern.latent_dim
-            self.backend=self._modern.backend
-            self.position=self._modern.position
-            self.mode='keyless' if requested_mode == 'keyless' else self._modern.mode
-            self.cache_mode=self._modern.cache_mode
-            self.avq_dim=self._modern.avq_dim
-            self.state_memory = self._modern.avq is not None
-            self.to(resolved_device)
-            return
         if latent_dim is None:
             latent_dim=32
         if d_model % num_heads != 0:
@@ -826,6 +798,14 @@ class Bolt(nn.Module):
             self.position=self._modern.position
             return self
         self.position = _resolve_rope(position, self.latent_dim)
+        return self
+
+    def set_qk_transform(self, transform):
+        """Install a user-provided token-local Q/K callable; no encoding is built in."""
+        if not self.is_modern:
+            raise RuntimeError('External Q/K transforms are supported on modern BOLT modes')
+        self._modern.set_qk_transform(transform)
+        self.position = self._modern.position
         return self
 
     @property
