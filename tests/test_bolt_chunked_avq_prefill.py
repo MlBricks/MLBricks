@@ -78,6 +78,13 @@ def test_real_2048_chunk_boundary(device, retention):
         check_close(got, ref, device)
         check_close(carried, state, device)
         assert carried.untyped_storage().nbytes() == carried.numel() * 4
+        # The same non-identity return projection must work in decode too.
+        token = torch.randn(2, 1, 48, device=device, dtype=dtype)
+        out_ref, next_ref = a.step(token, state)
+        out_got, next_got = a.step(token, carried)
+        check_close(out_got, out_ref, device)
+        check_close(next_got, next_ref, device)
+        assert next_got.dtype == torch.float32
 
 
 @pytest.mark.parametrize('training,kv_heads,causal,seq,chunk', [
@@ -129,3 +136,57 @@ def test_default_automatic_chunk_dispatch(retention):
         check_close(y, ref, 'cpu')
         for got, expected in zip(cache, ref_cache):
             check_close(got, expected, 'cpu')
+
+
+@pytest.mark.parametrize('retention', ['learned', 'decay'])
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+def test_explicit_low_precision_linear_return_cpu(retention, dtype):
+    # Reproduce the CUDA dtype error on CPU too, without autocast. The
+    # non-identity return map is required to exercise the failing GEMM.
+    torch.manual_seed(89)
+    a = EnhancedMQA(48, 6, avq_dim=29, retention=retention,
+                    backend='pytorch').to(device='cpu', dtype=dtype).eval().avq
+    x = torch.randn(2, 35, 48, dtype=dtype)
+    assert isinstance(a.back, torch.nn.Linear)
+    with torch.no_grad(), torch.autocast(device_type='cpu', enabled=False):
+        assert not torch.is_autocast_enabled('cpu')
+        # Independent reference: FP32 recurrence/readout and explicit cast
+        # only at the return projection boundary.
+        from mlbricks.bolt.presets import _affine_scan
+        coeff, value, read = a.components(x)
+        history = _affine_scan(coeff, value)
+        h = a.norm(history) * (1. + read)
+        assert h.dtype == torch.float32
+        expected = x + a.gamma.to(dtype) * torch.nn.functional.linear(
+            h.to(dtype), a.back.weight, a.back.bias).to(dtype)
+        ref, state = a(x, return_state=True)
+        torch.testing.assert_close(ref, expected, rtol=0, atol=0)
+        got, carry = a._prefill_chunked(x, 11)
+        # GEMMs with different row counts can round FP16/BF16 projections
+        # differently on CPU. Verify the chunk recurrence independently,
+        # using matching per-chunk projection shapes and a serial FP32 scan.
+        manual = torch.zeros_like(carry)
+        parts = []
+        for part in x.split(11, dim=1):
+            co, va, re = a.components(part)
+            states = []
+            for t in range(part.size(1)):
+                manual = co[:, t].float() * manual + va[:, t]
+                states.append(manual)
+            readout = a.norm(torch.stack(states, dim=1)) * (1. + re)
+            parts.append(part + a.gamma.to(dtype) * torch.nn.functional.linear(
+                readout.to(dtype), a.back.weight, a.back.bias).to(dtype))
+        torch.testing.assert_close(got, torch.cat(parts, dim=1), rtol=0.02, atol=0.01)
+        torch.testing.assert_close(carry, manual, rtol=1e-4, atol=1e-6)
+        token = x[:, -1:]
+        y, next_state = a.step(token, carry)
+        co, va, re = a.components(token)
+        expected_state = co[:, 0].float() * carry + va[:, 0]
+        readout = (a.norm(expected_state) * (1. + re[:, 0]))[:, None]
+        expected_y = token + a.gamma.to(dtype) * torch.nn.functional.linear(
+            readout.to(dtype), a.back.weight, a.back.bias).to(dtype)
+        torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
+        torch.testing.assert_close(next_state, expected_state, rtol=0, atol=0)
+        assert y.dtype == got.dtype == ref.dtype == dtype
+        assert state.dtype == carry.dtype == next_state.dtype == torch.float32
+        assert torch.isfinite(y).all() and torch.isfinite(next_state).all()

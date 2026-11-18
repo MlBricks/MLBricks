@@ -268,6 +268,14 @@ class BoltStateMemory(nn.Module):
             missing_keys, unexpected_keys, error_msgs
         )
 
+    def _return_update(self, h, dtype):
+        # The recurrence, normalization and read gate use FP32. Explicit
+        # low-precision weights need a matching GEMM input when autocast
+        # is disabled. Leave autocast and the identity return map alone.
+        if isinstance(self.back, nn.Linear) and not torch.is_autocast_enabled(h.device.type):
+            h = h.to(self.back.weight.dtype)
+        return self.back(h).to(dtype)
+
     def forward(self,o,*,return_state=False):
         if o.device != self.project.weight.device:
             o = o.to(self.project.weight.device, non_blocking=True)
@@ -307,7 +315,7 @@ class BoltStateMemory(nn.Module):
             else:
                 s=_affine_scan(a,v)
         h=self.norm(s)*(1.+r)
-        update=self.back(h).to(o.dtype)
+        update=self._return_update(h, o.dtype)
         enhanced=o+self.gamma.to(o.dtype)*update
         return (enhanced,s[:,-1,:].contiguous()) if return_state else enhanced
 
@@ -321,7 +329,7 @@ class BoltStateMemory(nn.Module):
         v[:, 0, :].add_(a[:, 0, :] * carry)
         history = _affine_scan(a, v)
         h = self.norm(history) * (1. + r)
-        update = self.back(h).to(o.dtype)
+        update = self._return_update(h, o.dtype)
         enhanced = o + self.gamma.to(o.dtype) * update
         return enhanced, history[:, -1, :].clone()
 
@@ -368,7 +376,7 @@ class BoltStateMemory(nn.Module):
         else:
             s=a[:,0,:]*state.float()+v[:,0,:]
         h=(self.norm(s)*(1.+r[:,0,:]))[:,None,:]
-        update=self.back(h).to(o.dtype)
+        update=self._return_update(h, o.dtype)
         return o+self.gamma.to(o.dtype)*update, s
 
 
