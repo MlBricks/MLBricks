@@ -66,6 +66,9 @@ class EnhancedMQA(nn.Module):
     cached decode updates the identical recurrent state one token at a time.
     """
     is_modern = True
+    # Plain runtime setting, not a parameter or checkpoint field. Set to 0
+    # on this component to disable chunked cached prefill for A/B checks.
+    avq_prefill_chunk_size = 2048
 
     def __init__(self, d_model: int, num_heads: int, *, forget_gate_init: float = 0.95,
                  head_output_gate: bool = True, bias: bool = False,
@@ -253,16 +256,22 @@ class EnhancedMQA(nn.Module):
         if start_pos != 0:
             raise ValueError('Enhanced MQA prefill must start at 0; use decode_step to continue')
         if self.avq is not None:
-            z, state = self.avq(x, return_state=True)
+            chunk = self.avq_prefill_chunk_size
+            if (not self.training and not self.avq.training
+                    and self.causal and self.kv_heads == 1
+                    and self.avq.backend == 'pytorch' and not self.avq.use_native
+                    and chunk > 0 and x.size(1) > chunk):
+                z, state = self.avq._prefill_chunked(x, chunk)
+            else:
+                z, state = self.avq(x, return_state=True)
+                # Release any retained scan-history storage before attention.
+                state = state.clone()
         else:
             z = x
             state = x.new_zeros((x.size(0), 0), dtype=torch.float32)
         q, k, v = self._project(z, start_pos=0)
         out = self._finish(self._attend(q, k, v, causal=self.causal), z)
-        # The final AVQ state may be a view of the entire FP32 scan history.
-        # A clone owns only the final [B, avq_dim] state, even when it is
-        # already contiguous (notably batch size 1).
-        return out, (k.contiguous(), v.contiguous(), state.clone())
+        return out, (k.contiguous(), v.contiguous(), state)
 
     prefill = prefill_with_cache
 

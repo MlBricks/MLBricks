@@ -311,6 +311,44 @@ class BoltStateMemory(nn.Module):
         enhanced=o+self.gamma.to(o.dtype)*update
         return (enhanced,s[:,-1,:].contiguous()) if return_state else enhanced
 
+    @torch.no_grad()
+    def _prefill_chunk(self, o, carry):
+        """Evaluate one AVQ chunk with the previous chunk's FP32 state."""
+        a, v, r = self.components(o)
+        a = a.float()
+        # The first affine update incorporates the incoming state; all later
+        # coefficients and updates are unchanged. v is a fresh tensor.
+        v[:, 0, :].add_(a[:, 0, :] * carry)
+        history = _affine_scan(a, v)
+        h = self.norm(history) * (1. + r)
+        update = self.back(h).to(o.dtype)
+        enhanced = o + self.gamma.to(o.dtype) * update
+        return enhanced, history[:, -1, :].clone()
+
+    @torch.no_grad()
+    def _prefill_chunked(self, o, chunk_size):
+        """Bound AVQ intermediates while preserving the full recurrence.
+
+        Only for eval-mode PyTorch cached prefill. The enhanced sequence is
+        still materialized for full-context attention; this is not an
+        attention window, and no tokens or state updates are dropped.
+        """
+        if self.training or self.backend != 'pytorch' or self.use_native:
+            raise RuntimeError('Chunked AVQ requires eval-mode PyTorch memory')
+        if chunk_size <= 0 or o.size(1) == 0:
+            raise ValueError('Expected positive chunk size and nonempty sequence')
+        if o.device != self.project.weight.device:
+            o = o.to(self.project.weight.device, non_blocking=True)
+        carry = torch.zeros((o.size(0), self.width), device=o.device,
+                            dtype=torch.float32)
+        out = torch.empty_like(o)
+        for start in range(0, o.size(1), chunk_size):
+            stop = min(start + chunk_size, o.size(1))
+            part, carry = self._prefill_chunk(o[:, start:stop], carry)
+            out[:, start:stop].copy_(part)
+            del part
+        return out, carry
+
     def step(self,o,state,*,_v2_cache_inplace=False):
         if o.device != self.project.weight.device:
             o = o.to(self.project.weight.device, non_blocking=True)
