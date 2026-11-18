@@ -202,6 +202,17 @@ class EnhancedMQA(nn.Module):
         return q, k, v
 
     def _attend(self, q, k, v, *, causal):
+        # Single-token inference: reinterpret query heads as independent rows.
+        # They all attend to one shared KV history; causal masking is unnecessary
+        # here because the cache contains only past/current tokens. Training,
+        # GQA (>1 KV head), and full-sequence attention retain their existing path.
+        if (not self.training and not torch.is_grad_enabled() and not causal
+                and self.kv_heads == 1 and q.size(2) == 1):
+            y = F.scaled_dot_product_attention(
+                q.transpose(1, 2).contiguous(), k.to(q.dtype), v.to(q.dtype),
+                is_causal=False, dropout_p=0., scale=self.head_dim ** -0.5,
+            )
+            return y.transpose(1, 2)
         # Expand to the required query heads for SDPA only; the persistent
         # K/V cache always stores kv_heads (one for MQA, multiple for GQA).
         if self.kv_heads != self.num_heads:
@@ -248,7 +259,10 @@ class EnhancedMQA(nn.Module):
             state = x.new_zeros((x.size(0), 0), dtype=torch.float32)
         q, k, v = self._project(z, start_pos=0)
         out = self._finish(self._attend(q, k, v, causal=self.causal), z)
-        return out, (k.contiguous(), v.contiguous(), state)
+        # The final AVQ state may be a view of the entire FP32 scan history.
+        # A clone owns only the final [B, avq_dim] state, even when it is
+        # already contiguous (notably batch size 1).
+        return out, (k.contiguous(), v.contiguous(), state.clone())
 
     prefill = prefill_with_cache
 
