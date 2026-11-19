@@ -76,6 +76,23 @@ class _ShortScan(torch.autograd.Function):
         return dza, dzv, None
 
 
+def fixed_available():
+    """Whether the segmented scan provider accepts precomputed coefficients."""
+    segmented, _ = _load()
+    return segmented is not None
+
+
+def scan_coefficients(a, v, *, latent_dim=32):
+    """Scan already-computed retention and write coefficients."""
+    if not a.is_cuda or a.dtype not in (torch.float16, torch.float32):
+        return None
+    segmented, _ = _load()
+    if segmented is None:
+        return None
+    a, v = a.float().contiguous(), v.float().contiguous()
+    return _SegmentedScan.apply(a, v)
+
+
 def scan(za, zv, *, a=None, v=None, latent_dim=32):
     """Return FP32 states or None when the accelerated path is unavailable.
 

@@ -167,5 +167,5 @@ def test_bolt_full_auto_skips_native_wrapper_when_cached_route_is_pytorch(monkey
     assert y.shape == x.shape
     decisions = [r for r in EXECUTION_PLANNER.operator_decisions()
                  if len(r["key"]) > 1 and r["key"][1] == "bolt_full"]
-    assert decisions
-    assert decisions[-1]["route"] == "pytorch"
+    assert not decisions  # modern BOLT uses SDPA directly, not the historical planner route
+    assert model.execution_info()["backend"] == "pytorch_sdpa"

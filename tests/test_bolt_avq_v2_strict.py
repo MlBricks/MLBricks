@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from mlbricks.bolt import v2_strict
-from mlbricks.bolt.presets import BoltStateMemory, BoltPreset, BoltPresetCache
+from mlbricks.bolt.presets import BoltStateMemory
 
 
 def test_v2_off_by_default(monkeypatch):
@@ -59,15 +59,14 @@ def test_v2_cached_decode_64_steps(monkeypatch):
     if v2_strict.get_extension() is None:
         pytest.skip('build with MLBRICKS_BUILD_BOLT_V2_STRICT=1')
     torch.manual_seed(77)
-    model = BoltPreset(384, 12, mode='quality', cache='tight',
-                       backend='pytorch', projection='packed').eval().cuda().half()
+    model = BoltStateMemory(192, 192, device='cuda', backend='pytorch').eval().half()
     with torch.no_grad():
-        model.avq.gamma.fill_(0.2)
+        model.gamma.fill_(0.2)
     ref = copy.deepcopy(model)
     # For this integration test, enable only the V2 AVQ path while keeping the
     # same (PyTorch) attention/feature projection on both models.
-    model.backend = 'pytorch'; model.avq.use_native = True
-    ref.backend = 'pytorch'; ref.avq.use_native = False
+    model.backend = 'pytorch'; model.use_native = True
+    ref.backend = 'pytorch'; ref.use_native = False
     # Test the AVQ one-token step directly to avoid mixing attention backends.
     x = torch.randn(1, 1, 192, device='cuda', dtype=torch.float16)
     state1 = torch.zeros(1, 192, device='cuda', dtype=torch.float32)
@@ -75,9 +74,9 @@ def test_v2_cached_decode_64_steps(monkeypatch):
     monkeypatch.setenv('MLBRICKS_BOLT_V2_STRICT_DECODE', '1')
     with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16):
         for _ in range(64):
-            o1, state1 = model.avq.step(x, state1)
+            o1, state1 = model.step(x, state1)
             monkeypatch.setenv('MLBRICKS_BOLT_V2_STRICT_DECODE', '0')
-            o2, state2 = ref.avq.step(x, state2)
+            o2, state2 = ref.step(x, state2)
             monkeypatch.setenv('MLBRICKS_BOLT_V2_STRICT_DECODE', '1')
             torch.testing.assert_close(o1.float(), o2.float(), atol=0.03, rtol=0.02)
             torch.testing.assert_close(state1, state2, atol=6e-4, rtol=1e-3)

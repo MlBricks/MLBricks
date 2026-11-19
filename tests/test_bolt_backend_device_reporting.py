@@ -5,9 +5,9 @@ from mlbricks import Bolt
 from mlbricks.bolt import presets
 
 
-@pytest.mark.parametrize("profile", ["standard", "compact"])
+@pytest.mark.parametrize("mode", ["quantised", "keyless", "base"])
 @pytest.mark.parametrize("state_memory", [True, False])
-def test_cpu_backend_reporting(monkeypatch, profile, state_memory):
+def test_cpu_backend_reporting(monkeypatch, mode, state_memory):
     monkeypatch.setattr(
         presets._accelerated, "available", lambda: True
     )
@@ -18,7 +18,7 @@ def test_cpu_backend_reporting(monkeypatch, profile, state_memory):
     model = Bolt(
         embed_dim=64,
         num_heads=4,
-        profile=profile,
+        mode=mode,
         state_memory=state_memory,
         backend="auto",
         device="cpu",
@@ -53,5 +53,5 @@ def test_native_backend_requires_cuda(monkeypatch):
 
     assert "unavailable" in model.resolved_backend()
 
-    with pytest.raises(RuntimeError, match="requires a CUDA tensor"):
+    with pytest.raises(RuntimeError, match="backend=native"):
         model(torch.randn(1, 3, 64))

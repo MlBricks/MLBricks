@@ -45,9 +45,9 @@ def test_bricks_parent_takes_ownership_of_cuda_first_mixer():
 
 
 @pytest.mark.parametrize("state_memory", [False, True])
-def test_boltmodel_preserves_device_and_legacy_precision(state_memory):
+def test_boltmodel_preserves_device_and_precision(state_memory):
     cfg = BoltConfig(vocab_size=41, context=16, layers=1, dim=32, heads=4,
-                     profile="compact", state_memory=state_memory,
+                     bolt_mode="quantised", state_memory=state_memory,
                      device="cpu", precision="fp32", backend="pytorch")
     model = BoltModel(cfg).eval()
     assert all(v.precision == "fp32" for v in model.modules() if isinstance(v, Bolt))

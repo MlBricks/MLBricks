@@ -34,8 +34,9 @@ def test_direct_q_wrapper_rejects_gradient_silencing(monkeypatch):
 
 
 def test_public_models_have_no_query_p_and_matched_identity_memory():
-    for name, dim in [('compact', 16), ('standard', 32)]:
-        m = Bolt(d_model=384, num_heads=12, profile=name, device='cpu')
+    for name in ('quantised', 'keyless', 'base'):
+        dim = 32
+        m = Bolt(d_model=384, num_heads=12, mode=name, device='cpu')
         assert m._modern.latent_dim == dim
         assert m._modern.avq_dim == 12 * dim
         assert isinstance(m._modern.avq.back, torch.nn.Identity)

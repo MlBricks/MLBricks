@@ -10,53 +10,6 @@ import torch
 
 
 @dataclass
-class BoltLegacyCache:
-    c: torch.Tensor
-    rho: torch.Tensor
-    length: int = 0
-
-    @property
-    def capacity(self) -> int:
-        return int(self.c.size(2))
-
-    @classmethod
-    def allocate(cls, batch: int, heads: int, capacity: int, latent_dim: int, *, device, dtype):
-        if batch <= 0 or heads <= 0 or capacity <= 0 or latent_dim <= 0:
-            raise ValueError("BoltLegacyCache dimensions must be positive")
-        c = torch.empty(batch, heads, capacity, latent_dim, device=device, dtype=dtype)
-        rho = torch.empty(batch, heads, capacity, device=device, dtype=dtype)
-        return cls(c=c, rho=rho, length=0)
-
-    def reset(self) -> "BoltLegacyCache":
-        self.length = 0
-        return self
-
-    def load_prefix(self, c: torch.Tensor, rho: torch.Tensor) -> "BoltLegacyCache":
-        n = int(c.size(2))
-        if c.shape[:2] != self.c.shape[:2] or c.size(3) != self.c.size(3):
-            raise ValueError("BOLT cache prefix shape mismatch")
-        if rho.shape != c.shape[:3]:
-            raise ValueError("rho prefix shape mismatch")
-        if n > self.capacity:
-            raise ValueError("BOLT cache prefix exceeds capacity")
-        self.c[:, :, :n, :].copy_(c)
-        self.rho[:, :, :n].copy_(rho)
-        self.length = n
-        return self
-
-    def append(self, c: torch.Tensor, rho: torch.Tensor, *, position: int | None = None) -> int:
-        if c.size(2) != 1 or rho.size(2) != 1:
-            raise ValueError("BoltLegacyCache.append expects one token")
-        pos = self.length if position is None else int(position)
-        if pos < 0 or pos >= self.capacity:
-            raise ValueError("BOLT cache position exceeds capacity")
-        self.c[:, :, pos:pos + 1, :].copy_(c)
-        self.rho[:, :, pos:pos + 1].copy_(rho)
-        self.length = max(self.length, pos + 1)
-        return self.length
-
-
-@dataclass
 class KVCache:
     k: torch.Tensor
     v: torch.Tensor
@@ -103,4 +56,4 @@ class KVCache:
         return self.length
 
 
-__all__ = ["BoltLegacyCache", "KVCache"]
+__all__ = ["KVCache"]

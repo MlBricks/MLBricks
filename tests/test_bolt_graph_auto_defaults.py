@@ -8,15 +8,14 @@ import torch
 from torch import nn
 from mlbricks import Bolt, BoltConfig, BoltModel
 from mlbricks.bolt.graph_policy import normalize_graph_policy
-from mlbricks.bolt.presets import BoltPreset
 
 
 def test_default_single_bolt():
     layer = Bolt(64, 4, device='cpu').eval()
     assert layer.backend == 'auto'
     assert layer.graph == 'auto'
-    assert layer._modern.graph == 'auto'
-    assert layer.graph_allowed()
+    assert layer._modern.graph == 'off'
+    assert not layer.graph_allowed()
     output = layer(torch.randn(1, 3, 64))
     assert output.shape == (1, 3, 64)
 
@@ -27,7 +26,7 @@ def test_explicit_reference_overrides_graph_auto():
     assert not layer.graph_allowed()
     assert layer._modern.backend == 'pytorch'
     layer.set_backend('auto')
-    assert layer.graph_allowed()
+    assert not layer.graph_allowed()
     layer.set_graph(False)
     assert layer.graph == layer._modern.graph == 'off'
     assert not layer.graph_allowed()
@@ -48,14 +47,9 @@ def test_training_cannot_capture():
     layer=Bolt(64,4,device='cpu')
     assert not layer.graph_allowed()
     layer.eval()
-    assert layer.graph_allowed()
+    assert not layer.graph_allowed()
 
 
-def test_direct_preset_default_and_explicit_pytorch():
-    p=BoltPreset(64,4).eval()
-    assert p.graph == p.backend == 'auto'
-    p.set_backend('pytorch')
-    assert not p.graph_allowed()
 
 
 def test_hybrid_with_one_bolt_layer():

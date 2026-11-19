@@ -13,6 +13,7 @@ from mlbricks import (
     Bolt,
     BoltModel,
     ResController,
+    RoPE,
     StateAwareFFN,
     VesaConfig,
 )
@@ -35,19 +36,15 @@ def test_set_backend_override():
     assert a.set_backend("native").backend == "native"
 
 
-def test_bolt_model_forward_all_positions():
+def test_bolt_model_forward_external_position_only():
     ids = torch.randint(0, 97, (2, 8))
-    for position in ("none", "learned", "sinusoidal", "rope"):
-        model = BoltModel(
-            vocab_size=97,
-            context=32,
-            layers=2,
-            dim=32,
-            heads=4,
-            latent_dim=8,
-            position=position,
-            dropout=0.0,
-        )
+    kwargs = dict(vocab_size=97, context=32, layers=2, dim=32, heads=4,
+                  dropout=0.0, device="cpu")
+    for position in ("learned", "sinusoidal", "rope"):
+        with pytest.raises(ValueError, match="no built-in positional encoding"):
+            BoltModel(**kwargs, position=position)
+    for transform in (None, RoPE()):
+        model = BoltModel(**kwargs).set_qk_transform(transform)
         assert model(ids).shape == (2, 8, 97)
 
 
@@ -116,10 +113,6 @@ def test_bricks_mixed_pipeline_forward_and_generation():
 
 
 def test_native_override_fails_cleanly_when_not_supported():
-    model = Bolt(32, 4, latent_dim=8, backend="native")
-    x = torch.randn(1, 32)
-    c = torch.randn(1, 4, 4, 8)
-    rho = torch.ones(1, 4, 4)
-    if not torch.cuda.is_available():
-        with pytest.raises(RuntimeError, match="backend='native'"):
-            model.decode(x, c, rho)
+    model = Bolt(32, 4, backend="native", device="cpu")
+    with pytest.raises(RuntimeError, match="backend=native"):
+        model(torch.randn(1, 3, 32))

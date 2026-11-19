@@ -1,10 +1,11 @@
 import torch
 
 from mlbricks import Attention, Brick, Bricks, ESA, Bolt, BoltModel
-from mlbricks.cache import BoltLegacyCache, KVCache
+from mlbricks.cache import KVCache
+from mlbricks.bolt.enhanced_mqa import EnhancedMQACache
 
 
-def _legacy_bolt_model_generate(model, input_ids, steps):
+def _dynamic_bolt_model_generate(model, input_ids, steps):
     was = model.training
     model.eval()
     logits, caches = model.prefill(input_ids)  # tuple caches: legacy path
@@ -24,20 +25,20 @@ def _legacy_bolt_model_generate(model, input_ids, steps):
     return tokens
 
 
-def test_bolt_model_fixed_cache_matches_legacy_cat_path():
+def test_bolt_model_fixed_cache_matches_dynamic_cat_path():
     torch.manual_seed(1)
     model = BoltModel(vocab_size=43, context=32, layers=2, dim=32, heads=4, latent_dim=8, device="cpu", precision="fp32")
     ids = torch.randint(0, 43, (2, 5))
-    expected = _legacy_bolt_model_generate(model, ids, 4)
+    expected = _dynamic_bolt_model_generate(model, ids, 4)
     actual = model.generate(ids, 4, temperature=0)
     torch.testing.assert_close(actual, expected)
     prepared = model._prepared_generation
     assert prepared is not None
-    assert all(isinstance(c, BoltLegacyCache) for c in prepared["caches"])
+    assert all(isinstance(c, EnhancedMQACache) for c in prepared["caches"])
     assert all(c.length == 8 for c in prepared["caches"])
 
 
-def test_attention_and_gauss_used_length_ignore_unwritten_capacity():
+def test_attention_used_length_ignore_unwritten_capacity():
     torch.manual_seed(2)
     xhist = torch.randn(1, 5, 32)
     x = torch.randn(1, 32)
@@ -51,14 +52,6 @@ def test_attention_and_gauss_used_length_ignore_unwritten_capacity():
     got = attn.decode(x, kc, vc, used_length=5)
     torch.testing.assert_close(got, ref)
 
-    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", device="cpu", precision="fp32").eval()
-    c, rho = gauss.project_cache_state(xhist)
-    cc = torch.randn(1, 4, 16, 8)
-    rr = torch.randn(1, 4, 16)
-    cc[:, :, :5].copy_(c); rr[:, :, :5].copy_(rho)
-    ref = gauss.decode(x, c, rho, used_length=5)
-    got = gauss.decode(x, cc, rr, used_length=5)
-    torch.testing.assert_close(got, ref)
 
 
 def test_bricks_prepares_heterogeneous_fixed_caches():
@@ -74,7 +67,7 @@ def test_bricks_prepares_heterogeneous_fixed_caches():
     )
     model.prepare_generation(batch_size=2, max_context=16, warmup_native=False)
     buffers = model._prepared_generation["buffers"]
-    assert isinstance(buffers[0], BoltLegacyCache)
+    assert isinstance(buffers[0], EnhancedMQACache)
     assert isinstance(buffers[1], KVCache)
     assert buffers[2] is None
     ids = torch.randint(0, 41, (2, 4))
@@ -99,15 +92,12 @@ def test_bolt_model_prefill_logits_match_eval_forward():
     torch.testing.assert_close(prefill, direct, rtol=1e-5, atol=1e-6)
 
 
-def test_packed_gauss_projection_refreshes_after_weight_change():
-    torch.manual_seed(4)
-    g = Bolt(32, 4, latent_dim=8, backend="pytorch", device="cpu", precision="fp32").eval()
-    x = torch.randn(2, 32)
-    q1, c1, r1 = g.project_decode_state(x, start_pos=0)
-    with torch.no_grad():
-        g.q_proj.weight.add_(0.01)
-    q2, c2, r2 = g.project_decode_state(x, start_pos=0)
-    assert not torch.allclose(q1, q2)
-    # C/G parameters did not change, so cache state is unchanged.
-    torch.testing.assert_close(c1, c2)
-    torch.testing.assert_close(r1, r2)
+
+def test_modern_q_projection_observes_updated_weights():
+    g=Bolt(32,4,avq=False,device='cpu',backend='pytorch').eval()
+    x=torch.randn(2,3,32)
+    q1,k1,v1=g._modern._project(x,start_pos=0)
+    with torch.no_grad(): g._modern.q_proj.weight.add_(0.01)
+    q2,k2,v2=g._modern._project(x,start_pos=0)
+    assert not torch.allclose(q1,q2)
+    torch.testing.assert_close(k1,k2);torch.testing.assert_close(v1,v2)

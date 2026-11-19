@@ -1,3 +1,5 @@
+Modern BOLT has three attention modes: `quantised` (MQA/GQA), `keyless` (one shared C), and `base` (MHA). Each supports optional pre-attention AVQ with `retention="decay"` or `"learned"`. Historical fixed-width and rho-normalized architectures are retired; old checkpoints are not automatically converted. Historical patch notes are development records, not current API specifications.
+
 # MLBricks Kit 1.0.0b3 API Reference
 
 `mlbricks-kit` is the PyPI distribution. The Python import namespace remains `mlbricks`.
@@ -79,36 +81,25 @@ print(backend_report(layer))
 print(build_execution_plan(layer))
 ```
 
-## BOLT model configuration and optional state memory
+## BOLT model configuration
 
-`BoltConfig` and `BoltModel` are the production BOLT language-model API.
-`device="auto"` selects CUDA when available. BOLT enables AVQ memory by default;
-set `state_memory=False` to construct compact attention without AVQ modules or
-recurrent-state cache. The optional memory state is recorded in the configuration
-and changes checkpoint compatibility.
+The embedding width must be divisible by the query-head count. For MQA/GQA, `kv_heads` must divide the query-head count. The default AVQ width is the embedding width. The default precision is FP32; mixed precision is opt-in.
 
 ```python
-from mlbricks import Bolt, BoltConfig, BoltModel
+from mlbricks import Bolt, BoltConfig, BoltModel, RoPE
 
-config = BoltConfig(
-    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard",  # latent width 32
-    # state_memory=True is the default
-    device="auto", backend="auto", precision="auto",
-)
-model = BoltModel(config)  # CUDA automatically if available
-
-attention_only = BoltModel(BoltConfig(
-    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard", state_memory=False,
-))
-standalone = Bolt(embed_dim=384, num_heads=12,
-                  profile="compact", state_memory=False)
+mqa = Bolt(384, 12, mode="quantised", kv_heads=1, position=RoPE())
+gqa = Bolt(384, 12, mode="quantised", kv_heads=3)
+keyless = Bolt(384, 12, mode="keyless")
+classic = Bolt(384, 12, mode="base", avq=False, head_output_gate=False)
+learned = Bolt(384, 12, retention="learned")
+config = BoltConfig(vocab_size=50257, context=2048, layers=3, dim=384, heads=12,
+                    layer_modes=("base", "quantised", "keyless"), device="auto")
+model = BoltModel(config)
+model.set_qk_transform(RoPE())
 ```
 
-Older `bolt_mode="fast"` and `mode="fast"` calls still select attention-only
-BOLT for compatibility. Switching a checkpoint's AVQ option is not an implicit
-state-dict conversion; save its matching configuration.
+At 384D/12 heads, FP16 persistent attention storage is 128 bytes/token/layer for MQA, 64 for shared-C Keyless, and 1536 for MHA. Enabled 384D AVQ adds 1536 bytes of FP32 recurrent state per sequence/layer. Cache storage is distinct from peak GPU allocation. Modern BOLT uses PyTorch SDPA; the retired BOLT native attention and graph routes are not available. The optimized one-KV-head decode and chunked AVQ prefill are retained; chunking does not alter training.
 
 ## Unified lifecycle API
 
@@ -338,40 +329,17 @@ compass(
 
 ### `Bolt` / `BoltAttention`
 
-`BoltAttention` is an alias of the canonical `Bolt` implementation.
-
-In MLBricks Kit 1.0.0b3, the native FP16 compound Stage-1 backward path is dtype-safe with FP32 master Parameters under AMP; the public Bolt API and equations are unchanged.
+`BoltAttention` aliases `Bolt`. Use `mode="quantised"`, `"keyless"`, or `"base"`. Positional transforms are external callables, such as `RoPE()`, rather than strings. `state_memory=False` or `avq=False` disables AVQ; `head_output_gate=False` disables learnable head-output gates.
 
 ```python
-Bolt(
-    d_model,
-    num_heads,
-    *,
-    latent_dim=32,
-    bias=False,
-    dropout=0.0,
-    causal=True,
-    backend="auto",
-    autotune_kernels=True,
-    eps=1e-6,
-    use_sdpa=True,
-    position=None,
-    native_full_sequence=False,
-)
+bolt(x)  # differentiable forward
+output, cache = bolt.prefill_with_cache(x)
+next_output, cache = bolt.decode_step(next_x, cache)
+fixed = bolt.allocate_cache(batch_size=1, capacity=2048)
+y = bolt.decode_with_cache(next_x, fixed, position=0)
 ```
 
-Main methods:
-
-```python
-bolt(x) -> torch.Tensor
-bolt.set_backend(backend, *, recursive=True)
-bolt.resolved_backend() -> str
-bolt.prefill(x, *, start_pos=0) -> (output, cache)
-bolt.decode_step(x, cache) -> (output, cache)
-bolt.project_cache_state(x, *, start_pos=0)
-bolt.prefill_with_cache(x, *, start_pos=0)
-bolt.decode(x, c_cache, rho_cache, *, force_retune=False, position=None, used_length=None)
-```
+The fixed-cache example starts a separate empty session. MQA/GQA/base use `(k,v,state)` dynamic caches and `EnhancedMQACache` static caches. Keyless uses `(c,state)` dynamic caches and `SharedCCache` static caches. The actual cache precision follows the model's inference precision. Cache allocation and cached decode are for inference; use ordinary forward for training.
 
 ### `Attention`
 
@@ -391,59 +359,9 @@ Attention(
 )
 ```
 
-### Professional BOLT model and components
+### BOLT model and components
 
-The canonical language-model classes are **`BoltModel`** and **`BoltConfig`**.
-They own the complete BOLT model implementation. Historical checkpoint weights
-can be loaded with matching BOLT architecture settings.
-
-`BoltStateMemory` implements the learnable recurrent state; `BoltCache` holds
-compact attention features and state for cached generation. Historical
-`BoltPreset`, `BoltPresetCache`, and `PostSoftmaxAVQ` imports remain supported.
-
-```python
-import torch
-from mlbricks import BoltConfig, BoltModel
-
-config = BoltConfig(
-    vocab_size=50257, context=2048, layers=6, dim=384, heads=12,
-    profile="standard", state_memory=True,  # AVQ = 12 * 32 = 384 (Identity return)
-    backend="auto", device="auto", precision="auto",
-)
-model = BoltModel(config)  # automatically uses CUDA when available
-ids = torch.randint(0, config.vocab_size, (1, 64))  # CPU tensor accepted
-logits = model(ids)
-```
-
-`profile="standard"` selects latent 32; `profile="compact"` selects latent
-16. New models use attention scaling by latent width and balanced state
-initialization. These were the leading TinyStories quality settings in the
-10K-step model comparisons. Execution and mathematical configuration remain
-independent: `backend="auto"` routes available CUDA state kernels when built,
-with a safe PyTorch fallback; it never changes the mathematical settings.
-
-`device="auto"` prefers CUDA then CPU. Explicit `device="cuda:1"` works, and
-requesting unavailable CUDA raises a clear error. `precision="auto"` selects
-CUDA mixed precision (BF16 where supported, otherwise FP16); model weights
-remain FP32. Explicit `precision="fp32"` disables autocast. Auto-transferring
-CPU inputs incurs a copy; feed tensors already on the GPU for best throughput.
-
-The new model supports `model(input_ids)`, `model(input_ids, targets=targets)`,
-`model.prefill`, `model.decode_step`, and `model.generate` as before. The
-recurrent state is computed by native CUDA when available, or by the canonical
-reference scan. There is no public kernel-version or compiler-specific mode.
-
-Native BOLT state kernels are separately opt-in for source builds:
-
-```bash
-MLBRICKS_BUILD_BOLT_ACCEL=1 pip install -v .
-```
-
-On CPU or when these extensions are absent, the library uses its reference
-implementation. Existing pretrained checkpoint files must use their original
-mathematical configuration (`attention_scale="head"`, and matching state
-parameters); changing the profile is a separate model-design decision.
-
+`BoltModel` and `BoltConfig` provide a language model; `BoltStateMemory` implements pre-AVQ. `EnhancedMQA`, `EnhancedMQACache`, `ClassicMHA`, `SharedCKeyless`, and `SharedCCache` are also exported. `BoltModel` supports forward, prefill, incremental decoding and generation. Modern mode weights retain their existing parameter and state-dict layout. Historical BOLT16/BOLT32 checkpoints and fixed-width graph caches are not supported. Existing naming aliases such as `fast` select modern modes, not a second implementation. Modern graph acceleration is not implemented; graph policy does not select the retired kernels.
 
 ## SOUP
 
@@ -796,7 +714,7 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 
 | Group | Exports |
 | --- | --- |
-| Attention / Bolt | `Attention`, `Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig` |
+| Attention / Bolt | `Attention`, `Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `BoltStateMemory`, `EnhancedMQA`, `EnhancedMQACache`, `ClassicMHA`, `SharedCKeyless`, `SharedCCache` |
 | SOUP | `SOUP`, `soup` |
 | Composition | `Bricks`, `Brick` |
 | Vision | `VisionBolt`, `VisionBoltConfig`, `vision_native_available`, `vision_native_cuda_built`, `vesa`, `Vesa`, `VesaConfig` |
@@ -813,31 +731,3 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 ## Licensing
 
 MLBricks Kit is distributed under the repository-level PolyForm Noncommercial License 1.0.0 terms plus component-specific notices shipped with the relevant components. Commercial use requires a separate written commercial license. See `LICENSE.md`, `LICENSING_NOTICE.md`, `COMMERCIAL_LICENSE.md`, and the component notices listed in `LICENSE.md`.
-
-### Compatibility and complete BOLT exports
-
-`Bolt`, `BoltAttention`, `BoltModel`, `BoltConfig`, `BoltStateMemory`, `BoltCache`, `BoltPreset`, `BoltPresetCache`, `PostSoftmaxAVQ`
-
-### Experimental BOLT per-layer automatic decode (optimised-decode branch)
-
-`Bolt(d_model, num_heads)` defaults to `backend="auto", graph="auto"`. For
-models on supported NVIDIA CUDA devices, this enables automatic native BOLT
-kernels during cached decode and optionally a session-owned CUDA Graph after
-eligibility checks. Both controls are independent; `graph=False` disables only
-BOLT-owned graphs, not external `torch.compile()` or enclosing CUDA capture.
-
-```python
-from mlbricks import Bolt
-bolt = Bolt(384, 12)                        # auto native + auto graph preference
-cache = bolt.allocate_cache(batch_size=1, capacity=2048)
-# ... supply each layer input tensor x of shape [1,1,384] ...
-# y = bolt.decode_with_cache(x, cache, position=cache.length)
-bolt.set_backend('pytorch').set_graph(False)  # reference fallback
-```
-
-`bolt.execution_info()` reports the actual last cached-decode selection.
-A cache owns its graph session; a separate cache owns a separate graph.
-`BoltGraphEngine` remains an explicit, experimental whole-model engine for
-qualified WikiLM-style BOLT layouts; it is not automatically used by an
-arbitrary `BoltModel` or hybrid model. GPU qualification is required before
-production use of the new automatic per-layer graph route.

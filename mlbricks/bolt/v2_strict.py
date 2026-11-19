@@ -58,6 +58,7 @@ def eligible(avq, o, state):
         and tuple(state.shape) == (1, o.shape[-1])
         and avq.width == o.shape[-1]
         and isinstance(avq.back, nn.Identity)
+        and not getattr(avq, "_fixed_retention_enabled", False)
     )
 
 

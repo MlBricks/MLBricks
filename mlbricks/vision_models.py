@@ -36,11 +36,11 @@ def _make_mixer(family: str, config: VisionConfig, *, causal: bool):
         return Bolt(
             config.dim,
             config.heads,
-            latent_dim=config.latent_dim,
+            mode="quantised",
+            state_memory=causal,
             causal=causal,
             position=None,
             backend=config.backend,
-            native_full_sequence=True,
             # Vision engines own device placement for the whole model.
             device="cpu",
             precision="fp32",

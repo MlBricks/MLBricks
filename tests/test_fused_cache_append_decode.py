@@ -1,7 +1,8 @@
 import torch
 
 from mlbricks import Attention, Brick, Bricks, Bolt, BoltModel
-from mlbricks.cache import BoltLegacyCache, KVCache
+from mlbricks.cache import KVCache
+from mlbricks.bolt.enhanced_mqa import EnhancedMQACache
 
 
 def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
@@ -33,33 +34,6 @@ def test_attention_decode_append_projected_matches_append_then_decode_pytorch():
     torch.testing.assert_close(got_v[:, :, :6], ref_v[:, :, :6])
 
 
-def test_bolt_decode_append_projected_matches_append_then_decode_pytorch_rope():
-    torch.manual_seed(102)
-    gauss = Bolt(32, 4, latent_dim=8, backend="pytorch", position="rope", device="cpu", precision="fp32").eval()
-    hist = torch.randn(2, 5, 32)
-    x = torch.randn(2, 32)
-    c, rho = gauss.project_cache_state(hist)
-    q, cn, rn = gauss.project_decode_state(x, start_pos=5)
-
-    ref_c = torch.empty(2, 4, 12, 8)
-    ref_r = torch.empty(2, 4, 12)
-    ref_c[:, :, :5].copy_(c)
-    ref_r[:, :, :5].copy_(rho)
-    ref_c[:, :, 5:6].copy_(cn)
-    ref_r[:, :, 5:6].copy_(rn)
-    ref = gauss.decode_projected(q, ref_c, ref_r, used_length=6)
-
-    got_c = torch.empty_like(ref_c)
-    got_r = torch.empty_like(ref_r)
-    got_c[:, :, :5].copy_(c)
-    got_r[:, :, :5].copy_(rho)
-    got = gauss.decode_append_projected(
-        q, cn, rn, got_c, got_r, position=5
-    )
-
-    torch.testing.assert_close(got, ref)
-    torch.testing.assert_close(got_c[:, :, :6], ref_c[:, :, :6])
-    torch.testing.assert_close(got_r[:, :, :6], ref_r[:, :, :6])
 
 
 def test_bolt_model_prepared_generation_updates_cache_length_without_cache_append(monkeypatch):
@@ -70,7 +44,7 @@ def test_bolt_model_prepared_generation_updates_cache_length_without_cache_appen
     def forbidden(*args, **kwargs):
         raise AssertionError("prepared generation must not call BoltLegacyCache.append")
 
-    monkeypatch.setattr(BoltLegacyCache, "append", forbidden)
+    monkeypatch.setattr(EnhancedMQACache, "append", forbidden, raising=False)
     ids = torch.randint(0, 47, (1, 5))
     out = model.generate(ids, 4, temperature=0)
     assert out.shape == (1, 9)
@@ -93,7 +67,7 @@ def test_bricks_prepared_generation_avoids_python_cache_append(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("prepared generation must not call cache.append")
 
-    monkeypatch.setattr(BoltLegacyCache, "append", forbidden)
+    monkeypatch.setattr(EnhancedMQACache, "append", forbidden, raising=False)
     monkeypatch.setattr(KVCache, "append", forbidden)
     ids = torch.randint(0, 53, (1, 5))
     out = model.generate(ids, 4, temperature=0)

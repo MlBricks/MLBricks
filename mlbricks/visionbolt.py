@@ -61,11 +61,11 @@ class VisionBoltBlock(nn.Module):
         self.mixer = Bolt(
             config.dim,
             config.heads,
-            latent_dim=config.latent_dim,
+            mode="quantised",
+            state_memory=directional,
             causal=directional,
             position=None,
             backend=config.backend,
-            native_full_sequence=True,
             # Child modules inherit their enclosing model's placement/precision.
             # Standalone Bolt keeps its CUDA-first default.
             device="cpu",

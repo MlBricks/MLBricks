@@ -12,14 +12,13 @@ from torch import nn
 import torch.nn.functional as F
 
 from .attention import Bolt
-from .presets import BoltPresetCache
+from .enhanced_mqa import EnhancedMQA, EnhancedMQACache
+from .shared_c import SharedCKeyless, SharedCCache
 from .config import BoltConfig, BoltModelSettings
 from .precision import native_bf16_supported
-from ..cache import BoltLegacyCache
 from ..components import Embedding, FFN, LayerNorm, LMHead, RMSNorm, Residual
 from ..ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
 from ..residualbrick import ResController
-from ..position import make_position
 from ..runtime import (
     normalize_backend, backend_report as collect_backend_report,
     build_execution_plan, compile_module, prepare_module_execution,
@@ -87,27 +86,29 @@ class BoltBlock(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.norm1 = _norm(cfg.norm, cfg.dim, cfg.bias)
-        legacy = cfg.bolt_mode == "legacy" or cfg.latent_dim not in (16, 32)
-        if legacy:
-            self.attn = Bolt(cfg.dim, cfg.heads, latent_dim=cfg.latent_dim,
-                             bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, graph=cfg.graph, eps=cfg.eps, position=rotary,
-                             precision=getattr(cfg, 'precision', 'fp32'),
-                             device='cpu')
-        else:
-            is_bolt_config = hasattr(cfg,'profile')
-            self.attn = Bolt(cfg.dim, cfg.heads, mode=cfg.bolt_mode,
-                             cache=cfg.bolt_cache, avq_dim=cfg.avq_dim,
-                             bias=cfg.bias, dropout=cfg.dropout, causal=True,
-                             backend=cfg.backend, graph=cfg.graph, position=rotary,
-                             profile=cfg.profile if is_bolt_config else None,
-                             attention_scale=getattr(cfg,'attention_scale',None),
-                             memory_init=getattr(cfg,'memory_init',None),
-                             projection=getattr(cfg,'projection',None),
-                             avq_return_map=getattr(cfg,'avq_return_map','auto'),
-                             avq_norm_eps=getattr(cfg,'avq_norm_eps',None),
-                             precision=getattr(cfg,'precision','auto'),
-                             device='cpu')
+        layer_mode = (cfg.layer_modes[layer_index] if getattr(cfg, 'layer_modes', None)
+                      else cfg.bolt_mode)
+        is_bolt_config = hasattr(cfg,'profile')
+        # Each hybrid layer uses its own natural AVQ width by default.
+        avq_dim = cfg.avq_dim
+        self.attn = Bolt(cfg.dim, cfg.heads, mode=layer_mode,
+                         cache=cfg.bolt_cache, avq_dim=avq_dim,
+                         bias=cfg.bias, dropout=cfg.dropout, causal=True,
+                         backend=cfg.backend, graph=cfg.graph, position=rotary,
+                         profile=cfg.profile if is_bolt_config else None,
+                         attention_scale=getattr(cfg,'attention_scale',None),
+                         memory_init=getattr(cfg,'memory_init',None),
+                         projection=getattr(cfg,'projection',None),
+                         avq_return_map=getattr(cfg,'avq_return_map','auto'),
+                         avq_norm_eps=getattr(cfg,'avq_norm_eps',None),
+                         precision=getattr(cfg,'precision','fp32'),
+                         state_memory=getattr(cfg,'state_memory',True),
+                         avq=getattr(cfg,'avq',None),
+                         forget_gate_init=getattr(cfg,'forget_gate_init',.95),
+                         head_output_gate=getattr(cfg,'head_output_gate',True),
+                         retention=getattr(cfg,'retention','decay'),
+                         kv_heads=(getattr(cfg,'kv_heads',None) if layer_mode == 'quantised' else None),
+                         device='cpu')
         self.residual1 = _residual(cfg)
         self.norm2 = _norm(cfg.norm, cfg.dim, cfg.bias)
         self.ffn = _ffn(cfg, layer_index)
@@ -165,13 +166,18 @@ class BoltBlock(nn.Module):
     @torch.no_grad()
     def prefill(
         self, x, previous_mixer=None, previous_state=None, *,
-        start_pos: int = 0, cache_buffer: BoltLegacyCache | None = None,
+        start_pos: int = 0, cache_buffer: EnhancedMQACache | SharedCCache | None = None,
     ):
         normalized = self.norm1(x)
-        mixer_update, (c, rho) = self.attn.prefill_with_cache(
+        mixer_update, state = self.attn.prefill_with_cache(
             normalized, start_pos=start_pos
         )
-        cache = cache_buffer.load_prefix(c, rho) if cache_buffer is not None else (c, rho)
+        if isinstance(cache_buffer, EnhancedMQACache):
+            cache = cache_buffer.load_prefix(*state)
+        elif cache_buffer is not None:
+            cache = cache_buffer.load_prefix(*state)
+        else:
+            cache = state
         x, mixer_update, next_state = self.finish(
             x, mixer_update, previous_mixer, previous_state
         )
@@ -180,38 +186,13 @@ class BoltBlock(nn.Module):
     @torch.no_grad()
     def step(self, x, cache, previous_mixer=None, previous_state=None, *, position: int):
         normalized = self.norm1(x)
-        if self.attn.is_modern:
-            if isinstance(cache, BoltPresetCache):
-                mixer_update = self.attn._modern.decode_with_cache(
-                    normalized, cache, position=position)
-                next_cache = cache
-            else:
-                mixer_update, next_cache = self.attn.decode_step(normalized, cache)
-            x, mixer_update, next_state = self._finish_decode(
-                x, mixer_update, previous_mixer, previous_state)
-            return x, next_cache, mixer_update, next_state
-        q, c_now, rho_now = self.attn.project_decode_state(
-            normalized, start_pos=position
-        )
-        if isinstance(cache, BoltLegacyCache):
-            mixer_update = self.attn.decode_append_projected(
-                q, c_now, rho_now, cache.c, cache.rho, position=position
-            )[:, None, :]
-            cache.length = max(cache.length, int(position) + 1)
+        if isinstance(cache, (EnhancedMQACache, SharedCCache)):
+            mixer_update = self.attn.decode_with_cache(normalized, cache, position=position)
             next_cache = cache
         else:
-            # Backward-compatible external prefill/decode API. Optimized model
-            # generation uses BoltLegacyCache and never takes this torch.cat path.
-            c_old, rho_old = cache
-            c = torch.cat([c_old, c_now], dim=2)
-            rho = torch.cat([rho_old, rho_now], dim=2)
-            mixer_update = self.attn.decode_projected(
-                q, c, rho, used_length=c.size(2)
-            )[:, None, :]
-            next_cache = (c, rho)
+            mixer_update, next_cache = self.attn.decode_step(normalized, cache)
         x, mixer_update, next_state = self._finish_decode(
-            x, mixer_update, previous_mixer, previous_state
-        )
+            x, mixer_update, previous_mixer, previous_state)
         return x, next_cache, mixer_update, next_state
 
 
@@ -237,10 +218,10 @@ class BoltModelCore(nn.Module):
         self.backend = config.backend
         self.graph = config.graph
 
-        additive, rotary = make_position(
-            config.position, dim=config.dim, max_seq_len=config.context
-        )
-        self.position = additive
+        if config.position not in (None, 'none'):
+            raise ValueError('BOLT has no built-in positional encoding. Use set_qk_transform.')
+        self.position = None
+        rotary = None
         self.token_embedding = Embedding(config.vocab_size, config.dim)
         self.drop = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
@@ -256,6 +237,12 @@ class BoltModelCore(nn.Module):
         self._prepared_generation = None
         self._compile_generation_regions = False
         self._generation_compile_mode = "default"
+
+    def set_qk_transform(self, transform):
+        """Set an external token-local callable for all modern BOLT attention layers."""
+        for block in self.blocks:
+            block.attn.set_qk_transform(transform)
+        return self
 
     def _embed(self, input_ids: torch.Tensor, *, start_pos: int = 0) -> torch.Tensor:
         if input_ids.ndim != 2:
@@ -364,14 +351,8 @@ class BoltModelCore(nn.Module):
         caches = []
         for block in self.blocks:
             a=block.attn
-            if a.is_modern:
-                caches.append(BoltPresetCache.allocate(
-                    batch_size,a.num_heads,capacity,a.latent_dim,a.avq_dim,
-                    device=device,dtype=dtype))
-            else:
-                caches.append(BoltLegacyCache.allocate(
-                    batch_size,a.num_heads,capacity,a.latent_dim,
-                    device=device,dtype=dtype))
+            caches.append(a.allocate_cache(batch_size=batch_size, capacity=capacity,
+                                           device=device, dtype=dtype))
         self._prepared_generation = {
             "batch_size": int(batch_size),
             "capacity": capacity,
@@ -416,7 +397,7 @@ class BoltModelCore(nn.Module):
 
     @torch.no_grad()
     def prefill(
-        self, input_ids: torch.Tensor, *, cache_buffers: list[BoltLegacyCache] | None = None
+        self, input_ids: torch.Tensor, *, cache_buffers: list[EnhancedMQACache | SharedCCache] | None = None
     ):
         x = self._embed(input_ids, start_pos=0)
         caches = []
@@ -515,7 +496,8 @@ class BoltModel(BoltModelCore):
 
     The constructor automatically places model weights on CUDA when available.
     Input token IDs and targets are transferred to the model's current device.
-    ``precision='auto'`` uses autocast on CUDA and full precision on CPU.
+    ``precision='fp32'`` (default) keeps full precision on CUDA and CPU.
+    Explicit ``precision='auto'`` enables CUDA autocast.
     """
     def __init__(self, config: BoltConfig | BoltModelSettings | None = None, **kwargs):
         if config is None:
@@ -585,33 +567,10 @@ class BoltModel(BoltModelCore):
 
     @torch.no_grad()
     def generate(self,input_ids,max_new_tokens,*,temperature=1.,top_k=None):
-        # Experimental whole-model graph policy. Ineligible combinations keep
-        # the existing eager / V5 per-layer path without any graph capture.
-        # V5 users can select graph='off'/'auto'/'on' through BoltConfig.
-        from .model_graph import BoltModelGraphEngine
-        ids = self._on_device(input_ids)
+        # Historical native graph kernels implement different attention equations.
         self._mlbricks_model_graph_status = {
             'using_graph': False,
-            'fallback_reason': 'whole-model graph not selected for this request',
+            'fallback_reason': 'modern BOLT graph kernels are not qualified',
         }
-        graph_policy = str(getattr(self, 'graph', getattr(self.config, 'graph', 'off'))).lower()
-        allow_model = graph_policy not in ('off', 'false', '0')
-        minimum = 2 if graph_policy in ('on', 'true', '1') else 64
-        if (allow_model and max_new_tokens >= minimum and temperature <= 0
-                and not self.training and BoltModelGraphEngine.supports(
-                    self, ids, int(max_new_tokens))):
-            # No outer CUDA graph exists here: the engine calls the BOLT CUDA
-            # dynamic decoder directly, *never* its per-layer graph wrapper.
-            engine = BoltModelGraphEngine.from_prompt(
-                self, ids, max_new_tokens=int(max_new_tokens),
-                enable_graph=True, strict_graph=False,
-            )
-            if engine.using_graph:
-                new_ids = engine.generate_tensor(int(max_new_tokens))
-                self._mlbricks_model_graph_status = engine.status()
-                return torch.cat((ids, new_ids), dim=1)
-            self._mlbricks_model_graph_status = engine.status()
-        # Preserve arbitrary sampling, training mode, CPU/ROCm/MPS, RoPE,
-        # unsupported FFN variants and explicit graph=off behavior.
-        return super().generate(ids,max_new_tokens,
-                                temperature=temperature,top_k=top_k)
+        return super().generate(self._on_device(input_ids), max_new_tokens,
+                                temperature=temperature, top_k=top_k)

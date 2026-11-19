@@ -5,16 +5,16 @@ import torch
 from torch import nn
 
 from mlbricks import Bolt, BoltConfig, BoltModel, BoltStateMemory
-from mlbricks.bolt.presets import BoltPreset
 
 
-@pytest.mark.parametrize("profile,latent", [("compact", 16), ("standard", 32)])
+@pytest.mark.parametrize("mode", ["quantised", "keyless", "base"])
 @pytest.mark.parametrize("heads", [4, 12])
-def test_public_bolt_defaults_match_full_attention_width(profile, latent, heads):
+def test_public_bolt_defaults_match_full_attention_width(mode, heads):
     torch.manual_seed(1)
-    module = Bolt(d_model=48, num_heads=heads, profile=profile,
+    module = Bolt(d_model=48, num_heads=heads, mode=mode,
                   device="cpu", backend="pytorch", precision="fp32")
-    full_attention_width = heads * latent
+    full_attention_width = 48
+    latent = 48 // heads
     assert module.latent_dim == latent
     assert module.avq_dim == full_attention_width
     assert module._modern.avq.width == full_attention_width
@@ -40,34 +40,30 @@ def test_public_bolt_defaults_match_full_attention_width(profile, latent, heads)
     torch.testing.assert_close(last, expected[:, 4:], atol=5e-5, rtol=5e-5)
 
 
-@pytest.mark.parametrize("profile,latent", [("compact", 16), ("standard", 32)])
-def test_bolt_model_config_default_matches_width(profile, latent):
+@pytest.mark.parametrize("mode", ["quantised", "keyless", "base"])
+def test_bolt_model_config_default_matches_width(mode):
     config = BoltConfig(vocab_size=47, context=8, layers=1, dim=48,
-                        heads=12, profile=profile, device="cpu",
+                        heads=12, bolt_mode=mode, device="cpu",
                         precision="fp32", backend="pytorch")
-    assert config.avq_dim == 12 * latent
+    assert config.avq_dim == 48
     model = BoltModel(config)
     attention = model.blocks[0].attn
-    assert attention.avq_dim == 12 * latent
+    assert attention.avq_dim == 48
     assert isinstance(attention._modern.avq.back, nn.Identity)
     assert not any("avq.back.weight" in name for name in model.state_dict())
 
 
-def test_preset_and_standalone_memory_default_to_identity():
-    preset = BoltPreset(48, 12, cache="normal", backend="pytorch")
-    assert preset.avq_dim == 384
-    assert isinstance(preset.avq.back, nn.Identity)
+def test_standalone_memory_default_to_identity():
     state = BoltStateMemory(input_dim=384, device="cpu", backend="pytorch")
     assert state.width == 384
     assert isinstance(state.back, nn.Identity)
 
 
 def test_explicit_nonmatching_width_remains_a_deliberate_ablation():
-    module = Bolt(d_model=48, num_heads=12, profile="standard",
+    module = Bolt(d_model=48, num_heads=12, mode="quantised",
                   avq_dim=194, device="cpu", backend="pytorch")
     assert module.avq_dim == 194
     assert isinstance(module._modern.avq.back, nn.Linear)
-    assert module._modern.avq.back.weight.shape == (384, 194)
+    assert module._modern.avq.back.weight.shape == (48, 194)
     with pytest.raises(ValueError, match="identity AVQ return"):
-        Bolt(d_model=48, num_heads=12, profile="standard", avq_dim=194,
-             avq_return_map="identity", device="cpu", backend="pytorch")
+        BoltStateMemory(48, 194, return_map="identity", device="cpu")

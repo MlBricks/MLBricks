@@ -5,7 +5,7 @@ from mlbricks import Bolt, BoltConfig, BoltModel
 
 
 def test_cpu_override_is_supported_for_reference_workloads():
-    layer = Bolt(64,4,profile="compact",device="cpu",precision="fp32",backend="pytorch").eval()
+    layer = Bolt(64,4,mode="quantised",device="cpu",precision="fp32",backend="pytorch").eval()
     data = torch.randn(2,5,64)
     with torch.no_grad():
         forward = layer(data)
@@ -15,11 +15,11 @@ def test_cpu_override_is_supported_for_reference_workloads():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("profile",["standard","compact"])
+@pytest.mark.parametrize("mode",["quantised","keyless","base"])
 @pytest.mark.parametrize("precision",["fp32","auto"])
-def test_cuda_cached_and_forward_use_same_precision(profile,precision):
+def test_cuda_cached_and_forward_use_same_precision(mode,precision):
     torch.manual_seed(919)
-    layer=Bolt(384,12,profile=profile,device="auto",precision=precision,backend="pytorch").eval()
+    layer=Bolt(384,12,mode=mode,device="auto",precision=precision,backend="pytorch").eval()
     assert next(layer.parameters()).is_cuda
     inputs=torch.randn(1,9,384)  # API transparently moves CPU inputs to CUDA
     with torch.no_grad():
@@ -40,7 +40,7 @@ def test_cuda_cached_and_forward_use_same_precision(profile,precision):
 @pytest.mark.parametrize("memory",[True,False])
 def test_cuda_model_default_device_and_memory_option(memory):
     cfg=BoltConfig(vocab_size=97,context=32,layers=2,dim=64,heads=4,
-                   profile="compact",state_memory=memory,device="auto",precision="fp32",backend="pytorch")
+                   bolt_mode="quantised",state_memory=memory,device="auto",precision="fp32",backend="pytorch")
     model=BoltModel(cfg).eval()
     assert model.device.type=="cuda"
     ids=torch.randint(0,97,(1,8),device="cpu")
@@ -51,4 +51,4 @@ def test_cuda_model_default_device_and_memory_option(memory):
         assert pref.shape==(1,5,97)
         torch.testing.assert_close(pref,output[:,:5],rtol=4e-5,atol=1e-5)
         if not memory:
-            assert all(c[1] is None for c in cs)
+            assert all(c[-1].numel()==0 for c in cs)

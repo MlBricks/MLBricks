@@ -16,7 +16,9 @@ from .runtime import (
     normalize_backend, backend_report as collect_backend_report,
     build_execution_plan, compile_module, prepare_module_execution, reset_execution_route, predict_module,
 )
-from .cache import BoltLegacyCache, KVCache
+from .cache import KVCache
+from .bolt.enhanced_mqa import EnhancedMQACache
+from .bolt.shared_c import SharedCCache
 
 
 def _make_norm(spec, dim: int):
@@ -165,14 +167,13 @@ class Brick(nn.Module):
         normalized = self.norm1(x)
         state = None
         if isinstance(self.mixer, Bolt):
-            update, (c, rho) = self.mixer.prefill_with_cache(
-                normalized, start_pos=start_pos
-            )
-            if isinstance(cache_buffer, BoltLegacyCache):
-                cache_buffer.load_prefix(c, rho)
-                state = ("gauss", cache_buffer)
-            else:
-                state = ("gauss", c, rho)
+            update, cache = self.mixer.prefill_with_cache(normalized, start_pos=start_pos)
+            if cache_buffer is not None:
+                if not isinstance(cache_buffer, (EnhancedMQACache, SharedCCache)):
+                    raise TypeError('expected modern BOLT cache')
+                cache_buffer.load_prefix(*cache)
+                cache = cache_buffer
+            state = ("bolt", cache)
         elif isinstance(self.mixer, Attention):
             update, (k, v) = self.mixer.prefill_with_cache(
                 normalized, start_pos=start_pos
@@ -196,25 +197,13 @@ class Brick(nn.Module):
         x = _call_optional(self.pre, x)
         normalized = self.norm1(x)
         kind = state[0]
-        if kind == "gauss":
-            q, c_now, rho_now = self.mixer.project_decode_state(
-                normalized, start_pos=position
-            )
-            if len(state) == 2 and isinstance(state[1], BoltLegacyCache):
-                cache = state[1]
-                update = self.mixer.decode_append_projected(
-                    q, c_now, rho_now, cache.c, cache.rho, position=position
-                )[:, None, :]
-                cache.length = max(cache.length, int(position) + 1)
-                next_state = ("gauss", cache)
+        if kind == "bolt":
+            cache = state[1]
+            if isinstance(cache, (EnhancedMQACache, SharedCCache)):
+                update = self.mixer.decode_with_cache(normalized, cache, position=position)
             else:
-                _, c_old, rho_old = state
-                c = torch.cat([c_old, c_now], dim=2)
-                rho = torch.cat([rho_old, rho_now], dim=2)
-                update = self.mixer.decode_projected(
-                    q, c, rho, used_length=c.size(2)
-                )[:, None, :]
-                next_state = ("gauss", c, rho)
+                update, cache = self.mixer.decode_step(normalized, cache)
+            next_state = ("bolt", cache)
         elif kind == "attention":
             q, k_now, v_now = self.mixer.project_decode_state(
                 normalized, start_pos=position
@@ -411,10 +400,8 @@ class Bricks(nn.Module):
         for layer in self.layers:
             mixer = layer.mixer
             if isinstance(mixer, Bolt):
-                buffers.append(BoltLegacyCache.allocate(
-                    batch_size, mixer.num_heads, capacity, mixer.latent_dim,
-                    device=device, dtype=dtype,
-                ))
+                buffers.append(mixer.allocate_cache(batch_size=batch_size, capacity=capacity,
+                                                    device=device, dtype=dtype))
             elif isinstance(mixer, Attention):
                 buffers.append(KVCache.allocate(
                     batch_size, mixer.num_heads, capacity, mixer.head_dim,

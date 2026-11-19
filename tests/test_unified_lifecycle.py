@@ -23,7 +23,7 @@ def _mixed_model(device="cpu"):
                 dim=dim,
             ),
             mlb.Brick(
-                mixer=mlb.Bolt(dim, 2, latent_dim=4, backend="pytorch"),
+                mixer=mlb.Bolt(dim, 2, mode="quantised", backend="pytorch"),
                 ffn=mlb.FFN(dim, 32),
                 dim=dim,
             ),

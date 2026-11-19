@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import torch
 
-REPO = Path(os.environ.get('MLBRICKS_REPO', Path(__file__).resolve().parents[2])).resolve()
+REPO = Path(os.environ.get('MLBRICKS_REPO', Path(__file__).resolve().parents[1])).resolve()
 NATIVE = REPO / 'mlbricks/bolt/native_backend.py'
 
 class FakeExtension:
@@ -121,60 +121,6 @@ class TestBOLTInferenceDtype(unittest.TestCase):
         self.assertTrue(torch.equal(updated,expected_state))
         self.assertTrue(torch.isfinite(result).all().item())
         self.assertTrue(torch.isfinite(updated).all().item())
-    def test_cached_bolt_fp16_projection_fp32_native_output_no_external_amp(self):
-        from mlbricks.bolt.presets import BoltCache,BoltPreset
-        from mlbricks.bolt import native_backend
-        for mode in ('quality','fast'):
-            model=BoltPreset(64,2,mode=mode,cache='tight',backend='pytorch').eval().half()
-            model._native_enabled=lambda x:True  # emulate CUDA native reader selection
-            x=torch.randn(1,1,64,dtype=torch.float16)
-            c=BoltCache.allocate(1,2,10,16,32 if mode=='quality' else 0,
-                                  device=x.device,dtype=x.dtype)
-            with patch.object(native_backend,'get_extension',return_value=object()),\
-                 patch.object(native_backend,'decode_append',
-                       side_effect=lambda q,c_now,cache,scratch,pos,scale:
-                           torch.ones_like(q,dtype=torch.float32)):
-                with torch.no_grad():
-                    actual=model.decode_with_cache(x,c,position=0)
-            self.assertEqual(actual.dtype,torch.float16)
-            self.assertTrue(torch.isfinite(actual).all().item())
-            if c.state is not None:
-                self.assertEqual(c.state.dtype,torch.float32)
-
-
-class TestPatchV2StrictCompatibility(unittest.TestCase):
-    def test_v2_method_signature_keeps_amp_wrapping_native_strict_update(self):
-        import ast, subprocess
-        source = subprocess.check_output(['git','-C',str(REPO),'show','HEAD:mlbricks/bolt/presets.py'],text=True)
-        # MLBRICKS_COMMITTED_V2_TEST_FIX
-        # HEAD is already patched on optimised-decode; check idempotency there.
-        if '# MLBRICKS_BOLT_INFERENCE_AMP_V2' in source:
-            scripts=REPO/'tools/bolt_optimised_decode_patch/scripts'
-            sys.path.insert(0,str(scripts))
-            from apply_bolt_dispatch_patch import locate_presets
-            self.assertIn('_v2_strict.maybe_step',source)
-            self.assertEqual(source,locate_presets(source))
-            ast.parse(source)
-            return
-        source=source.replace('def step(self,o,state):',
-                              'def step(self,o,state,*,_v2_cache_inplace=False):',1)
-        needle='        a,v,r=self.components(o)\n        if self.use_native and o.is_cuda'
-        self.assertIn(needle,source)
-        source=source.replace(needle,"""        if self.use_native and o.is_cuda:
-            candidate = _v2_strict.maybe_step(self, o, state, inplace_cache=_v2_cache_inplace)
-            if candidate is not None:return candidate
-        a,v,r=self.components(o)
-        if self.use_native and o.is_cuda""",1)
-        scripts=REPO/'tools/bolt_optimised_decode_patch/scripts'
-        sys.path.insert(0,str(scripts))
-        from apply_bolt_dispatch_patch import locate_presets
-        after=locate_presets(source)
-        ast.parse(after)
-        self.assertIn('with torch.autocast',after)
-        self.assertLess(after.index('MLBRICKS_BOLT_INFERENCE_AMP_V2'),
-                        after.index('_v2_strict.maybe_step'))
-        self.assertEqual(after,locate_presets(after))
-
 
 
 class TestBOLTPrecisionDefault(unittest.TestCase):
