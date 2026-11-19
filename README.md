@@ -1,30 +1,8 @@
-Modern BOLT has three attention modes: `quantised` (MQA/GQA), `keyless` (one shared C), and `base` (MHA). Each supports optional pre-attention AVQ with `retention="decay"` or `"learned"`. Historical fixed-width and rho-normalized architectures are retired; old checkpoints are not automatically converted. Historical patch notes are development records, not current API specifications.
-
 # MLBricks Kit
 
 MLBricks Kit is a modular neural-network toolkit for building and experimenting with efficient AI systems across PyTorch and optimized native execution paths.
 
 It provides unified `auto`, `native`, and `pytorch` backend dispatch together with reusable components and architectures including **ESA, Bolt, BoltModel, VisionBolt, VESA, Bricks, FFNBrick, ResController, SOUP, and ElasticBit**. MLBricks also includes native C++/CUDA execution paths, adaptive runtime planning, model lifecycle utilities, and production-oriented inference/training APIs.
-
-## BOLT API
-
-The embedding width must be divisible by the query-head count. For MQA/GQA, `kv_heads` must divide the query-head count. The default AVQ width is the embedding width. The default precision is FP32; mixed precision is opt-in.
-
-```python
-from mlbricks import Bolt, BoltConfig, BoltModel, RoPE
-
-mqa = Bolt(384, 12, mode="quantised", kv_heads=1, position=RoPE())
-gqa = Bolt(384, 12, mode="quantised", kv_heads=3)
-keyless = Bolt(384, 12, mode="keyless")
-classic = Bolt(384, 12, mode="base", avq=False, head_output_gate=False)
-learned = Bolt(384, 12, retention="learned")
-config = BoltConfig(vocab_size=50257, context=2048, layers=3, dim=384, heads=12,
-                    layer_modes=("base", "quantised", "keyless"), device="auto")
-model = BoltModel(config)
-model.set_qk_transform(RoPE())
-```
-
-At 384D/12 heads, FP16 persistent attention storage is 128 bytes/token/layer for MQA, 64 for shared-C Keyless, and 1536 for MHA. Enabled 384D AVQ adds 1536 bytes of FP32 recurrent state per sequence/layer. Cache storage is distinct from peak GPU allocation. Modern BOLT uses PyTorch SDPA; the retired BOLT native attention and graph routes are not available. The optimized one-KV-head decode and chunked AVQ prefill are retained; chunking does not alter training.
 
 ## Core components
 
@@ -85,7 +63,7 @@ from mlbricks import ESA, Bolt, StateAwareFFN, ResController
 x = torch.randn(2, 128, 384)
 
 esa = ESA(embd=384, head=6)
-bolt = Bolt(d_model=384, num_heads=6, latent_dim=32)
+bolt = Bolt(d_model=384, num_heads=6)
 ffn = StateAwareFFN(d_model=384)
 residual = ResController(update_ratio=0.18)
 ```
@@ -96,10 +74,11 @@ MLBricks components use `backend="auto"` by default. The public backend choices 
 - `native` — require a supported MLBricks native implementation.
 - `pytorch` — force the PyTorch/reference path.
 
+BOLT supports `auto` and `pytorch`; use `native` only for components with a qualified native implementation.
+
 Example:
 
 ```python
-bolt.set_backend("native")
 bolt.set_backend("pytorch")
 bolt.set_backend("auto")
 ```
@@ -188,7 +167,76 @@ For the ready-made ESA language-model architecture:
 from mlbricks import ESAModel, ESAModelConfig
 ```
 
-## Bolt
+## BOLT Architecture
+
+### Architecture Modes
+
+BOLT is a memory-efficient attention architecture with optional pre-attention AVQ, dynamic head dimensions, learnable head-output gates, and externally supplied positional transforms.
+
+| Architecture | `mode` | Configuration |
+|---|---|---|
+| BOLT Quantised | `quantised` | One shared KV head (`kv_heads=1`, the default) |
+| BOLT Grouped Quantised | `quantised` | Multiple shared KV heads (`1 < kv_heads < num_heads`) |
+| BOLT Keyless | `keyless` | One shared C representation; `kv_heads` is not applicable |
+| BOLT Base | `base` | Full per-head key and value representations |
+
+Quantised and Grouped Quantised use the same implementation and differ only in `kv_heads`. Setting `kv_heads=num_heads` in `quantised` uses full KV width. Every mode supports optional AVQ with `retention="decay"` (default) or `retention="learned"`.
+
+### BOLT API
+
+The embedding width must be divisible by the query-head count. For Quantised and Grouped Quantised, `kv_heads` must be a positive divisor of the query-head count. The default AVQ width is the embedding width. FP32 is the default precision; mixed precision is opt-in.
+
+```python
+from mlbricks import Bolt, BoltConfig, BoltModel, RoPE
+
+# BOLT Quantised
+quantised = Bolt(384, 12, mode="quantised", kv_heads=1, position=RoPE())
+
+# BOLT Grouped Quantised
+grouped_quantised = Bolt(384, 12, mode="quantised", kv_heads=3)
+
+# BOLT Keyless
+keyless = Bolt(384, 12, mode="keyless")
+
+# BOLT Base
+base = Bolt(384, 12, mode="base")
+
+# BOLT Base without AVQ or head-output gates
+classic = Bolt(384, 12, mode="base", avq=False, head_output_gate=False)
+
+# BOLT with learned AVQ retention
+learned = Bolt(384, 12, retention="learned")
+
+# Hybrid BOLT language model
+config = BoltConfig(
+    vocab_size=50257,
+    context=2048,
+    layers=3,
+    dim=384,
+    heads=12,
+    layer_modes=("base", "quantised", "keyless"),
+    device="auto",
+)
+model = BoltModel(config)
+model.set_qk_transform(RoPE())
+```
+
+### Memory Efficiency
+
+At 384D and 12 query heads (32 dimensions per head), persistent FP16 attention-cache storage is:
+
+| BOLT architecture | Bytes/token/layer | Reduction vs Base |
+|---|---:|---:|
+| Quantised | 128 | 91.67% |
+| Grouped Quantised (3 KV heads) | 384 | 75.00% |
+| Keyless | 64 | 95.83% |
+| Base | 1,536 | 0% |
+
+Enabled 384D AVQ adds 1,536 bytes of FP32 recurrent state per sequence per layer, independent of context length. The table excludes AVQ state, model weights, temporary allocations and unused preallocated capacity. Persistent cache storage is distinct from peak GPU allocation.
+
+### Execution and Optimization
+
+BOLT uses PyTorch Scaled Dot-Product Attention (SDPA), with compact single-KV-head decoding and chunked AVQ inference prefill. Chunking carries recurrent state across chunks and does not alter training. FP16 and BF16 mixed-precision inference require suitable hardware. Modern native attention and CUDA graph acceleration are not implemented; optional standalone native operators are separate from the BOLT attention path.
 
 ### `Bolt` / `BoltAttention`
 
@@ -202,11 +250,11 @@ fixed = bolt.allocate_cache(batch_size=1, capacity=2048)
 y = bolt.decode_with_cache(next_x, fixed, position=0)
 ```
 
-The fixed-cache example starts a separate empty session. MQA/GQA/base use `(k,v,state)` dynamic caches and `EnhancedMQACache` static caches. Keyless uses `(c,state)` dynamic caches and `SharedCCache` static caches. The actual cache precision follows the model's inference precision. Cache allocation and cached decode are for inference; use ordinary forward for training.
+The fixed-cache example starts a separate empty session. Quantised, Grouped Quantised and Base use `(k,v,state)` dynamic caches and `EnhancedMQACache` static caches. Keyless uses `(c,state)` dynamic caches and `SharedCCache` static caches. The actual cache precision follows the model's inference precision. Cache allocation and cached decode are for inference; use ordinary forward for training.
 
 ### BOLT model and components
 
-`BoltModel` and `BoltConfig` provide a language model; `BoltStateMemory` implements pre-AVQ. `EnhancedMQA`, `EnhancedMQACache`, `ClassicMHA`, `SharedCKeyless`, and `SharedCCache` are also exported. `BoltModel` supports forward, prefill, incremental decoding and generation. Modern mode weights retain their existing parameter and state-dict layout. Historical BOLT16/BOLT32 checkpoints and fixed-width graph caches are not supported. Existing naming aliases such as `fast` select modern modes, not a second implementation. Modern graph acceleration is not implemented; graph policy does not select the retired kernels.
+`BoltModel` and `BoltConfig` provide a language model; `BoltStateMemory` implements pre-AVQ. `EnhancedMQA`, `EnhancedMQACache`, `ClassicMHA`, `SharedCKeyless`, and `SharedCCache` are also exported. `BoltModel` supports forward, prefill, incremental decoding and generation. Modern mode weights retain their existing parameter and state-dict layout. Historical BOLT16/BOLT32 checkpoints and fixed-width graph caches are not supported. Historical branch and patch notes are development records, not current API specifications. Existing naming aliases such as `fast` select modern modes, not a second implementation. Modern graph acceleration is not implemented; graph policy does not select the retired kernels.
 
 ## FFNBricks
 
@@ -373,7 +421,7 @@ model = Bricks(
             dim=384,
         ),
         Brick(
-            mixer=Bolt(384, 6, latent_dim=32),
+            mixer=Bolt(384, 6),
             ffn=FFN(384, 1536, activation="gelu"),
             dim=384,
         ),
