@@ -5,7 +5,7 @@
 
 ## Scope
 
-- Add FastESA v0.4.0 source under `mlbricks/esa/fastesa_engine/` without altering its math.
+- Add FastESA v0.4.0 source under `mlbricks/esa/engine/` without altering its math.
 - Expose `ESA(mode='retention'|'legacy')`, defaulting to retention,
   plus `LegacyESA`, `RetentionESA`, `CurrentESA`, `CurrentESAConfig`, `CurrentESAModel`,
   `make_current_esa_model`, checkpoint helpers and `make_esa`.

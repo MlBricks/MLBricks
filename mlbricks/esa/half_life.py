@@ -6,14 +6,14 @@ retention engine. Internal historical wrappers keep the legacy Thunder engine.
 """
 from __future__ import annotations
 
-from .fastesa_engine import (
+from .engine import (
     CurrentESA, BaseESA, ESAConfig as CurrentESAConfig,
     save_esa_checkpoint as save_current_esa_checkpoint,
     load_esa_checkpoint as load_current_esa_checkpoint,
     detect_esa_variant as detect_current_esa_variant,
     GraphDecoder as CurrentESAGraphDecoder,
 )
-from .fastesa_engine.core import (
+from .engine.core import (
     DEFAULT_CURRENT_HALF_LIVES,
     ESAModel as CurrentESAModel,
     BaseESAModel as BaseESAModel,

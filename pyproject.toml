@@ -82,4 +82,4 @@ include = ["mlbricks*"]
 exclude = ["tests*", "examples*"]
 
 [tool.setuptools.package-data]
-"mlbricks.esa.fastesa_engine" = ["cuda/*.cpp", "cuda/*.cu"]
+"mlbricks.esa.engine" = ["cuda/*.cpp", "cuda/*.cu"]
