@@ -80,3 +80,6 @@ License = "https://polyformproject.org/licenses/noncommercial/1.0.0"
 where = ["."]
 include = ["mlbricks*"]
 exclude = ["tests*", "examples*"]
+
+[tool.setuptools.package-data]
+"mlbricks.esa.fastesa_engine" = ["cuda/*.cpp", "cuda/*.cu"]

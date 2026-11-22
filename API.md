@@ -30,6 +30,47 @@ from mlbricks import (
 )
 ```
 
+## ESA architecture modes (FastESA v0.4.0)
+
+The public `ESA` constructor selects **retention by default**. To keep the
+historical Thunder implementation, pass `mode="legacy"`. The returned object is
+the concrete engine (not an additional wrapper), so checkpoint parameter keys
+are unaffected. The two architectures have **different** recurrence rules and
+state dictionaries; never load a checkpoint from one mode into the other.
+
+```python
+import torch
+from mlbricks import ESA, RetentionESA, LegacyESA
+
+retention = ESA(embd=384, head=6, backend="pytorch", device="cpu")
+# Same as ESA(embd=384, head=6, mode="retention", ...)
+assert isinstance(retention, RetentionESA)
+x = torch.randn(1, 8, 384)
+y, state = retention(x)           # output tensor AND recurrent state
+next_out, state = retention.decode_step(torch.randn(1, 384), state)
+# Initial learnable FP32 half-lives: [0.125, 0.5, 2, 8, 32, 64]
+
+legacy = ESA(embd=32, head=4, mode="legacy", precision="fp32", device="cpu")
+assert isinstance(legacy, LegacyESA)
+y_only = legacy(torch.randn(1, 8, 32))   # single output tensor
+```
+
+- `RetentionESA` (also `CurrentESA`) — FastESA half-life mixer, the default ESA mode
+- `LegacyESA` — previous MLBricks Thunder ESA, selected with `mode="legacy"`
+- `BaseESA` — FastESA's separate historical learned-bounds variant (not Thunder)
+- `CurrentESAConfig`, `CurrentESAModel`, `BaseESAModel` — FastESA-only config/model APIs
+- `DEFAULT_CURRENT_HALF_LIVES` — `(0.125, 0.5, 2, 8, 32, 64)`
+- `make_esa` — compatible factory with `architecture="retention"` (default), `"current"` (alias), or `"legacy"`
+- `make_current_esa_model`, `current_esa_forward_tokens` — retention language model helpers
+- `save_current_esa_checkpoint` / `load_current_esa_checkpoint` — retention mixer checkpoint tools
+- `load_current_esa_model_checkpoint` — retention LM checkpoint loader
+- `CurrentESAGraphDecoder` — CUDA graph helper (requires GPU validation)
+
+`ESAModel` / `ESAModelConfig`, legacy `ESAConfig`, and existing SOUP/VESA models
+remain on the original Thunder ESA engine for checkpoint compatibility. Their
+migration to retention is a separate change. Native FastESA CUDA performance
+and correctness need dedicated GPU testing.
+
 ## Backend policy and execution planner
 
 ### Backend values
@@ -187,45 +228,31 @@ FP16_ADAM_MIN_EPS
 
 ## ESA
 
-### `ESA`
+### `ESA` (retention default)
 
 ```python
-ESA(
-    embd,
-    head=4,
-    batch=None,
-    block=None,
-    backend="auto",
-    precision="fp16",
-    *,
-    compass="auto",
-    dropout=0.0,
-    gate_min=0.8,
-    gate_max=0.995,
-    eps=1e-5,
-    device="auto",
-    auto_compile=False,
-    compile_mode="default",
-    auto_move_input=True,
-    strict_checks=False,
-)
+ESA(embd=384, head=None, backend="auto", device=None, *, mode="retention", **kwargs)
 ```
 
-`esa` is a lowercase constructor alias for `ESA`.
-
-Main methods:
+The default number of heads is 6 for retention and 4 for legacy. Retention
+accepts FastESA-specific keywords such as `chunk_size`; legacy accepts
+`precision`, `compass`, `gate_min`, `gate_max`, etc. Each mode validates its
+own arguments. `mode` accepts only `"retention"` and `"legacy"`.
 
 ```python
-layer(x) -> torch.Tensor
-layer.set_backend(backend, *, recursive=True)
-layer.resolved_backend() -> str
-layer.prefill(x, state=None, *, backend=None, compass=None)
-    -> (output, state)
-layer.decode_step(x, state) -> (output, state)
-layer.compile(mode="default")
+retention(x, state=None) -> (output, new_state)
+retention.prefill(x, state=None) -> (output, new_state)
+retention.decode_step(x, state) -> (output, new_state)
+
+legacy(x) -> torch.Tensor
+legacy.forward_with_state(x, state=None) -> (output, new_state)
+legacy.prefill(x, state=None) -> (output, new_state)
+legacy.decode_step(x, state) -> (output, new_state)
 ```
 
-`ESAConfig` is the standalone ESA layer configuration dataclass.
+`esa` is the lowercase alias for the public `ESA` selector. `LegacyESA`
+preserves the original layer class for existing applications and checkpoints.
+`ESAConfig` is the legacy layer configuration dataclass.
 
 ### `ESAModel`
 
@@ -778,3 +805,19 @@ The following names are exported by `mlbricks.__all__` in `1.0.0b3`:
 ## Licensing
 
 MLBricks Kit is distributed under the repository-level PolyForm Noncommercial License 1.0.0 terms plus component-specific notices shipped with the relevant components. Commercial use requires a separate written commercial license. See `LICENSE.md`, `LICENSING_NOTICE.md`, `COMMERCIAL_LICENSE.md`, and the component notices listed in `LICENSE.md`.
+
+
+## ESA mode selector (default retention)
+
+`ESA(embd=384, head=6, backend="auto", mode="retention")` returns a concrete
+`RetentionESA` with learnable FP32 half-lives initialized to
+`[0.125, 0.5, 2, 8, 32, 64]`. The mode argument is optional.
+Its forward and prefill calls return `(output, state)`.
+
+`ESA(embd=384, head=4, mode="legacy")` returns the original `LegacyESA`
+Thunder-based mixer; `forward(x)` returns only an output tensor.
+Both instances keep native state dict parameter paths (no wrapper prefix).
+`CurrentESA` remains as a compatible alias to `RetentionESA`.
+Older `ESAModel` and VESA remain wired to the legacy engine and require
+migration before they can use retention. Keep architecture-specific checkpoints
+separate; do not swap the weight files between modes.

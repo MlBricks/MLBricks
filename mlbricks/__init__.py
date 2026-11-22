@@ -36,10 +36,16 @@ from .residualbrick import native_backend_available as residualbrick_native_back
 from .residualbrick import native_backend_name as residualbrick_native_backend_name
 from .esa import (
     ESA,
+    LegacyESA,
+    RetentionESA,
     ESAConfig,
     ESAModel,
     ESAModelConfig,
 )
+from .esa.half_life import (CurrentESA, BaseESA, CurrentESAConfig, CurrentESAModel,
+    BaseESAModel, DEFAULT_CURRENT_HALF_LIVES, make_esa, make_current_esa_model,
+    current_esa_forward_tokens, save_current_esa_checkpoint, load_current_esa_checkpoint,
+    load_current_esa_model_checkpoint, CurrentESAGraphDecoder)
 from .lifecycle import save, load, inspect, predict, generate, compile
 from .trainer import Trainer, TrainerState, train
 from .optim import Adam, AdamW, FP16_ADAM_MIN_EPS, stabilize_optimizer
@@ -137,6 +143,21 @@ __all__ = [
     "residualbrick_native_backend_available",
     "residualbrick_native_backend_name",
     "ESA",
+    "LegacyESA",
+    "RetentionESA",
+    "CurrentESA",
+    "BaseESA",
+    "CurrentESAConfig",
+    "CurrentESAModel",
+    "BaseESAModel",
+    "DEFAULT_CURRENT_HALF_LIVES",
+    "make_esa",
+    "make_current_esa_model",
+    "current_esa_forward_tokens",
+    "save_current_esa_checkpoint",
+    "load_current_esa_checkpoint",
+    "load_current_esa_model_checkpoint",
+    "CurrentESAGraphDecoder",
     "esa",
     "ESAConfig",
     "ESAModel",
