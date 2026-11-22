@@ -62,7 +62,8 @@ from mlbricks import ESA, Bolt, StateAwareFFN, ResController
 
 x = torch.randn(2, 128, 384)
 
-esa = ESA(embd=384, head=6)
+esa = ESA(embd=384, head=6)  # retention mode (default)
+# retention forward returns (output, recurrent_state)
 bolt = Bolt(d_model=384, num_heads=6)
 ffn = StateAwareFFN(d_model=384)
 residual = ResController(update_ratio=0.18)
@@ -158,14 +159,22 @@ from mlbricks import ESA
 esa = ESA(
     embd=384,
     head=6,
+    mode="retention",  # optional: this is the default
 )
 ```
 
-For the ready-made ESA language-model architecture:
+Retention ESA outputs `(output, state)` and defaults to directly initialized
+learnable half-lives `[0.125, 0.5, 2, 8, 32, 64]`. For the original Thunder
+implementation, use `ESA(mode="legacy", ...)` (its forward returns a tensor).
+
+The historical ready-made language-model architecture remains **legacy**:
 
 ```python
 from mlbricks import ESAModel, ESAModelConfig
 ```
+
+To create a new retention language model, use `make_current_esa_model`.
+See `API.md` for the differing forward signatures and checkpoint formats.
 
 ## BOLT Architecture
 
@@ -433,7 +442,8 @@ input_ids = torch.randint(0, 50_257, (1, 32), device=device)
 logits = model(input_ids)
 ```
 
-`ESA(device="auto")` is convenient when ESA is used by itself. Inside `Bricks` or another parent `nn.Module`, prefer `ESA(..., device=None)` and move the complete parent model with `.to(device)` so embeddings, residual paths, mixers, FFNs, and inputs remain on one device.
+`ESA(mode="legacy", device="auto")` is convenient when legacy ESA is used by itself;
+retention mode accepts `device=None` or a concrete device (e.g. `"cuda"`). Inside `Bricks` or another parent `nn.Module`, prefer `ESA(..., device=None)` and move the complete parent model with `.to(device)` so embeddings, residual paths, mixers, FFNs, and inputs remain on one device.
 
 ## Native vision runtime
 

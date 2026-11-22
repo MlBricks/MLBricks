@@ -64,8 +64,8 @@ def _call_with_supported_kwargs(cls, kwargs: dict[str, Any]):
 def _load_mixer_class(name: str):
     key = name.lower().strip()
     if key == "esa":
-        from mlbricks import ESA
-        return ESA
+        from mlbricks import LegacyESA
+        return LegacyESA
     if key == "bolt":
         try:
             from mlbricks import BOLT

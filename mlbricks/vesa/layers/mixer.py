@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from ...esa import ESA
+from ...esa import LegacyESA as ESA
 from ...runtime import normalize_backend
 from ..config import ESAConfig, FullBackend
 

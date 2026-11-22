@@ -1,7 +1,7 @@
 """Entangled State Attention (ESA) component package."""
 
 from .config import ESAConfig
-from .layer import ESA
+from .selector import ESA, LegacyESA, RetentionESA
 from .model import ESAModel, ESAModelConfig
 from .generation import GenerationResult, GenerationStats
 from .compass import compass, CompassResult
@@ -21,6 +21,21 @@ from .boost import thunderBoost
 
 __all__ = [
     "ESA",
+    "LegacyESA",
+    "RetentionESA",
+    "CurrentESA",
+    "BaseESA",
+    "CurrentESAConfig",
+    "CurrentESAModel",
+    "BaseESAModel",
+    "DEFAULT_CURRENT_HALF_LIVES",
+    "make_esa",
+    "make_current_esa_model",
+    "current_esa_forward_tokens",
+    "save_current_esa_checkpoint",
+    "load_current_esa_checkpoint",
+    "load_current_esa_model_checkpoint",
+    "CurrentESAGraphDecoder",
     "ESAConfig",
     "ESAModel",
     "ESAModelConfig",
@@ -40,3 +55,9 @@ __all__ = [
     "cuda_telemetry",
     "thunderBoost",
 ]
+
+# Retention ESA is the public default; legacy implementation stays explicitly available.
+from .half_life import (CurrentESA, BaseESA, CurrentESAConfig, CurrentESAModel,
+    BaseESAModel, DEFAULT_CURRENT_HALF_LIVES, make_esa, make_current_esa_model,
+    current_esa_forward_tokens, save_current_esa_checkpoint, load_current_esa_checkpoint,
+    load_current_esa_model_checkpoint, CurrentESAGraphDecoder)

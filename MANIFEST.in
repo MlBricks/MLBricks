@@ -28,3 +28,6 @@ include mlbricks/soup/LICENSE_SOUP.txt
 include mlbricks/vesa/LICENSE_VESA.txt
 
 recursive-include mlbricks/bolt/native_accel *.cpp *.cu
+
+# Vendored FastESA CUDA sources are required for native scan/fused decode.
+recursive-include mlbricks/esa/engine/cuda *.cpp *.cu

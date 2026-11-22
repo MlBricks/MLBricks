@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from .components import Embedding, FFN, LMHead, LayerNorm, RMSNorm, Residual
 from .bolt import Attention, Bolt
-from .esa import ESA
+from .esa import LegacyESA as ESA, RetentionESA
 from .ffnbrick import MicroVirtualFFN, StateAwareFFN, VirtualStateAwareFFN
 from .position import RoPE, make_position
 from .runtime import (
@@ -183,7 +183,7 @@ class Brick(nn.Module):
                 state = ("attention", cache_buffer)
             else:
                 state = ("attention", k, v)
-        elif isinstance(self.mixer, ESA):
+        elif isinstance(self.mixer, (ESA, RetentionESA)):
             update, esa_state = self.mixer.prefill(normalized)
             state = ("esa", esa_state)
         else:

@@ -13,6 +13,7 @@ def _mixed_model(device="cpu"):
         layers=[
             mlb.Brick(
                 mixer=mlb.ESA(
+                    mode="legacy",
                     embd=dim,
                     head=2,
                     backend="pytorch",
